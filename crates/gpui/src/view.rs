@@ -332,7 +332,7 @@ struct ViewElementState {
     /// restored when its prepaint is reused so the window stays subscribed.
     accessed_entities: FxHashSet<EntityId>,
     /// The accessibility nodes the prepaint added, when it ran while the tree
-    /// was being built. A frame that builds the tree can only reuse the view
+    /// was being built (the replay credited in window/a11y.rs). A frame that builds the tree can only reuse the view
     /// if it has them: the tree starts empty in every frame and the reused
     /// prepaint doesn't run.
     a11y: Option<CapturedA11y>,

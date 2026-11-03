@@ -418,6 +418,13 @@ impl A11y {
 
 /// Builder API for synthetic children. See the docs for
 /// [`Element::a11y_synthetic_children`].
+// The replay of a reused view's accessibility nodes (`A11yMark`,
+// `CapturedA11y`, `A11y::mark`, `capture`, `replay`,
+// `reuse_action_listeners`, `A11yNodeBuilder::replay`, and their use in
+// view.rs and window.rs) is adapted from Wormhole's patch to gpui-pre 0.3.9:
+// https://github.com/wormhole-terminal/gpui-pre, commit 7b47af1.
+// Copyright Wormhole's authors, licensed under the Apache License 2.0.
+
 /// Where a view's prepaint started in the tree being built. See [`A11y::mark`].
 pub(crate) struct A11yMark {
     nodes: usize,

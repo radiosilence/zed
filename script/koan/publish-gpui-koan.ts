@@ -576,10 +576,22 @@ function pathDepTarget(crateDir: string, spec: Toml): string | undefined {
 }
 
 /** Every workspace crate the root crates need, in dependency order. */
+/**
+ * A member's name as Zed has it. The fork renames gpui's own crates to their
+ * published names and keeps Zed's as the library name, so for those the
+ * library name is Zed's; every other member is published under a name made
+ * from its package name.
+ */
+function zedName(manifest: Toml): string {
+  const name = manifest.package.name as string;
+  const lib = manifest.lib?.name as string | undefined;
+  return name.startsWith(PUBLISH_PREFIX) && lib !== undefined ? lib : name;
+}
+
 function collectClosure(ws: Workspace): Crate[] {
   const byName = new Map<string, string>();
   for (const [rel, manifest] of ws.members)
-    byName.set(manifest.package.name, rel);
+    byName.set(zedName(manifest), rel);
   for (const root of ROOT_CRATES) {
     if (!byName.has(root))
       throw new BumpError(
@@ -614,7 +626,7 @@ function collectClosure(ws: Workspace): Crate[] {
 
   return order.map((relDir) => {
     const manifest = ws.members.get(relDir)!;
-    const name = manifest.package.name as string;
+    const name = zedName(manifest);
     return {
       relDir,
       manifest,
@@ -747,7 +759,7 @@ function pruneUnpublishable(ws: Workspace, crates: Crate[]) {
     for (const { name, spec } of depTables(crate.manifest)) {
       const target = pathDepTarget(crate.relDir, effectiveSpec(ws, name, spec));
       if (target !== undefined)
-        depNames.set(name, ws.members.get(target)!.package.name);
+        depNames.set(name, zedName(ws.members.get(target)!));
     }
     const features: Record<string, string[]> = crate.manifest.features ?? {};
     for (const [feature, entries] of Object.entries(features)) {

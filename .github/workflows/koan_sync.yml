@@ -97,7 +97,7 @@ jobs:
         if: steps.merge.outputs.merged == 'true'
         run: |
           set -euo pipefail
-          if ! cargo test -p gpui 2>&1 | tee "$RUNNER_TEMP/test.log"; then
+          if ! cargo test -p gpui-koan 2>&1 | tee "$RUNNER_TEMP/test.log"; then
             {
               echo "report<<EOF"
               echo "The merge of Zed's main into koan fails its tests. koan's own commits:"
@@ -131,8 +131,8 @@ jobs:
           fi
           current=$(cat script/koan/VERSION)
           next=$(echo "$current" | awk -F. '{ printf "%d.%d.%d\n", $1, $2, $3 + 1 }')
-          echo "$next" > script/koan/VERSION
-          git commit -m "gpui-koan $next" script/koan/VERSION
+          bun script/koan/set-version.ts "$next"
+          git commit -am "gpui-koan $next"
 
       - name: Push koan
         if: steps.merge.outputs.merged == 'true'

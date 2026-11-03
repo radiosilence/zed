@@ -9,13 +9,11 @@ name: "koan: CI/CD"
 # Configuration:
 #   secrets.CARGO_REGISTRY_TOKEN  crates.io token, publish scope for gpui-koan*;
 #                                 until it is set nothing is released
-#   vars.GPUI_COMPONENT_REPO      owner/name of the gpui-component fork whose
-#                                 `koan` branch builds on gpui-koan; when set,
-#                                 it and koan are built against the staged
-#                                 crates, and a release opens a koan pull
-#                                 request moving the pins
-#   secrets.FORK_TOKEN            reads that fork
 #   secrets.KOAN_TOKEN            pull requests on radiosilence/koan
+#
+# Once radiosilence/koan builds on gpui-koan, every run also builds and tests
+# it against the staged crates, and a release opens a koan pull request
+# moving its pins; until then both say so and pass.
 on:
   push:
     branches: [koan]
@@ -102,8 +100,12 @@ jobs:
         with:
           toolchain: stable
       - uses: oven-sh/setup-bun@v2
+      - name: Versions in step
+        # A git dependency on this branch is held to the same requirement a
+        # release is, so the renamed crates carry VERSION here too.
+        run: bun script/koan/set-version.ts --check
       - name: Test gpui
-        run: cargo test -p gpui
+        run: cargo test -p gpui-koan
       - name: Stage, audit and verify the crates
         # Stages the standalone workspace, audits its licences and runs
         # `cargo publish --workspace --dry-run`, which packages and builds
@@ -118,37 +120,35 @@ jobs:
           include-hidden-files: true
           retention-days: 7
 
-  downstream:
-    name: gpui-component and koan
+  koan:
+    name: koan
     needs: [changes, crates]
-    if: vars.GPUI_COMPONENT_REPO != ''
     runs-on: macos-latest
     timeout-minutes: 180
     env:
       VERSION: ${{ needs.changes.outputs.version }}
+      GH_TOKEN: ${{ secrets.KOAN_TOKEN || github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          filter: blob:none
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+          sparse-checkout: script/koan
+      - uses: actions/download-artifact@v4
         with:
-          repository: ${{ vars.GPUI_COMPONENT_REPO }}
-          ref: koan
-          token: ${{ secrets.FORK_TOKEN }}
-          path: component
+          name: gpui-koan
+          path: ${{ env.GPUI_KOAN_WORK }}/workspace
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
       - uses: oven-sh/setup-bun@v2
-      - name: Build gpui-component against the staged crates
-        run: bun script/koan/publish-gpui-koan.ts "$VERSION" --zed . --kit component --dry-run --no-verify
-      - name: Build and test koan against them
-        env:
-          GH_TOKEN: ${{ secrets.KOAN_TOKEN }}
+      - name: Build and test koan against the staged crates
         run: |
           set -euo pipefail
           gh repo clone "$KOAN" "$RUNNER_TEMP/koan" -- --depth 1
           cd "$RUNNER_TEMP/koan"
+          if ! grep -rqs 'gpui-koan' Cargo.toml crates/*/Cargo.toml; then
+            echo "::notice::radiosilence/koan does not build on gpui-koan yet"
+            exit 0
+          fi
           bun "$GITHUB_WORKSPACE/script/koan/point-koan.ts" --staged "$GPUI_KOAN_WORK/workspace" --version "$VERSION"
           cargo test -p koan-kit
           cargo test -p koan-gui --lib
@@ -157,7 +157,7 @@ jobs:
     name: Checks
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [changes, crates, downstream]
+    needs: [changes, crates, koan]
     if: always()
     steps:
       - env:
@@ -284,7 +284,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [changes, release]
-    if: ${{ !cancelled() && needs.release.result == 'success' && vars.GPUI_COMPONENT_REPO != '' }}
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
     env:
       VERSION: ${{ needs.changes.outputs.version }}
       GH_TOKEN: ${{ secrets.KOAN_TOKEN }}
@@ -301,6 +301,10 @@ jobs:
           set -euo pipefail
           gh repo clone "$KOAN" "$RUNNER_TEMP/koan"
           cd "$RUNNER_TEMP/koan"
+          if ! grep -rqs 'gpui-koan' Cargo.toml crates/*/Cargo.toml; then
+            echo "::notice::radiosilence/koan does not build on gpui-koan yet; no pins to move"
+            exit 0
+          fi
           git config user.name "gpui-koan"
           git config user.email "gpui-koan@users.noreply.github.com"
           git checkout -b "gpui-koan-$VERSION"

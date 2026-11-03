@@ -1,0 +1,312 @@
+name: "koan: CI/CD"
+# The gpui-koan crates, as radiosilence/koan's ci-cd.yml does its own: every
+# push and pull request to `koan` is checked; `Checks` gates CD; a push
+# releases only when it changes the version (script/koan/VERSION) to one not
+# yet released. The crates are staged from this branch by
+# script/koan/publish-gpui-koan.ts, published with koan's steps, and the
+# release (and its tag, `gpui-koan-v<version>`) is made by CI.
+#
+# Configuration:
+#   secrets.CARGO_REGISTRY_TOKEN  crates.io token, publish scope for gpui-koan*;
+#                                 until it is set nothing is released
+#   vars.GPUI_COMPONENT_REPO      owner/name of the gpui-component fork whose
+#                                 `koan` branch builds on gpui-koan; when set,
+#                                 it and koan are built against the staged
+#                                 crates, and a release opens a koan pull
+#                                 request moving the pins
+#   secrets.FORK_TOKEN            reads that fork
+#   secrets.KOAN_TOKEN            pull requests on radiosilence/koan
+on:
+  push:
+    branches: [koan]
+  pull_request:
+    branches: [koan]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  KOAN: radiosilence/koan
+  GPUI_KOAN_WORK: ${{ github.workspace }}/../gpui-koan
+
+jobs:
+  changes:
+    name: Changes
+    if: github.repository == 'radiosilence/zed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          sparse-checkout: script/koan
+      - name: Version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHING: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          # As koan's: a push releases when it changes the version and that
+          # version is not out yet; a manual run, which is how a failed
+          # release is retried, releases whatever version is not out yet.
+          version=$(cat script/koan/VERSION)
+          bumped=false
+          if [ "$(git show HEAD^1:script/koan/VERSION 2>/dev/null)" != "$version" ]; then
+            bumped=true
+          fi
+          release=false
+          if [ "$EVENT" = pull_request ]; then
+            release=$bumped
+          elif [ "$GITHUB_REF" = refs/heads/koan ] && { [ "$EVENT" = workflow_dispatch ] || [ "$bumped" = true ]; }; then
+            # Only a 404 means the version is not out. Any other failure
+            # stops the run: guessing either way releases twice or never.
+            if ! out=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/gpui-koan-v$version" 2>&1); then
+              if printf '%s' "$out" | grep -q 'HTTP 404'; then
+                release=true
+              else
+                echo "::error::cannot tell whether gpui-koan $version is released: $out"
+                exit 1
+              fi
+            fi
+          fi
+          if [ "$release" = true ] && [ "$EVENT" != pull_request ] && [ "$PUBLISHING" != true ]; then
+            echo "::notice::gpui-koan $version would be released, but CARGO_REGISTRY_TOKEN is not set"
+            release=false
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+  crates:
+    name: Crates
+    needs: changes
+    # gpui_macos's build script compiles Metal shaders, which only macOS can.
+    runs-on: macos-latest
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.changes.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          filter: blob:none
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: oven-sh/setup-bun@v2
+      - name: Test gpui
+        run: cargo test -p gpui
+      - name: Stage, audit and verify the crates
+        # Stages the standalone workspace, audits its licences and runs
+        # `cargo publish --workspace --dry-run`, which packages and builds
+        # every crate as crates.io will receive it.
+        run: bun script/koan/publish-gpui-koan.ts "$VERSION" --zed . --dry-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpui-koan
+          path: |
+            ${{ env.GPUI_KOAN_WORK }}/workspace
+            !${{ env.GPUI_KOAN_WORK }}/workspace/target
+          include-hidden-files: true
+          retention-days: 7
+
+  downstream:
+    name: gpui-component and koan
+    needs: [changes, crates]
+    if: vars.GPUI_COMPONENT_REPO != ''
+    runs-on: macos-latest
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.changes.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          filter: blob:none
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.GPUI_COMPONENT_REPO }}
+          ref: koan
+          token: ${{ secrets.FORK_TOKEN }}
+          path: component
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: oven-sh/setup-bun@v2
+      - name: Build gpui-component against the staged crates
+        run: bun script/koan/publish-gpui-koan.ts "$VERSION" --zed . --kit component --dry-run --no-verify
+      - name: Build and test koan against them
+        env:
+          GH_TOKEN: ${{ secrets.KOAN_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh repo clone "$KOAN" "$RUNNER_TEMP/koan" -- --depth 1
+          cd "$RUNNER_TEMP/koan"
+          bun "$GITHUB_WORKSPACE/script/koan/point-koan.ts" --staged "$GPUI_KOAN_WORK/workspace" --version "$VERSION"
+          cargo test -p koan-kit
+          cargo test -p koan-gui --lib
+
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, crates, downstream]
+    if: always()
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key')
+          if [ -n "$bad" ]; then
+            echo "::error::not passed: $(echo "$bad" | tr '\n' ' ')"
+            exit 1
+          fi
+
+  # ── CD ──────────────────────────────────────────────────────────────────
+  #
+  # `koan` only, after `Checks`. Every job states the results it depends on
+  # rather than relying on the default, which would skip it whenever any job
+  # upstream was skipped.
+
+  check-version:
+    name: Check Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes, checks]
+    if: ${{ !cancelled() && needs.checks.result == 'success' && needs.changes.outputs.release == 'true' && github.ref == 'refs/heads/koan' && github.event_name != 'pull_request' }}
+    env:
+      VERSION: ${{ needs.changes.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: gpui-koan
+          path: workspace
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Version pins
+        working-directory: workspace
+        run: |
+          # Every staged crate, and every requirement between them, carries
+          # the version being released: a stale sibling pin would publish a
+          # crate depending on the previous snapshot.
+          BAD=$(cargo metadata --no-deps --format-version 1 | jq -r --arg v "$VERSION" '
+            .packages[] as $p
+            | (if ($p.version | split("+")[0]) != $v then "\($p.name) \($p.version)" else empty end),
+              ($p.dependencies[]
+               | select(.name | startswith("gpui-koan"))
+               | select((.req | ltrimstr("=") | split("+")[0]) != $v)
+               | "\($p.name) -> \(.name) \(.req)")')
+          if [ -n "$BAD" ]; then
+            echo "::error::staged versions out of step with ${VERSION}:"
+            echo "$BAD"
+            exit 1
+          fi
+
+  publish-crate:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: [changes, check-version]
+    if: ${{ !cancelled() && needs.check-version.result == 'success' }}
+    env:
+      VERSION: ${{ needs.changes.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: gpui-koan
+          path: workspace
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Publish crates
+        working-directory: workspace
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # koan's step. `cargo publish --workspace` resolves dependency order
+        # itself and waits for each crate to appear in the index before
+        # publishing its dependents. No verification build: `Crates` verified
+        # this staged workspace already.
+        #
+        # Publishing is not idempotent: it errors on a version that already
+        # exists. A release retried after a partial publish (crates.io limits
+        # how many new crates arrive at once, so the first release may need a
+        # retry), or after a downstream failure, would fail here, so each
+        # crate already in the index at this version is excluded and only the
+        # rest go out.
+        run: |
+          EXCLUDE=()
+          PENDING=0
+          for crate in $(cargo metadata --no-deps --format-version 1 \
+                         | jq -r '.packages[] | select(.publish != []) | .name'); do
+            if curl -sf "https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}" \
+               | grep -q "\"vers\":\"${VERSION}+"; then
+              echo "${crate} ${VERSION} is already on crates.io"
+              EXCLUDE+=(--exclude "$crate")
+            else
+              PENDING=$((PENDING + 1))
+            fi
+          done
+          if [ "$PENDING" -eq 0 ]; then
+            echo "nothing to publish"
+            exit 0
+          fi
+          cargo publish --workspace --no-verify --allow-dirty "${EXCLUDE[@]}"
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes, publish-crate]
+    if: ${{ !cancelled() && needs.publish-crate.result == 'success' }}
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.changes.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Tag and release
+        run: |
+          gh release create "gpui-koan-v$VERSION" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "gpui-koan $VERSION" \
+            --notes "gpui-koan $VERSION, from \`koan\` at $GITHUB_SHA: Zed's GPUI with koan's commits, on crates.io as gpui-koan-*."
+
+  koan-pins:
+    name: Move koan's pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [changes, release]
+    if: ${{ !cancelled() && needs.release.result == 'success' && vars.GPUI_COMPONENT_REPO != '' }}
+    env:
+      VERSION: ${{ needs.changes.outputs.version }}
+      GH_TOKEN: ${{ secrets.KOAN_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: script/koan
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Open the koan pull request
+        run: |
+          set -euo pipefail
+          gh repo clone "$KOAN" "$RUNNER_TEMP/koan"
+          cd "$RUNNER_TEMP/koan"
+          git config user.name "gpui-koan"
+          git config user.email "gpui-koan@users.noreply.github.com"
+          git checkout -b "gpui-koan-$VERSION"
+          bun "$GITHUB_WORKSPACE/script/koan/point-koan.ts" --version "$VERSION"
+          cargo update -p gpui-koan
+          git commit -am "GPUI: gpui-koan $VERSION"
+          git push origin "gpui-koan-$VERSION"
+          gh pr create --title "GPUI: gpui-koan $VERSION" --label gpui \
+            --body "gpui-koan $VERSION, released from radiosilence/zed at ${GITHUB_SHA}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/gpui-koan-v${VERSION}"

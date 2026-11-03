@@ -1,0 +1,153 @@
+name: "koan: sync with Zed"
+# Weekly, and on demand: `main` follows Zed's main exactly, then `main` is
+# merged into `koan` (never rebased) and the merge is tested. Green: when the
+# merge changed what the gpui-koan crates hold, the version moves in a commit
+# of its own, and the push starts `koan: CI/CD`, which publishes it. A
+# conflict or a red test opens an issue on radiosilence/koan naming the
+# commits involved, and nothing is pushed to `koan`.
+#
+# Secrets:
+#   FORK_TOKEN    contents and workflows write on this repository. A push
+#                 with the job's own token would not start CI/CD, and a merge
+#                 bringing Zed's workflow changes needs the workflows scope.
+#   KOAN_TOKEN    issues on radiosilence/koan
+#   CARGO_REGISTRY_TOKEN  read only to tell whether publishing is set up:
+#                 until it is, the version is not moved
+on:
+  schedule:
+    - cron: "0 3 * * 2"
+  workflow_dispatch:
+
+concurrency:
+  group: koan-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ZED_UPSTREAM: https://github.com/zed-industries/zed
+  KOAN: radiosilence/koan
+  GPUI_KOAN_WORK: ${{ github.workspace }}/../gpui-koan
+
+jobs:
+  sync:
+    name: Sync
+    if: github.repository == 'radiosilence/zed'
+    # gpui_macos's build script compiles Metal shaders, which only macOS can.
+    runs-on: macos-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: koan
+          fetch-depth: 0
+          filter: blob:none
+          token: ${{ secrets.FORK_TOKEN }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Update main from Zed's main
+        id: main
+        run: |
+          set -euo pipefail
+          git config user.name "gpui-koan"
+          git config user.email "gpui-koan@users.noreply.github.com"
+          git remote add upstream "$ZED_UPSTREAM"
+          git fetch --filter=blob:none upstream main
+          # `main` is a mirror: Zed's main and nothing else, so this is
+          # always a fast-forward.
+          git push origin FETCH_HEAD:refs/heads/main
+          echo "zed=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Merge main into koan
+        id: merge
+        env:
+          ZED: ${{ steps.main.outputs.zed }}
+        run: |
+          set -euo pipefail
+          echo "before=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$ZED" HEAD; then
+            echo "koan already holds Zed's main"
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git merge --no-edit -m "Merge Zed's main into koan" "$ZED"; then
+            files=$(git diff --name-only --diff-filter=U)
+            {
+              echo "report<<EOF"
+              echo "The merge of Zed's main (${ZED:0:12}) into koan conflicts in:"
+              echo
+              echo "$files" | sed 's/^/- /'
+              echo
+              echo "The commits on each side touching them:"
+              echo
+              echo "$files" | xargs git log --oneline --no-merges HEAD...MERGE_HEAD -- | sed 's/^/- /'
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            exit 1
+          fi
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      - name: Test the merge
+        id: test
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          if ! cargo test -p gpui 2>&1 | tee "$RUNNER_TEMP/test.log"; then
+            {
+              echo "report<<EOF"
+              echo "The merge of Zed's main into koan fails its tests. koan's own commits:"
+              echo
+              git log --oneline --no-merges "${{ steps.main.outputs.zed }}..HEAD" | sed 's/^/- /'
+              echo
+              echo "Failing:"
+              echo
+              grep -E '^(test .* FAILED|error(\[|:))' "$RUNNER_TEMP/test.log" | head -20 | sed 's/^/- /'
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          # The crates as they would be published package and build.
+          bun script/koan/publish-gpui-koan.ts "$(cat script/koan/VERSION)" --zed . --dry-run
+
+      - name: Move the version where the crates changed
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::notice::publishing is not set up; the version stays"
+            exit 0
+          fi
+          answer=$(bun script/koan/publish-gpui-koan.ts --zed . --report-changes | tail -1)
+          if [ "$answer" != changed ]; then
+            echo "the published crates are unchanged; the version stays"
+            exit 0
+          fi
+          current=$(cat script/koan/VERSION)
+          next=$(echo "$current" | awk -F. '{ printf "%d.%d.%d\n", $1, $2, $3 + 1 }')
+          echo "$next" > script/koan/VERSION
+          git commit -m "gpui-koan $next" script/koan/VERSION
+
+      - name: Push koan
+        if: steps.merge.outputs.merged == 'true'
+        run: git push origin HEAD:koan
+
+      - name: Report
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.KOAN_TOKEN }}
+          REPORT: ${{ steps.merge.outputs.report || steps.test.outputs.report }}
+        run: |
+          gh issue create -R "$KOAN" --label gpui \
+            --title "gpui-koan: Zed's main does not merge into koan" \
+            --body "${REPORT:-The sync failed before the merge was tested.}
+
+          Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          main was updated; koan was not pushed."

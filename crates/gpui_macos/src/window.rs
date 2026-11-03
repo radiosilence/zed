@@ -1466,6 +1466,32 @@ impl Drop for MacWindow {
 /// This should be used when spawning foreground tasks interacting with the
 /// window, as some messages will end hard faulting if dispatched to no longer
 /// valid window handles.
+/// Whether a change the app made to a text input leaves an input method's
+/// composition standing somewhere it no longer belongs.
+fn discards_marked_text(change: gpui::TextInputStateChange) -> bool {
+    matches!(
+        change,
+        gpui::TextInputStateChange::ContentChanged
+            | gpui::TextInputStateChange::SelectionChanged
+    )
+}
+
+/// Tells `view`'s input context to discard the input method's composition,
+/// as an NSTextView does when its text or selection is changed under it.
+///
+/// # Safety
+///
+/// `view` is an NSView (or answers `inputContext` as one does).
+unsafe fn discard_marked_text(view: *mut AnyObject) {
+    unsafe {
+        let input_context: *mut AnyObject = msg_send![view, inputContext];
+        if input_context.is_null() {
+            return;
+        }
+        let _: () = msg_send![input_context, discardMarkedText];
+    }
+}
+
 fn if_window_not_closed(closed: Arc<AtomicBool>, f: impl FnOnce()) {
     if !closed.load(Ordering::Acquire) {
         f();
@@ -2195,6 +2221,25 @@ impl PlatformWindow for MacWindow {
 
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
         None
+    }
+
+    // The app changed the text or the selection itself, as a click elsewhere
+    // in a field does: an input method's composition no longer stands where
+    // it was, so AppKit is told to discard it.
+    fn text_input_state_changed(&self, change: gpui::TextInputStateChange) {
+        if !discards_marked_text(change) {
+            return;
+        }
+        // This window's own context: the current one is the key window's,
+        // which a field changed in a window behind it must not touch.
+        let this = self.0.lock();
+        let view = this.native_view;
+        let closed = this.closed.clone();
+        this.foreground_executor
+            .spawn(async move {
+                if_window_not_closed(closed, || unsafe { discard_marked_text(view.as_ptr()) })
+            })
+            .detach()
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
@@ -4130,6 +4175,64 @@ extern "C" fn toggle_tab_bar(this: &AnyObject, _sel: Sel, _id: *mut AnyObject) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static DISCARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn test_context_discard(_: &AnyObject, _: Sel) {
+        DISCARDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    extern "C" fn test_view_input_context(this: &AnyObject, _: Sel) -> *mut AnyObject {
+        unsafe {
+            *this
+                .class()
+                .instance_variable(c"testInputContext")
+                .expect("test input context ivar")
+                .load::<*mut AnyObject>(this)
+        }
+    }
+
+    #[test]
+    fn an_app_change_to_a_field_discards_the_composition() {
+        use gpui::TextInputStateChange::*;
+        assert!(discards_marked_text(ContentChanged));
+        assert!(discards_marked_text(SelectionChanged));
+        assert!(!discards_marked_text(FocusGained));
+        assert!(!discards_marked_text(FocusLost));
+
+        autoreleasepool(|_| unsafe {
+            let mut context = ClassBuilder::new(c"GPUIImeTestContext", class!(NSObject))
+                .expect("test context class");
+            context.add_method(
+                sel!(discardMarkedText),
+                test_context_discard as extern "C" fn(_, Sel),
+            );
+            let context: Retained<AnyObject> = msg_send![context.register(), new];
+
+            let mut view = ClassBuilder::new(c"GPUIImeTestView", class!(NSObject))
+                .expect("test view class");
+            view.add_ivar::<*mut AnyObject>(c"testInputContext");
+            view.add_method(
+                sel!(inputContext),
+                test_view_input_context as extern "C" fn(_, Sel) -> *mut AnyObject,
+            );
+            let view: Retained<AnyObject> = msg_send![view.register(), new];
+            let slot = view
+                .class()
+                .instance_variable(c"testInputContext")
+                .expect("test input context ivar")
+                .load_ptr::<*mut AnyObject>(&view);
+
+            let before = DISCARDS.load(std::sync::atomic::Ordering::SeqCst);
+            slot.write(ptr::null_mut());
+            discard_marked_text(Retained::as_ptr(&view).cast_mut());
+            assert_eq!(DISCARDS.load(std::sync::atomic::Ordering::SeqCst), before);
+
+            slot.write(Retained::as_ptr(&context).cast_mut());
+            discard_marked_text(Retained::as_ptr(&view).cast_mut());
+            assert_eq!(DISCARDS.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+        });
+    }
 
     extern "C" fn test_view_hit_test(this: &AnyObject, _: Sel, _: NSPoint) -> *mut AnyObject {
         // The view answers with itself: the forwarder must return it.

@@ -838,6 +838,7 @@ impl X11Client {
                         force_render: false,
                         signal_at: None,
                         signal_source: FrameRequestSource::NativeCallback,
+                        present_at: None,
                     });
                 }
             }
@@ -2136,6 +2137,7 @@ impl X11ClientState {
                                 force_render: false,
                                 signal_at: PlatformFrameSignal::capture(|| instant),
                                 signal_source: FrameRequestSource::LocalSchedule,
+                                present_at: None,
                             });
                             // A few refreshes no one asked for: nothing
                             // to draw. The frame waker restarts the timer.

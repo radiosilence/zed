@@ -8,10 +8,10 @@
 //! So motion that a program works out from `time` costs a present per
 //! refresh and nothing more, and a window at rest presents nothing.
 
+use scheduler::Instant;
 use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
 
 use parking_lot::{Mutex, ReentrantMutex, ReentrantMutexGuard};
 

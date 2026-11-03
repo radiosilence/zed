@@ -1394,6 +1394,7 @@ impl WindowsWindowInner {
             force_render,
             signal_at,
             signal_source,
+            present_at: None,
         });
 
         self.state.callbacks.request_frame.set(Some(request_frame));

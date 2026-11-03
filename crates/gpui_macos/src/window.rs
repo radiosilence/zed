@@ -3447,10 +3447,16 @@ fn metal_frame(
     };
     lock.renderer.set_frame_drawable(Some(update.drawable()));
     drop(lock);
+    // How far ahead of now this frame reaches the screen, on the display
+    // link's clock.
+    let lead = update.targetPresentationTimestamp() - objc2_quartz_core::CACurrentMediaTime();
+    let present_at = scheduler::Instant::now()
+        + std::time::Duration::try_from_secs_f64(lead.clamp(0.0, 0.1)).unwrap_or_default();
     metal_frames.begin_frame();
     callback(RequestFrameOptions {
         signal_at,
         signal_source: FrameRequestSource::NativeCallback,
+        present_at: Some(present_at),
         ..Default::default()
     });
     let mut lock = window_state.lock();

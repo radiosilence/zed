@@ -50,6 +50,27 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub shaders: Vec<crate::PaintShader>,
+    /// Which drawn frame this scene holds, so a renderer can tell a
+    /// re-present of the same frame from a new one.
+    pub generation: u64,
+    /// The scene as layers its shaders are drawn between, so a re-present
+    /// composes them rather than drawing the whole scene; `None` where the
+    /// shaders cannot be drawn apart from the rest.
+    pub shader_layers: Option<Box<ShaderLayers>>,
+}
+
+/// A scene with shaders, split where they are drawn: `layers[0]` first, then
+/// the shaders of `groups[0]` (a range of `Scene::shaders`), then
+/// `layers[1]`, and so on, `layers` one longer than `groups`. Each layer
+/// holds the scene's other primitives drawn between those shaders, with
+/// their orders, ready for a renderer to draw into a texture of its own.
+#[derive(Default)]
+pub struct ShaderLayers {
+    /// The primitives drawn before, between and after the groups.
+    pub layers: Vec<Scene>,
+    /// Each group's shaders, as a range of `Scene::shaders`.
+    pub groups: Vec<Range<usize>>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +87,24 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.shaders.clear();
+    }
+
+    /// Whether a shader on screen asks for the window to present every
+    /// refresh at `now`.
+    pub fn has_live_shaders(&self, now: std::time::Instant) -> bool {
+        self.shaders
+            .iter()
+            .any(|shader| shader.uniforms.is_live(now))
+    }
+
+    /// Whether this refresh at `now` should present again: a shader's
+    /// uniforms changed, or one moves with time. Asks every shader, so each
+    /// one's change is taken once.
+    pub fn take_shader_present(&self, now: std::time::Instant) -> bool {
+        self.shaders
+            .iter()
+            .fold(false, |any, shader| shader.uniforms.take_present(now) | any)
     }
 
     pub fn len(&self) -> usize {
@@ -133,6 +172,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::Shader(shader) => {
+                shader.order = order;
+                self.shaders.push(shader.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -160,6 +203,174 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        // Kept together by program and image within an order.
+        self.shaders.sort_by_key(|shader| {
+            (
+                shader.order,
+                shader.program as *const crate::ShaderProgram as usize,
+                shader.image.as_ref().map(|tile| tile.texture_id.index),
+            )
+        });
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.shader_layers = self.plan_shader_layers().map(Box::new);
+    }
+
+    /// Whether this scene holds no primitives.
+    pub fn is_blank(&self) -> bool {
+        self.shadows.is_empty()
+            && self.quads.is_empty()
+            && self.paths.is_empty()
+            && self.underlines.is_empty()
+            && self.monochrome_sprites.is_empty()
+            && self.subpixel_sprites.is_empty()
+            && self.polychrome_sprites.is_empty()
+            && self.surfaces.is_empty()
+            && self.shaders.is_empty()
+    }
+
+    // Splits the scene where its shaders are drawn.
+    //
+    // Shaders in draw order are grouped, a new group starting at a shader
+    // that overlaps one already in the group, so shaders side by side are
+    // drawn as one group. Every other primitive must be drawn after
+    // each shader it overlaps with a lower order (at equal orders the shader
+    // is drawn last), after every primitive drawn before it that it
+    // overlaps, and before each shader it overlaps with an equal or higher
+    // order. It goes in the lowest layer meeting the first two; if that is
+    // past a group it must precede, the scene cannot be split and is drawn
+    // whole. Layers then hold what is drawn between groups, each in its own
+    // draw order, so a composed present draws everything in the order a
+    // whole one would wherever two things overlap.
+    fn plan_shader_layers(&self) -> Option<ShaderLayers> {
+        if self.shaders.is_empty() {
+            return None;
+        }
+        let visible = |bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
+            bounds.intersect(&mask.bounds)
+        };
+        let shaders: Vec<_> = self
+            .shaders
+            .iter()
+            .map(|s| (s.order, visible(&s.bounds, &s.content_mask)))
+            .collect();
+        let mut groups = Vec::new();
+        let mut group_of = Vec::with_capacity(shaders.len());
+        let mut start = 0;
+        for (i, (_, bounds)) in shaders.iter().enumerate() {
+            if shaders[start..i].iter().any(|(_, b)| b.intersects(bounds)) {
+                groups.push(start..i);
+                start = i;
+            }
+            group_of.push(groups.len());
+        }
+        groups.push(start..shaders.len());
+
+        // Each other primitive in the order the renderer draws them: by
+        // order, then kind, then place in its list.
+        let mut drawn: Vec<(DrawOrder, PrimitiveKind, usize, Bounds<ScaledPixels>)> = Vec::new();
+        macro_rules! collect {
+            ($($list:ident => $kind:ident),*) => {$(
+                for (i, p) in self.$list.iter().enumerate() {
+                    drawn.push((p.order, PrimitiveKind::$kind, i, visible(&p.bounds, &p.content_mask)));
+                }
+            )*};
+        }
+        collect!(
+            shadows => Shadow,
+            quads => Quad,
+            paths => Path,
+            underlines => Underline,
+            monochrome_sprites => MonochromeSprite,
+            subpixel_sprites => SubpixelSprite,
+            polychrome_sprites => PolychromeSprite,
+            surfaces => Surface
+        );
+        drawn.sort_unstable_by_key(|(order, kind, i, _)| (*order, *kind, *i));
+
+        // From the shaders alone: the layer after the last group holding a
+        // shader drawn before it that it overlaps, and the first group
+        // holding one it overlaps that is drawn after it (a shader is drawn
+        // after what shares its order).
+        let by_shaders = |order: DrawOrder, bounds: &Bounds<ScaledPixels>| {
+            let (mut after, mut before) = (0, usize::MAX);
+            for (k, (o, s)) in shaders.iter().enumerate() {
+                if s.intersects(bounds) {
+                    if *o < order {
+                        after = after.max(group_of[k] + 1);
+                    } else {
+                        before = before.min(group_of[k]);
+                    }
+                }
+            }
+            (after, before)
+        };
+        let placed: Vec<(usize, usize)> =
+            drawn.iter().map(|(o, _, _, b)| by_shaders(*o, b)).collect();
+        // A primitive also follows every earlier one it overlaps, so a menu's
+        // text stays over the menu's ground wherever each is placed. Only
+        // what sits above the lowest layer anything was placed in can raise
+        // another, which is the little drawn over a shader: those are kept.
+        let floor = placed.iter().map(|(after, _)| *after).min().unwrap_or(0);
+        let mut raised: Vec<(Bounds<ScaledPixels>, usize)> = Vec::new();
+        let mut layers_by_kind: Vec<Vec<usize>> = vec![Vec::new(); 8];
+        for kind in 0..8 {
+            let len = match kind {
+                0 => self.shadows.len(),
+                1 => self.quads.len(),
+                2 => self.paths.len(),
+                3 => self.underlines.len(),
+                4 => self.monochrome_sprites.len(),
+                5 => self.subpixel_sprites.len(),
+                6 => self.polychrome_sprites.len(),
+                _ => self.surfaces.len(),
+            };
+            layers_by_kind[kind] = vec![0; len];
+        }
+        for ((_, kind, i, bounds), (after, before)) in drawn.iter().zip(&placed) {
+            let mut layer = *after;
+            for (b, l) in &raised {
+                if *l > layer && b.intersects(bounds) {
+                    layer = *l;
+                }
+            }
+            if layer > *before {
+                return None;
+            }
+            if layer > floor {
+                raised.push((*bounds, layer));
+            }
+            layers_by_kind[*kind as usize][*i] = layer;
+        }
+
+        let mut layers: Vec<Scene> = (0..=groups.len()).map(|_| Scene::default()).collect();
+        macro_rules! split {
+            ($($list:ident => $kind:ident),*) => {$(
+                for (p, layer) in self.$list.iter().zip(&layers_by_kind[PrimitiveKind::$kind as usize]) {
+                    layers[*layer].$list.push(p.clone());
+                }
+            )*};
+        }
+        split!(
+            shadows => Shadow,
+            quads => Quad,
+            underlines => Underline,
+            monochrome_sprites => MonochromeSprite,
+            subpixel_sprites => SubpixelSprite,
+            polychrome_sprites => PolychromeSprite,
+            surfaces => Surface
+        );
+        for (path, layer) in self
+            .paths
+            .iter()
+            .zip(&layers_by_kind[PrimitiveKind::Path as usize])
+        {
+            let paths = &mut layers[*layer].paths;
+            let mut path = path.clone();
+            path.id = PathId(paths.len());
+            paths.push(path);
+        }
+        Some(ShaderLayers { layers, groups })
     }
 
     #[cfg_attr(
@@ -187,6 +398,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            shaders_start: 0,
+            shaders_iter: self.shaders.iter().peekable(),
         }
     }
 }
@@ -209,6 +422,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    Shader,
 }
 
 pub(crate) enum PaintOperation {
@@ -228,6 +442,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    Shader(crate::PaintShader),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +457,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::Shader(shader) => &shader.bounds,
         }
     }
 
@@ -255,6 +471,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::Shader(shader) => &shader.content_mask,
         }
     }
 }
@@ -283,6 +500,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    shaders_start: usize,
+    shaders_iter: Peekable<slice::Iter<'a, crate::PaintShader>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -315,6 +534,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.shaders_iter.peek().map(|s| s.order),
+                PrimitiveKind::Shader,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -461,6 +684,32 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            // One batch per run of one program and image.
+            PrimitiveKind::Shader => {
+                let first = self.shaders_iter.peek().unwrap();
+                let (program, texture) =
+                    (first.program, first.image.as_ref().map(|t| t.texture_id));
+                let shaders_start = self.shaders_start;
+                let mut shaders_end = shaders_start + 1;
+                self.shaders_iter.next();
+                while self
+                    .shaders_iter
+                    .next_if(|shader| {
+                        (shader.order, batch_kind) < max_order_and_kind
+                            && std::ptr::eq(shader.program, program)
+                            && shader.image.as_ref().map(|t| t.texture_id) == texture
+                    })
+                    .is_some()
+                {
+                    shaders_end += 1;
+                }
+                self.shaders_start = shaders_end;
+                Some(PrimitiveBatch::Shaders {
+                    program,
+                    texture,
+                    range: shaders_start..shaders_end,
+                })
+            }
         }
     }
 }
@@ -493,6 +742,11 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    Shaders {
+        program: &'static crate::ShaderProgram,
+        texture: Option<AtlasTextureId>,
+        range: Range<usize>,
+    },
 }
 
 impl PrimitiveBatch {
@@ -525,6 +779,9 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::Shaders { program, range, .. } => {
+                format!("shaders ({}) of {}", range.len(), program.name)
+            }
         }
     }
 }

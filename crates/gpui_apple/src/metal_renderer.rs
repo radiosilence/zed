@@ -31,7 +31,7 @@ use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc, time::Instant};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -143,6 +143,16 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    /// Each shader program's pipeline, by the program's address, compiled
+    /// the first time it is drawn; `None` for one that would not compile,
+    /// which is not tried again.
+    shader_pipelines: std::cell::RefCell<std::collections::HashMap<usize, Option<Pipeline>>>,
+    /// The last frame drawn as the layers its shaders are drawn between,
+    /// which each present composes with the shaders.
+    shader_layers: ShaderLayerTextures,
+    compose_pipelines: Option<ComposePipelines>,
+    /// What a shader with no image is given to sample.
+    blank_texture: Option<Texture>,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
@@ -431,6 +441,10 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            shader_pipelines: Default::default(),
+            shader_layers: Default::default(),
+            compose_pipelines: None,
+            blank_texture: None,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -628,7 +642,17 @@ impl MetalRenderer {
             (texture.height() as i32).into(),
         );
 
-        let command_buffer = match self.render_frame(scene, &drawable.texture(), viewport_size) {
+        // A scene with shaders is drawn once as the layers they are drawn
+        // between, and each present composes the layers with the shaders, so
+        // re-presenting a moving shader costs the shaders and a few
+        // full-screen copies, not the scene.
+        let rendered = if scene.shader_layers.is_some() {
+            self.compose_frame(scene, &texture, viewport_size, Instant::now())
+        } else {
+            self.shader_layers.release();
+            self.render_frame(scene, &texture, viewport_size, false)
+        };
+        let command_buffer = match rendered {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
@@ -651,6 +675,7 @@ impl MetalRenderer {
         scene: &Scene,
         texture: &ProtocolObject<dyn MTLTexture>,
         viewport_size: Size<DevicePixels>,
+        transparent: bool,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         if self.path_intermediate_texture.is_none() {
             self.update_path_intermediate_textures(viewport_size)?;
@@ -680,6 +705,7 @@ impl MetalRenderer {
             texture,
             viewport_size,
             &mut surface_textures,
+            transparent,
         )?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
@@ -772,7 +798,7 @@ impl MetalRenderer {
             .newTextureWithDescriptor(&texture_descriptor)
             .context("allocating offscreen render target")?;
 
-        let command_buffer = self.render_frame(scene, &target_texture, size)?;
+        let command_buffer = self.render_frame(scene, &target_texture, size, false)?;
 
         // Managed textures require an explicit blit synchronize before the CPU
         // can read back the rendered data. Without this, get_bytes returns
@@ -832,7 +858,7 @@ impl MetalRenderer {
                 .clone()
                 .context("retrieving headless render target")?;
 
-            let command_buffer = self.render_frame(scene, &target_texture, size)?;
+            let command_buffer = self.render_frame(scene, &target_texture, size, false)?;
 
             // Commit without waiting, mirroring presentation to a real window where
             // the CPU doesn't block on the GPU.
@@ -849,12 +875,13 @@ impl MetalRenderer {
         texture: &ProtocolObject<dyn MTLTexture>,
         viewport_size: Size<DevicePixels>,
         surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
+        transparent: bool,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue
             .commandBuffer()
             .context("creating command buffer")?;
-        let alpha = if self.opaque { 1. } else { 0. };
+        let alpha = if self.opaque && !transparent { 1. } else { 0. };
 
         let mut command_encoder = new_command_encoder_for_texture(
             &command_buffer,
@@ -925,6 +952,18 @@ impl MetalRenderer {
                         viewport_size,
                         &command_encoder,
                     ),
+                PrimitiveBatch::Shaders {
+                    program,
+                    texture,
+                    range,
+                } => self.draw_shaders(
+                    program,
+                    texture,
+                    range,
+                    instance_bindings,
+                    viewport_size,
+                    &command_encoder,
+                ),
                 PrimitiveBatch::Surfaces(range) => {
                     if let Err(error) = self.draw_surfaces(
                         &scene.surfaces[range.clone()],
@@ -1072,6 +1111,345 @@ impl MetalRenderer {
                 6,
                 shadows.len(),
                 shadows.start,
+            );
+        }
+    }
+
+    /// Renders a scene as a window with shaders presents it, the layers
+    /// first and the shaders composed over them, `presents` times, for
+    /// checking against `render_scene_to_image`.
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    pub fn compose_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        presents: usize,
+    ) -> Result<RgbaImage> {
+        objc2::rc::autoreleasepool(|_| {
+            self.update_path_intermediate_textures(size)?;
+            let texture_descriptor = MTLTextureDescriptor::new();
+            // SAFETY: The dimensions are positive and this descriptor creates a 2D texture.
+            unsafe {
+                texture_descriptor.setWidth(size.width.0 as usize);
+                texture_descriptor.setHeight(size.height.0 as usize);
+            }
+            texture_descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            texture_descriptor
+                .setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+            let uses_shared_storage = cfg!(target_os = "ios") || self.is_apple_gpu;
+            texture_descriptor.setStorageMode(if uses_shared_storage {
+                MTLStorageMode::Shared
+            } else {
+                MTLStorageMode::Managed
+            });
+            let target_texture = self
+                .device
+                .newTextureWithDescriptor(&texture_descriptor)
+                .context("allocating compose target")?;
+            let mut last = None;
+            for _ in 0..presents.max(1) {
+                let command_buffer =
+                    self.compose_frame(scene, &target_texture, size, Instant::now())?;
+                command_buffer.commit();
+                last = Some(command_buffer);
+            }
+            let command_buffer = last.context("no present")?;
+            command_buffer.waitUntilCompleted();
+            if !uses_shared_storage {
+                let command_buffer = self
+                    .command_queue
+                    .commandBuffer()
+                    .context("creating command buffer")?;
+                let blit = command_buffer
+                    .blitCommandEncoder()
+                    .context("creating blit command encoder")?;
+                blit.synchronizeResource(ProtocolObject::from_ref(&*target_texture));
+                blit.endEncoding();
+                command_buffer.commit();
+                command_buffer.waitUntilCompleted();
+            }
+            read_texture_to_image(&target_texture)
+        })
+    }
+
+    /// A texture the size of the frame, to draw a layer into and read back
+    /// texel for texel.
+    fn layer_texture(&self, width: usize, height: usize) -> Result<Texture> {
+        let descriptor = MTLTextureDescriptor::new();
+        // SAFETY: The dimensions are the drawable's and this descriptor creates a 2D texture.
+        unsafe {
+            descriptor.setWidth(width);
+            descriptor.setHeight(height);
+        }
+        descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        descriptor.setStorageMode(MTLStorageMode::Private);
+        self.device
+            .newTextureWithDescriptor(&descriptor)
+            .context("allocating a layer texture")
+    }
+
+    /// Composes the scene's layers and shaders into `texture`, drawing the
+    /// layers first if this scene's are not drawn yet, with the shaders'
+    /// uniforms as they stand for a present at `at`.
+    fn compose_frame(
+        &mut self,
+        scene: &Scene,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        viewport_size: Size<DevicePixels>,
+        at: Instant,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        let plan = scene.shader_layers.as_deref().context("no shader layers")?;
+        let width = i32::from(viewport_size.width) as usize;
+        let height = i32::from(viewport_size.height) as usize;
+        if self.path_intermediate_texture.is_none() {
+            self.update_path_intermediate_textures(viewport_size)?;
+        }
+        if self.blank_texture.is_none() {
+            let descriptor = MTLTextureDescriptor::new();
+            // SAFETY: a 1×1 2D texture.
+            unsafe {
+                descriptor.setWidth(1);
+                descriptor.setHeight(1);
+            }
+            descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            descriptor.setStorageMode(MTLStorageMode::Private);
+            self.blank_texture = Some(
+                self.device
+                    .newTextureWithDescriptor(&descriptor)
+                    .context("allocating the blank texture")?,
+            );
+        }
+        if self.compose_pipelines.is_none() {
+            self.compose_pipelines = Some(ComposePipelines::new(&self.device)?);
+        }
+        let held = self.shader_layers.holds(scene.generation, width, height)
+            && self.shader_layers.layers.len() == plan.layers.len();
+        if !held {
+            let mut pool = self.shader_layers.take(width, height);
+            let mut drawn = Vec::with_capacity(plan.layers.len());
+            for (k, layer) in plan.layers.iter().enumerate() {
+                if layer.is_blank() {
+                    drawn.push(None);
+                    continue;
+                }
+                let target = match pool.pop() {
+                    Some(target) => target,
+                    None => self.layer_texture(width, height)?,
+                };
+                // The same queue runs these before the compose that reads them.
+                self.render_frame(layer, &target, viewport_size, k > 0)?
+                    .commit();
+                drawn.push(Some(target));
+            }
+            self.shader_layers = ShaderLayerTextures {
+                generation: scene.generation,
+                width,
+                height,
+                layers: drawn,
+            };
+        }
+        let pipelines = self
+            .compose_pipelines
+            .clone()
+            .context("missing compose pipelines")?;
+
+        let mut writer = InstanceBufferWriter::new(
+            &self.device,
+            &self.instance_buffer_pool,
+            self.is_unified_memory,
+        )?;
+        let shaders = writer.write_iter(
+            scene
+                .shaders
+                .iter()
+                .map(|shader| gpui::ShaderInstance::of(shader, at)),
+        )?;
+        let command_buffer = self
+            .command_queue
+            .commandBuffer()
+            .context("creating command buffer")?;
+        let render_pass_descriptor = MTLRenderPassDescriptor::new();
+        // SAFETY: Index zero is within the render pass's color attachment array.
+        let color_attachment = unsafe {
+            render_pass_descriptor
+                .colorAttachments()
+                .objectAtIndexedSubscript(0)
+        };
+        color_attachment.setTexture(Some(texture));
+        color_attachment.setStoreAction(MTLStoreAction::Store);
+        let first = self.shader_layers.layers.first().cloned().flatten();
+        if first.is_some() {
+            color_attachment.setLoadAction(MTLLoadAction::DontCare);
+        } else {
+            let alpha = if self.opaque { 1. } else { 0. };
+            color_attachment.setLoadAction(MTLLoadAction::Clear);
+            color_attachment.setClearColor(MTLClearColor {
+                red: 0.,
+                green: 0.,
+                blue: 0.,
+                alpha,
+            });
+        }
+        let encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
+            .context("creating render command encoder")?;
+        encoder.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: width as f64,
+            height: height as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        let layer = |encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+                     pipeline: &Pipeline,
+                     texture: &Texture| {
+            encoder.setRenderPipelineState(pipeline);
+            // SAFETY: the compose program reads texture 0 texel for texel and
+            // draws one triangle covering the target.
+            unsafe {
+                encoder.setFragmentTexture_atIndex(Some(texture), 0);
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        };
+        if let Some(first) = &first {
+            layer(&encoder, &pipelines.copy, first);
+        }
+        let bindings = ShaderBindings(shaders);
+        for (k, group) in plan.groups.iter().enumerate() {
+            let mut start = group.start;
+            while start < group.end {
+                let head = &scene.shaders[start];
+                let key = |s: &gpui::PaintShader| {
+                    (
+                        s.program as *const gpui::ShaderProgram,
+                        s.image.as_ref().map(|t| t.texture_id),
+                    )
+                };
+                let end = scene.shaders[start..group.end]
+                    .iter()
+                    .position(|s| key(s) != key(head))
+                    .map_or(group.end, |n| start + n);
+                self.draw_shaders(
+                    head.program,
+                    head.image.as_ref().map(|t| t.texture_id),
+                    start..end,
+                    &bindings,
+                    viewport_size,
+                    &encoder,
+                );
+                start = end;
+            }
+            if let Some(Some(over)) = self.shader_layers.layers.get(k + 1) {
+                layer(&encoder, &pipelines.over, over);
+            }
+        }
+        encoder.endEncoding();
+
+        let instance_buffer_pool = self.instance_buffer_pool.clone();
+        let instance_buffer = Cell::new(Some(writer.finish()));
+        let block = RcBlock::new(
+            move |_: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                if let Some(instance_buffer) = instance_buffer.take() {
+                    instance_buffer_pool.lock().release(instance_buffer);
+                }
+            },
+        );
+        // SAFETY: as in `render_frame`.
+        unsafe {
+            command_buffer.addCompletedHandler(RcBlock::as_ptr(&block));
+        }
+        Ok(command_buffer)
+    }
+
+    /// A program's pipeline, compiled from its source the first time it is
+    /// drawn: the app's `shade` between a prelude declaring the instance and
+    /// a vertex and fragment function calling it.
+    fn shader_pipeline(&self, program: &'static gpui::ShaderProgram) -> Option<Pipeline> {
+        let mut pipelines = self.shader_pipelines.borrow_mut();
+        pipelines
+            .entry(program as *const gpui::ShaderProgram as usize)
+            .or_insert_with(|| {
+                let source = format!("{SHADER_PRELUDE}\n{}\n{SHADER_MAIN}", program.msl);
+                let library = match self.device.newLibraryWithSource_options_error(
+                    &NSString::from_str(&source),
+                    Some(&objc2_metal::MTLCompileOptions::new()),
+                ) {
+                    Ok(library) => library,
+                    Err(error) => {
+                        log::error!(
+                            "shader {} did not compile: {}",
+                            program.name,
+                            error.localizedDescription()
+                        );
+                        return None;
+                    }
+                };
+                build_pipeline_state(
+                    &self.device,
+                    &library,
+                    program.name,
+                    "shader_vertex",
+                    "shader_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                )
+                .inspect_err(|error| log::error!("shader {}: {error:#}", program.name))
+                .ok()
+            })
+            .clone()
+    }
+
+    fn draw_shaders(
+        &self,
+        program: &'static gpui::ShaderProgram,
+        texture: Option<AtlasTextureId>,
+        shaders: Range<usize>,
+        instance_bindings: &impl HasShaders,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    ) {
+        let binding = instance_bindings.shaders();
+        if shaders.is_empty() {
+            return;
+        }
+        let Some(pipeline) = self.shader_pipeline(program) else {
+            return;
+        };
+        command_encoder.setRenderPipelineState(&pipeline);
+        let image = texture
+            .and_then(|id| self.sprite_atlas.metal_texture(id))
+            .or_else(|| self.blank_texture.clone());
+        let viewport = [
+            i32::from(viewport_size.width) as f32,
+            i32::from(viewport_size.height) as f32,
+        ];
+        // SAFETY: six unit vertices and the shader range match the instances
+        // written for this frame; the viewport bytes are copied.
+        unsafe {
+            command_encoder.setVertexBuffer_offset_atIndex(Some(&self.unit_vertices), 0, 0);
+            command_encoder.setVertexBuffer_offset_atIndex(
+                Some(&binding.buffer),
+                binding.offset,
+                1,
+            );
+            command_encoder.setFragmentBuffer_offset_atIndex(
+                Some(&binding.buffer),
+                binding.offset,
+                1,
+            );
+            command_encoder.setFragmentTexture_atIndex(image.as_deref(), 0);
+            command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(&viewport).cast(),
+                mem::size_of_val(&viewport),
+                2,
+            );
+            command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                MTLPrimitiveType::Triangle,
+                0,
+                6,
+                shaders.len(),
+                shaders.start,
             );
         }
     }
@@ -1673,7 +2051,204 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
+    shaders: InstanceBinding,
 }
+
+/// The Metal objects the shader-quad code holds.
+type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
+type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
+
+/// The layers of the last frame drawn with shaders, `None` for a blank one,
+/// kept while presents compose them.
+#[derive(Default)]
+struct ShaderLayerTextures {
+    generation: u64,
+    width: usize,
+    height: usize,
+    layers: Vec<Option<Texture>>,
+}
+
+impl ShaderLayerTextures {
+    fn holds(&self, generation: u64, width: usize, height: usize) -> bool {
+        self.generation == generation
+            && self.width == width
+            && self.height == height
+            && !self.layers.is_empty()
+    }
+
+    /// The textures, to be drawn again, where they are the size wanted.
+    fn take(&mut self, width: usize, height: usize) -> Vec<Texture> {
+        let same = self.width == width && self.height == height;
+        let layers = std::mem::take(&mut self.layers);
+        if same {
+            layers.into_iter().flatten().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn release(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Where a frame's shader instances are, whether written with the whole
+/// scene or alone for a compose.
+trait HasShaders {
+    fn shaders(&self) -> &InstanceBinding;
+}
+
+impl HasShaders for InstanceBindings {
+    fn shaders(&self) -> &InstanceBinding {
+        &self.shaders
+    }
+}
+
+struct ShaderBindings(InstanceBinding);
+
+impl HasShaders for ShaderBindings {
+    fn shaders(&self) -> &InstanceBinding {
+        &self.0
+    }
+}
+
+/// Draws a layer into the drawable as one triangle covering it, read texel
+/// for texel: unblended for the first, and over what is there for the rest,
+/// whose colours are premultiplied, as drawing over a clear layer leaves
+/// them.
+const COMPOSE_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+vertex float4 compose_vertex(uint id [[vertex_id]]) {
+    float2 p = float2((id << 1) & 2, id & 2);
+    return float4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fragment float4 compose_fragment(
+    float4 position [[position]],
+    texture2d<float, access::read> layer [[texture(0)]]
+) {
+    return layer.read(uint2(position.xy));
+}
+"#;
+
+#[derive(Clone)]
+struct ComposePipelines {
+    copy: Pipeline,
+    over: Pipeline,
+}
+
+impl ComposePipelines {
+    fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self> {
+        let library = device
+            .newLibraryWithSource_options_error(
+                &NSString::from_str(COMPOSE_SOURCE),
+                Some(&objc2_metal::MTLCompileOptions::new()),
+            )
+            .map_err(|error| anyhow::anyhow!("compose shader: {}", error.localizedDescription()))?;
+        let vertex = library
+            .newFunctionWithName(&NSString::from_str("compose_vertex"))
+            .context("locating compose_vertex")?;
+        let fragment = library
+            .newFunctionWithName(&NSString::from_str("compose_fragment"))
+            .context("locating compose_fragment")?;
+        let pipeline = |over: bool| {
+            let descriptor = MTLRenderPipelineDescriptor::new();
+            descriptor.setLabel(Some(&NSString::from_str(if over {
+                "compose_over"
+            } else {
+                "compose_copy"
+            })));
+            descriptor.setVertexFunction(Some(vertex.as_ref()));
+            descriptor.setFragmentFunction(Some(fragment.as_ref()));
+            // SAFETY: Index zero is within the pipeline's color attachment array.
+            let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+            color.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            color.setBlendingEnabled(over);
+            if over {
+                color.setRgbBlendOperation(MTLBlendOperation::Add);
+                color.setAlphaBlendOperation(MTLBlendOperation::Add);
+                color.setSourceRGBBlendFactor(MTLBlendFactor::One);
+                color.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+                color.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+                color.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+            }
+            device
+                .newRenderPipelineStateWithDescriptor_error(&descriptor)
+                .map_err(|error| {
+                    anyhow::anyhow!("compose pipeline: {}", error.localizedDescription())
+                })
+        };
+        Ok(Self {
+            copy: pipeline(false)?,
+            over: pipeline(true)?,
+        })
+    }
+}
+
+/// What a program's `shade` is compiled between: the instance, the image
+/// sampler, and the vertex and fragment functions calling `shade`.
+const SHADER_PRELUDE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ShaderInstance {
+    float4 bounds;
+    float4 clip;
+    float4 uniforms[20];
+    float4 time;
+    float4 tile;
+};
+
+// The quad's image at `uv`, 0 to 1 across it, filtered and kept off the
+// texels around its tile in the atlas.
+float4 sample_image(texture2d<float> image, float4 tile, float2 uv) {
+    constexpr sampler linear(filter::linear, address::clamp_to_edge);
+    float2 extent = float2(image.get_width(), image.get_height());
+    float2 at = clamp(tile.xy + uv * tile.zw, tile.xy + 0.5, tile.xy + tile.zw - 0.5);
+    return image.sample(linear, at / extent);
+}
+
+struct ShaderVarying {
+    float4 position [[position]];
+    float2 local;
+    uint instance [[flat]];
+};
+"#;
+
+const SHADER_MAIN: &str = r#"
+vertex ShaderVarying shader_vertex(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant float2 *unit [[buffer(0)]],
+    constant ShaderInstance *instances [[buffer(1)]],
+    constant float2 *viewport [[buffer(2)]]
+) {
+    ShaderInstance s = instances[instance_id];
+    float2 u = unit[vertex_id];
+    float2 p = s.bounds.xy + u * s.bounds.zw;
+    float2 ndc = p / *viewport * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    ShaderVarying out;
+    out.position = float4(ndc, 0.0, 1.0);
+    out.local = u * s.bounds.zw;
+    out.instance = instance_id;
+    return out;
+}
+
+fragment float4 shader_fragment(
+    ShaderVarying in [[stage_in]],
+    constant ShaderInstance *instances [[buffer(1)]],
+    texture2d<float> image [[texture(0)]]
+) {
+    constant ShaderInstance &s = instances[in.instance];
+    float2 p = in.position.xy;
+    if (any(p < s.clip.xy) || any(p > s.clip.xy + s.clip.zw)) {
+        discard_fragment();
+    }
+    return shade(in.local, s.bounds.zw, s.time.x, (constant float *)s.uniforms, image, s.tile);
+}
+"#;
 
 fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
     Ok(InstanceBindings {
@@ -1686,6 +2261,16 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
             bounds: surface.bounds,
             content_mask: surface.content_mask,
         }))?,
+        // The shaders' uniforms as they are for this present.
+        shaders: {
+            let now = Instant::now();
+            writer.write_iter(
+                scene
+                    .shaders
+                    .iter()
+                    .map(|shader| gpui::ShaderInstance::of(shader, now)),
+            )?
+        },
     })
 }
 
@@ -2127,6 +2712,7 @@ mod tests {
                 &scene,
                 &target_texture,
                 size(DevicePixels(16), DevicePixels(16)),
+                false,
             )
             .unwrap();
         if !uses_shared_storage {
@@ -2140,5 +2726,155 @@ mod tests {
         command_buffer.waitUntilCompleted();
         assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(read_texture_to_image(&target_texture).unwrap(), image);
+    }
+
+    // A scene with a shader nothing covers, presented as a
+    // window presents it (the base kept, the shaders composed over it), is
+    // the same picture as the whole scene drawn at once, and a re-present
+    // reads the uniforms afresh.
+    #[test]
+    fn a_composed_present_matches_a_whole_render() {
+        static PROGRAM: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-half",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return position.x < size.x * u[0] ? float4(1.0, 0.0, 0.0, 0.5) : float4(0.0);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds {
+            origin: Point::new(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        };
+        let uniforms = Arc::new(gpui::ShaderUniforms::new());
+        uniforms.set(0, 0.5);
+        let scene = |cover: bool| {
+            let mut scene = Scene::default();
+            let whole = rect(0.0, 0.0, 64.0, 32.0);
+            scene.insert_primitive(gpui::Quad {
+                bounds: whole,
+                content_mask: ContentMask { bounds: whole },
+                background: gpui::hsla(0.6, 0.5, 0.5, 1.0).into(),
+                ..Default::default()
+            });
+            let shader = rect(8.0, 8.0, 32.0, 16.0);
+            scene.insert_primitive(gpui::PaintShader {
+                order: 0,
+                bounds: shader,
+                content_mask: ContentMask { bounds: shader },
+                program: &PROGRAM,
+                uniforms: uniforms.clone(),
+                image: None,
+            });
+            let over = if cover {
+                rect(30.0, 10.0, 20.0, 4.0)
+            } else {
+                rect(50.0, 10.0, 10.0, 4.0)
+            };
+            scene.insert_primitive(gpui::Quad {
+                bounds: over,
+                content_mask: ContentMask { bounds: over },
+                background: gpui::hsla(0.1, 0.8, 0.5, 1.0).into(),
+                ..Default::default()
+            });
+            scene.finish();
+            scene
+        };
+        let viewport = size(DevicePixels(64), DevicePixels(32));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        // Layers over a shader are composed premultiplied in 8 bits, so a
+        // translucent edge may round a level apart.
+        let close = |a: &RgbaImage, b: &RgbaImage| {
+            a.as_raw()
+                .iter()
+                .zip(b.as_raw())
+                .all(|(x, y)| x.abs_diff(*y) <= 1)
+        };
+        for covered in [false, true] {
+            let scene = scene(covered);
+            let plan = scene.shader_layers.as_deref().expect("a plan");
+            assert_eq!(plan.groups.len(), 1);
+            assert_eq!(plan.layers[1].is_blank(), !covered);
+            uniforms.set(0, 0.5);
+            let whole = renderer.render_scene_to_image(&scene, viewport).unwrap();
+            let composed = renderer
+                .compose_scene_to_image(&scene, viewport, 2)
+                .unwrap();
+            assert!(close(&whole, &composed), "covered: {covered}");
+
+            uniforms.set(0, 1.0);
+            let moved = renderer
+                .compose_scene_to_image(&scene, viewport, 1)
+                .unwrap();
+            assert_ne!(moved.as_raw(), composed.as_raw());
+            let whole = renderer.render_scene_to_image(&scene, viewport).unwrap();
+            assert!(close(&whole, &moved), "covered: {covered}, moved");
+        }
+    }
+
+    // Something drawn over a shader keeps what is drawn over
+    // it in turn on top, where that sits clear of the shader: a menu over a
+    // playing row keeps its text.
+    #[test]
+    fn what_covers_a_shader_keeps_its_own_order() {
+        static PROGRAM: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-solid",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return float4(0.0, 1.0, 0.0, 1.0);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds {
+            origin: Point::new(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        };
+        let quad = |b: Bounds<ScaledPixels>, hue: f32| gpui::Quad {
+            bounds: b,
+            content_mask: ContentMask { bounds: b },
+            background: gpui::hsla(hue, 0.8, 0.5, 1.0).into(),
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        let shader = rect(4.0, 4.0, 16.0, 16.0);
+        scene.insert_primitive(gpui::PaintShader {
+            order: 0,
+            bounds: shader,
+            content_mask: ContentMask { bounds: shader },
+            program: &PROGRAM,
+            uniforms: Arc::new(gpui::ShaderUniforms::new()),
+            image: None,
+        });
+        // A menu over the shader, and its text over the menu, clear of it.
+        scene.insert_primitive(quad(rect(12.0, 8.0, 40.0, 16.0), 0.1));
+        scene.insert_primitive(quad(rect(32.0, 12.0, 12.0, 8.0), 0.6));
+        scene.finish();
+        let plan = scene.shader_layers.as_deref().expect("a plan");
+        assert!(plan.layers[1].quads.len() == 2, "the text follows the menu");
+
+        let viewport = size(DevicePixels(64), DevicePixels(32));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        let whole = renderer.render_scene_to_image(&scene, viewport).unwrap();
+        let composed = renderer
+            .compose_scene_to_image(&scene, viewport, 1)
+            .unwrap();
+        assert_eq!(
+            whole.get_pixel(36, 16),
+            composed.get_pixel(36, 16),
+            "the text is on top"
+        );
+        assert!(
+            whole
+                .as_raw()
+                .iter()
+                .zip(composed.as_raw())
+                .all(|(a, b)| a.abs_diff(*b) <= 1)
+        );
     }
 }

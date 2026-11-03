@@ -39,7 +39,6 @@ pub const SHADER_UNIFORMS: usize = 80;
 ///
 /// A program is compiled the first time it is drawn and kept for as long as
 /// the renderer lives, by the address of its `static`.
-#[derive(Debug)]
 pub struct ShaderProgram {
     /// What the compiled program is labelled with in a GPU debugger.
     pub name: &'static str,
@@ -52,8 +51,45 @@ pub struct ShaderProgram {
     /// the uniforms' origin to the frame's presentation, in double precision.
     /// It may rewrite the copy, and returns the `time` the program sees, so
     /// an app can keep `time` small and exact however long it runs. Without
-    /// it, the program sees that time as an `f32`.
-    pub prepare: Option<fn(&mut [f32; SHADER_UNIFORMS], f64) -> f32>,
+    /// it, the program sees that time as an `f32`. A function, or a closure
+    /// made once and kept, so one can serve several programs.
+    pub prepare: Option<&'static (dyn Fn(&mut [f32; SHADER_UNIFORMS], f64) -> f32 + Send + Sync)>,
+}
+
+impl std::fmt::Debug for ShaderProgram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShaderProgram")
+            .field("name", &self.name)
+            .field("prepare", &self.prepare.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+static GPU_TIMING: AtomicBool = AtomicBool::new(false);
+static GPU_TIMES: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+
+/// Starts or stops keeping each command buffer's time on the GPU, which the
+/// renderers report through [`record_gpu_time`]: what a frame of shaders
+/// costs, read without a GPU profiler.
+pub fn gpu_timing(on: bool) {
+    GPU_TIMING.store(on, Ordering::Relaxed);
+}
+
+/// Whether GPU times are being kept.
+pub fn gpu_timing_on() -> bool {
+    GPU_TIMING.load(Ordering::Relaxed)
+}
+
+/// A command buffer's time on the GPU, in seconds, kept while timing is on.
+pub fn record_gpu_time(seconds: f64) {
+    if gpu_timing_on() {
+        GPU_TIMES.lock().push(seconds);
+    }
+}
+
+/// The GPU times kept since last taken, in seconds.
+pub fn take_gpu_times() -> Vec<f64> {
+    std::mem::take(&mut *GPU_TIMES.lock())
 }
 
 /// The instant shader time counts from when the uniforms set no origin.
@@ -639,5 +675,36 @@ mod tests {
             std::mem::size_of::<ShaderInstance>(),
             4 * (4 + 4 + SHADER_UNIFORMS + 4 + 4)
         );
+    }
+
+    #[test]
+    fn prepare_rewrites_the_copy_and_sets_the_time() {
+        static HALVED: ShaderProgram = ShaderProgram {
+            name: "test-prepare",
+            msl: "",
+            wgsl: "",
+            prepare: Some(&|u, seconds| {
+                u[0] *= 0.5;
+                (seconds * 2.0) as f32
+            }),
+        };
+        let uniforms = Arc::new(ShaderUniforms::new());
+        uniforms.set(0, 8.0);
+        let origin = shader_epoch() + Duration::from_secs(10);
+        uniforms.set_origin(origin);
+        let shader = PaintShader {
+            order: 0,
+            bounds: Default::default(),
+            content_mask: Default::default(),
+            program: &HALVED,
+            uniforms: uniforms.clone(),
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        };
+        let instance = ShaderInstance::of(&shader, origin + Duration::from_secs(3));
+        assert_eq!(instance.uniforms[0], 4.0);
+        assert_eq!(instance.time[0], 6.0);
+        assert_eq!(uniforms.get(0), 8.0, "the app's copy is left as it was");
     }
 }

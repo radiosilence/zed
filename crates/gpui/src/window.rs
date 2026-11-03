@@ -4971,6 +4971,15 @@ impl Window {
         }
     }
 
+    /// The number of shader quads in the most recently rendered frame's
+    /// scene, layer groups' included.
+    pub fn painted_shader_count(&self) -> usize {
+        fn count(scene: &crate::Scene) -> usize {
+            scene.shaders.len() + scene.layer_groups.iter().map(count).sum::<usize>()
+        }
+        count(&self.rendered_frame.scene)
+    }
+
     /// When the frame being made now is expected to reach the screen, as
     /// the platform last said: what shaders reckon their time at, and what
     /// an app retargeting a moving value should sample it at. Never before

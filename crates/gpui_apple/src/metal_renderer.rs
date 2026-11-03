@@ -730,7 +730,8 @@ impl MetalRenderer {
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let frame_resources = Cell::new(Some((writer.finish(), surface_textures)));
         let block = RcBlock::new(
-            move |_: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            move |buffer: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                note_gpu_time(buffer);
                 if let Some((instance_buffer, _surface_textures)) = frame_resources.take() {
                     instance_buffer_pool.lock().release(instance_buffer);
                 }
@@ -1405,7 +1406,8 @@ impl MetalRenderer {
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
         let block = RcBlock::new(
-            move |_: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            move |buffer: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                note_gpu_time(buffer);
                 if let Some(instance_buffer) = instance_buffer.take() {
                     instance_buffer_pool.lock().release(instance_buffer);
                 }
@@ -2227,6 +2229,26 @@ struct InstanceBindings {
 
 /// The buffer index the stock shaders read the dynamic colour table from.
 const DYNAMIC_COLORS_INDEX: usize = 20;
+
+/// A finished command buffer's time on the GPU, for `gpui::take_gpu_times`,
+/// while a measurement keeps them.
+fn note_gpu_time(buffer: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>) {
+    if !gpui::gpu_timing_on() {
+        return;
+    }
+    // SAFETY: Metal hands the completed handler its live command buffer,
+    // an MTLCommandBuffer, which answers both selectors with a time.
+    let (start, end): (f64, f64) = unsafe {
+        let buffer = buffer.as_ref();
+        (
+            objc2::msg_send![buffer, GPUStartTime],
+            objc2::msg_send![buffer, GPUEndTime],
+        )
+    };
+    if end > start {
+        gpui::record_gpu_time(end - start);
+    }
+}
 
 /// The Metal objects the shader-quad code holds.
 type Texture = Retained<ProtocolObject<dyn MTLTexture>>;

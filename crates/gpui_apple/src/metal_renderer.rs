@@ -150,6 +150,11 @@ pub struct MetalRenderer {
     /// The last frame drawn as the layers its shaders are drawn between,
     /// which each present composes with the shaders.
     shader_layers: ShaderLayerTextures,
+    /// Each layer group's texture, the frame they were drawn for, and
+    /// whether each group moved when last drawn.
+    group_textures: Vec<Option<Texture>>,
+    group_generation: u64,
+    group_moving: Vec<bool>,
     compose_pipelines: Option<ComposePipelines>,
     /// What a shader with no image is given to sample.
     blank_texture: Option<Texture>,
@@ -443,6 +448,9 @@ impl MetalRenderer {
             surfaces_pipeline_state,
             shader_pipelines: Default::default(),
             shader_layers: Default::default(),
+            group_textures: Vec::new(),
+            group_generation: 0,
+            group_moving: Vec::new(),
             compose_pipelines: None,
             blank_texture: None,
             unit_vertices,
@@ -642,6 +650,10 @@ impl MetalRenderer {
             (texture.height() as i32).into(),
         );
 
+        // Each layer group drawn into its texture first.
+        if let Err(error) = self.draw_layer_groups(scene, viewport_size) {
+            log::error!("failed to draw layer groups: {error:#}");
+        }
         // A scene with shaders is drawn once as the layers they are drawn
         // between, and each present composes the layers with the shaders, so
         // re-presenting a moving shader costs the shaders and a few
@@ -776,6 +788,7 @@ impl MetalRenderer {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             anyhow::bail!("Invalid size for render_offscreen: {:?}", size);
         }
+        self.draw_layer_groups(scene, size)?;
 
         let texture_descriptor = MTLTextureDescriptor::new();
         // SAFETY: The dimensions are positive and this descriptor creates a 2D texture.
@@ -955,10 +968,12 @@ impl MetalRenderer {
                 PrimitiveBatch::Shaders {
                     program,
                     texture,
+                    group,
                     range,
                 } => self.draw_shaders(
                     program,
                     texture,
+                    group,
                     range,
                     instance_bindings,
                     viewport_size,
@@ -1127,6 +1142,7 @@ impl MetalRenderer {
     ) -> Result<RgbaImage> {
         objc2::rc::autoreleasepool(|_| {
             self.update_path_intermediate_textures(size)?;
+            self.draw_layer_groups(scene, size)?;
             let texture_descriptor = MTLTextureDescriptor::new();
             // SAFETY: The dimensions are positive and this descriptor creates a 2D texture.
             unsafe {
@@ -1324,15 +1340,18 @@ impl MetalRenderer {
                     (
                         s.program as *const gpui::ShaderProgram,
                         s.image.as_ref().map(|t| t.texture_id),
+                        s.group,
                     )
                 };
+                // A layer group's shader is drawn alone, with its texture.
                 let end = scene.shaders[start..group.end]
                     .iter()
-                    .position(|s| key(s) != key(head))
-                    .map_or(group.end, |n| start + n);
+                    .position(|s| key(s) != key(head) || s.group.is_some())
+                    .map_or(group.end, |n| (start + n).max(start + 1));
                 self.draw_shaders(
                     head.program,
                     head.image.as_ref().map(|t| t.texture_id),
+                    head.group,
                     start..end,
                     &bindings,
                     viewport_size,
@@ -1360,6 +1379,80 @@ impl MetalRenderer {
             command_buffer.addCompletedHandler(RcBlock::as_ptr(&block));
         }
         Ok(command_buffer)
+    }
+
+    /// Each layer group's scene drawn into a texture of its own: the
+    /// visible part of the shader composing it, its content moved to the
+    /// texture's origin, or the window's size for one holding paths or too
+    /// large. A group is drawn again when the frame is new or when
+    /// `Scene::layer_group_stale` says so. Groups nested in others are drawn
+    /// first, as their composing shader is in the enclosing group's scene.
+    fn draw_layer_groups(
+        &mut self,
+        scene: &Scene,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<()> {
+        if scene.layer_groups.is_empty() {
+            self.group_textures.clear();
+            self.group_moving.clear();
+            return Ok(());
+        }
+        if self.path_intermediate_texture.is_none() {
+            self.update_path_intermediate_textures(viewport_size)?;
+        }
+        let now = scene.present_time();
+        let new_frame = self.group_generation != scene.generation;
+        let count = scene.layer_groups.len();
+        if new_frame {
+            self.group_moving.clear();
+        }
+        self.group_moving.resize(count, false);
+        let mut redrawn = vec![false; count];
+        let sizes: Vec<Size<DevicePixels>> = scene
+            .layer_group_frames
+            .iter()
+            .map(|frame| match frame {
+                Some(frame) => size(
+                    DevicePixels((frame.size.width.0.ceil() as i32).max(1)),
+                    DevicePixels((frame.size.height.0.ceil() as i32).max(1)),
+                ),
+                None => viewport_size,
+            })
+            .collect();
+        let mut held = std::mem::take(&mut self.group_textures);
+        held.resize(count, None);
+        for index in (0..count).rev() {
+            let group = &scene.layer_groups[index];
+            if group.is_blank() {
+                held[index] = None;
+                continue;
+            }
+            let extent = sizes[index];
+            let width = i32::from(extent.width) as usize;
+            let height = i32::from(extent.height) as usize;
+            let fits = held[index]
+                .as_ref()
+                .is_some_and(|t| t.width() == width && t.height() == height);
+            let stale =
+                scene.layer_group_stale(index, now, &mut self.group_moving[index], &redrawn);
+            if fits && !new_frame && !stale {
+                continue;
+            }
+            redrawn[index] = true;
+            let target = match held[index].take().filter(|_| fits) {
+                Some(target) => target,
+                None => self.layer_texture(width, height)?,
+            };
+            // Drawn with the groups so far in place, which a group nested in
+            // this one is (higher indices first). The same queue runs these
+            // before whatever samples them.
+            self.group_textures = held.clone();
+            self.render_frame(group, &target, extent, true)?.commit();
+            held[index] = Some(target);
+        }
+        self.group_textures = held;
+        self.group_generation = scene.generation;
+        Ok(())
     }
 
     /// A program's pipeline, compiled from its source the first time it is
@@ -1403,6 +1496,7 @@ impl MetalRenderer {
         &self,
         program: &'static gpui::ShaderProgram,
         texture: Option<AtlasTextureId>,
+        group: Option<usize>,
         shaders: Range<usize>,
         instance_bindings: &impl HasShaders,
         viewport_size: Size<DevicePixels>,
@@ -1416,8 +1510,9 @@ impl MetalRenderer {
             return;
         };
         command_encoder.setRenderPipelineState(&pipeline);
-        let image = texture
-            .and_then(|id| self.sprite_atlas.metal_texture(id))
+        let image = group
+            .and_then(|group| self.group_textures.get(group).cloned().flatten())
+            .or_else(|| texture.and_then(|id| self.sprite_atlas.metal_texture(id)))
             .or_else(|| self.blank_texture.clone());
         let viewport = [
             i32::from(viewport_size.width) as f32,
@@ -2201,11 +2296,16 @@ struct ShaderInstance {
 };
 
 // The quad's image at `uv`, 0 to 1 across it, filtered and kept off the
-// texels around its tile in the atlas.
+// texels around its tile in the atlas. Past the texture's edge it is clear,
+// as a layer group's texture holds only its visible part.
 float4 sample_image(texture2d<float> image, float4 tile, float2 uv) {
     constexpr sampler linear(filter::linear, address::clamp_to_edge);
     float2 extent = float2(image.get_width(), image.get_height());
-    float2 at = clamp(tile.xy + uv * tile.zw, tile.xy + 0.5, tile.xy + tile.zw - 0.5);
+    float2 raw = tile.xy + uv * tile.zw;
+    if (any(raw < 0.0) || any(raw > extent)) {
+        return float4(0.0);
+    }
+    float2 at = clamp(raw, tile.xy + 0.5, tile.xy + tile.zw - 0.5);
     return image.sample(linear, at / extent);
 }
 
@@ -2766,6 +2866,8 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
                 program: &PROGRAM,
                 uniforms: uniforms.clone(),
                 image: None,
+                group: None,
+                group_inset: Default::default(),
             });
             let over = if cover {
                 rect(30.0, 10.0, 20.0, 4.0)
@@ -2848,6 +2950,8 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
             program: &PROGRAM,
             uniforms: Arc::new(gpui::ShaderUniforms::new()),
             image: None,
+            group: None,
+            group_inset: Default::default(),
         });
         // A menu over the shader, and its text over the menu, clear of it.
         scene.insert_primitive(quad(rect(12.0, 8.0, 40.0, 16.0), 0.1));
@@ -2875,5 +2979,95 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
                 .zip(composed.as_raw())
                 .all(|(a, b)| a.abs_diff(*b) <= 1)
         );
+    }
+
+    // A layer group at rest, partly outside the window, composed through its
+    // texture gives the pixels its content does drawn without a group: the
+    // offset, the clipped frame, the tile and the texture's viewport agree.
+    #[test]
+    fn a_group_at_rest_matches_its_content() {
+        static HALF: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-group-half",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return position.x < size.x * u[0] ? float4(1.0, 0.0, 0.0, 0.5) : float4(0.0);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        static IDENTITY: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-group-identity",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    float4 c = sample_image(image, tile, position / size);
+    float3 rgb = c.a > 0.0 ? c.rgb / c.a : float3(0.0);
+    return float4(rgb, c.a);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds {
+            origin: Point::new(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        };
+        let quad = |at: Bounds<ScaledPixels>, hue: f32| gpui::Quad {
+            bounds: at,
+            content_mask: ContentMask { bounds: at },
+            background: gpui::hsla(hue, 0.5, 0.5, 1.0).into(),
+            ..Default::default()
+        };
+        let shader = |at: Bounds<ScaledPixels>, program| gpui::PaintShader {
+            order: 0,
+            bounds: at,
+            content_mask: ContentMask { bounds: at },
+            program,
+            uniforms: Arc::new(gpui::ShaderUniforms::new()),
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        };
+        let scene = |grouped: bool| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(rect(0.0, 0.0, 64.0, 32.0), 0.6));
+            if grouped {
+                scene.push_group();
+            }
+            scene.insert_primitive(quad(rect(10.0, 10.0, 20.0, 10.0), 0.3));
+            let half = shader(rect(30.0, 8.0, 24.0, 16.0), &HALF);
+            half.uniforms.set(0, 0.5);
+            scene.insert_primitive(half);
+            if grouped {
+                let mut compose = shader(rect(4.0, 4.0, 80.0, 40.0), &IDENTITY);
+                compose.content_mask = ContentMask {
+                    bounds: rect(0.0, 0.0, 64.0, 32.0),
+                };
+                scene.pop_group(compose);
+            }
+            scene.finish();
+            scene
+        };
+        let grouped = scene(true);
+        assert_eq!(
+            grouped.layer_group_frames[0],
+            Some(rect(4.0, 4.0, 60.0, 28.0))
+        );
+        let viewport = size(DevicePixels(64), DevicePixels(32));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        let plain = renderer
+            .compose_scene_to_image(&scene(false), viewport, 1)
+            .unwrap();
+        let composed = renderer
+            .compose_scene_to_image(&grouped, viewport, 1)
+            .unwrap();
+        let worst = plain
+            .as_raw()
+            .iter()
+            .zip(composed.as_raw())
+            .map(|(x, y)| x.abs_diff(*y))
+            .max();
+        assert!(worst <= Some(2), "worst channel difference {worst:?}");
     }
 }

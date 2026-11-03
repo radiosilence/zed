@@ -68,10 +68,15 @@ struct ShaderInstance {
 @group(2) @binding(1) var s_shader_image: sampler;
 
 // The quad's image at `uv`, 0 to 1 across it, filtered and kept off the
-// texels around its tile in the atlas.
+// texels around its tile in the atlas. Past the texture's edge it is clear,
+// as a layer group's texture holds only its visible part.
 fn sample_image(tile: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
     let extent = vec2<f32>(textureDimensions(t_shader_image, 0));
-    let at = clamp(tile.xy + uv * tile.zw, tile.xy + 0.5, tile.xy + tile.zw - 0.5);
+    let raw = tile.xy + uv * tile.zw;
+    if (any(raw < vec2<f32>(0.0)) || any(raw > extent)) {
+        return vec4<f32>(0.0);
+    }
+    let at = clamp(raw, tile.xy + 0.5, tile.xy + tile.zw - 0.5);
     return textureSampleLevel(t_shader_image, s_shader_image, at / extent, 0.0);
 }
 
@@ -320,6 +325,12 @@ struct WgpuResources {
     /// which each present composes with the shaders, and the pipelines that
     /// lay a layer down.
     shader_layers: ShaderLayers,
+    /// Each layer group's texture.
+    layer_groups: ShaderLayers,
+    /// Whether drawing a scene drops the atlas bind groups it does not use:
+    /// not while a layer group is drawn, which would drop the window's and
+    /// the other groups' each frame.
+    prune_bind_groups: bool,
     compose_pipelines: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
 }
 
@@ -329,6 +340,8 @@ struct ShaderLayers {
     generation: u64,
     size: (u32, u32),
     layers: Vec<Option<(wgpu::Texture, wgpu::BindGroup)>>,
+    /// For layer groups: whether each moved when last drawn.
+    moving: Vec<bool>,
 }
 
 struct CachedTextureBindGroup {
@@ -1359,6 +1372,10 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+        // Each layer group drawn into its texture first.
+        if let Err(error) = core.draw_layer_groups(scene, size, premultiplied_alpha) {
+            log::error!("failed to draw layer groups: {error:#}");
+        }
         // A scene with shaders is drawn once as the layers they are drawn
         // between, and each present composes them with the shaders.
         let rendered = if scene.shader_layers.is_some() && !core.uses_webgl_instance_data {
@@ -1561,6 +1578,8 @@ impl WgpuRendererCore {
                 shader_color_target,
                 blank_texture_bind_group,
                 shader_layers: ShaderLayers::default(),
+                layer_groups: ShaderLayers::default(),
+                prune_bind_groups: true,
                 compose_pipelines: None,
             },
             atlas,
@@ -1643,7 +1662,11 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
-        self.ensure_intermediate_textures(size);
+        // A layer group the size of its bounds holds no paths, and resizing
+        // the path textures to it would reallocate them each frame.
+        if self.resources().prune_bind_groups || !scene.paths.is_empty() {
+            self.ensure_intermediate_textures(size);
+        }
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1844,6 +1867,7 @@ impl WgpuRendererCore {
                     PrimitiveBatch::Shaders {
                         program,
                         texture,
+                        group,
                         range,
                     } => {
                         if let Some(instances) = &shader_instances {
@@ -1851,6 +1875,7 @@ impl WgpuRendererCore {
                                 instances,
                                 program,
                                 texture,
+                                group,
                                 instance_range(range),
                                 &mut pass,
                             );
@@ -1948,9 +1973,30 @@ impl WgpuRendererCore {
             }
         }
 
-        self.resources_mut()
-            .atlas_texture_bind_groups
-            .retain(|texture_id, _| texture_ids.contains(texture_id));
+        // What the scene's layer groups use is kept too, and a group's own
+        // drawing drops nothing.
+        for group in &scene.layer_groups {
+            for batch in group.batches() {
+                let texture_id = match batch {
+                    PrimitiveBatch::MonochromeSprites { texture_id, .. }
+                    | PrimitiveBatch::SubpixelSprites { texture_id, .. }
+                    | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
+                    PrimitiveBatch::Shaders {
+                        texture: Some(texture_id),
+                        ..
+                    } => texture_id,
+                    _ => continue,
+                };
+                if !texture_ids.contains(&texture_id) {
+                    texture_ids.push(texture_id);
+                }
+            }
+        }
+        if self.resources().prune_bind_groups {
+            self.resources_mut()
+                .atlas_texture_bind_groups
+                .retain(|texture_id, _| texture_ids.contains(texture_id));
+        }
 
         for texture_id in texture_ids {
             let Some(texture_info) = self.atlas.get_texture_info(texture_id) else {
@@ -2059,6 +2105,111 @@ impl WgpuRendererCore {
         Ok(())
     }
 
+    /// Each layer group's scene drawn into a texture of its own, over
+    /// clear: the visible part of the shader composing it, its content moved
+    /// to the texture's origin, or the window's size for one holding paths or
+    /// too large. A group is drawn again when the frame is new or when
+    /// `Scene::layer_group_stale` says so. Groups nested in others are drawn
+    /// first, as their composing shader is in the enclosing group's scene. A
+    /// texture keeps its bind group while its size holds.
+    fn draw_layer_groups(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        premultiplied_alpha: bool,
+    ) -> Result<()> {
+        if scene.layer_groups.is_empty() {
+            self.resources_mut().layer_groups = ShaderLayers::default();
+            return Ok(());
+        }
+        let now = scene.present_time();
+        let new_frame = self.resources().layer_groups.generation != scene.generation;
+        let count = scene.layer_groups.len();
+        let mut moving = std::mem::take(&mut self.resources_mut().layer_groups.moving);
+        if new_frame {
+            moving.clear();
+        }
+        moving.resize(count, false);
+        let mut redrawn = vec![false; count];
+        let extents: Vec<Size<DevicePixels>> = scene
+            .layer_group_frames
+            .iter()
+            .map(|frame| match frame {
+                Some(frame) => Size {
+                    width: DevicePixels((frame.size.width.0.ceil() as i32).max(1)),
+                    height: DevicePixels((frame.size.height.0.ceil() as i32).max(1)),
+                },
+                None => size,
+            })
+            .collect();
+        let mut held = std::mem::take(&mut self.resources_mut().layer_groups.layers);
+        held.resize_with(scene.layer_groups.len(), || None);
+        self.resources_mut().prune_bind_groups = false;
+        let mut result = Ok(());
+        for index in (0..scene.layer_groups.len()).rev() {
+            let group = &scene.layer_groups[index];
+            if group.is_blank() {
+                held[index] = None;
+                continue;
+            }
+            let extent = extents[index];
+            let (width, height) = (extent.width.0 as u32, extent.height.0 as u32);
+            let fits = held[index]
+                .as_ref()
+                .is_some_and(|(t, _)| t.width() == width && t.height() == height);
+            let stale = scene.layer_group_stale(index, now, &mut moving[index], &redrawn);
+            if fits && !new_frame && !stale {
+                continue;
+            }
+            redrawn[index] = true;
+            let (texture, bind_group) = match held[index].take().filter(|_| fits) {
+                Some(kept) => kept,
+                None => {
+                    let resources = self.resources();
+                    let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("layer_group"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: self.target_format,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    });
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let bind_group = self.create_texture_bind_group("layer_group", &view);
+                    (texture, bind_group)
+                }
+            };
+            // The groups so far in place, which a group nested in this one
+            // is (higher indices first).
+            self.resources_mut().layer_groups.layers = held.clone();
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            if let Err(error) = self.render_frame(
+                group,
+                &view,
+                extent,
+                premultiplied_alpha,
+                wgpu::Color::TRANSPARENT,
+            ) {
+                result = Err(error);
+            }
+            held[index] = Some((texture, bind_group));
+        }
+        self.resources_mut().prune_bind_groups = true;
+        let groups = &mut self.resources_mut().layer_groups;
+        groups.layers = held;
+        groups.moving = moving;
+        groups.generation = scene.generation;
+        groups.size = (size.width.0 as u32, size.height.0 as u32);
+        result
+    }
+
     /// Composes the scene's layers and shaders into `target`, drawing the
     /// layers first if this scene's are not drawn yet, with the shaders'
     /// uniforms as they stand when the present reaches the screen.
@@ -2133,6 +2284,7 @@ impl WgpuRendererCore {
                 generation: scene.generation,
                 size: extent,
                 layers: drawn,
+                moving: Vec::new(),
             };
         }
         if self.resources().compose_pipelines.is_none() {
@@ -2206,16 +2358,19 @@ impl WgpuRendererCore {
                         (
                             s.program as *const gpui::ShaderProgram,
                             s.image.as_ref().map(|t| t.texture_id),
+                            s.group,
                         )
                     };
+                    // A layer group's shader is drawn alone, with its texture.
                     let end = scene.shaders[start..group.end]
                         .iter()
-                        .position(|s| key(s) != key(head))
-                        .map_or(group.end, |n| start + n);
+                        .position(|s| key(s) != key(head) || s.group.is_some())
+                        .map_or(group.end, |n| (start + n).max(start + 1));
                     self.draw_shaders(
                         &instances,
                         head.program,
                         head.image.as_ref().map(|t| t.texture_id),
+                        head.group,
                         start as u32..end as u32,
                         &mut pass,
                     );
@@ -2360,6 +2515,7 @@ impl WgpuRendererCore {
         instances: &InstanceBinding,
         program: &'static gpui::ShaderProgram,
         texture: Option<AtlasTextureId>,
+        group: Option<usize>,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
     ) {
@@ -2368,13 +2524,15 @@ impl WgpuRendererCore {
         let Some(Some(pipeline)) = resources.shader_pipelines.get(&key) else {
             return;
         };
-        let image = match texture {
-            Some(id) => match resources.atlas_texture_bind_groups.get(&id) {
+        let grouped = group.and_then(|g| resources.layer_groups.layers.get(g)?.as_ref());
+        let image = match (grouped, texture) {
+            (Some((_, bind_group)), _) => bind_group,
+            (None, Some(id)) => match resources.atlas_texture_bind_groups.get(&id) {
                 Some(cached) => &cached.bind_group,
                 // Released by the atlas: a stale paint, replaced soon.
                 None => return,
             },
-            None => &resources.blank_texture_bind_group,
+            (None, None) => &resources.blank_texture_bind_group,
         };
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
@@ -3017,6 +3175,7 @@ impl WgpuHeadlessRenderer {
             .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
             .view
             .clone();
+        self.core.draw_layer_groups(scene, size, false)?;
         self.core
             .render_frame(scene, &view, size, false, wgpu::Color::BLACK)?;
         Ok(())
@@ -3038,6 +3197,7 @@ impl WgpuHeadlessRenderer {
             .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
             .view
             .clone();
+        self.core.draw_layer_groups(scene, size, false)?;
         self.core.compose_frame(scene, &view, size, false)?;
         self.read_image()
     }
@@ -3600,6 +3760,8 @@ fn shade(position: vec2<f32>, size: vec2<f32>, time: f32, u: array<vec4<f32>, 20
             program: &HALF,
             uniforms: uniforms.clone(),
             image: None,
+            group: None,
+            group_inset: Default::default(),
         });
         scene.finish();
         let size = Size {
@@ -3665,6 +3827,8 @@ fn shade(position: vec2<f32>, size: vec2<f32>, time: f32, u: array<vec4<f32>, 20
             program: &SOLID,
             uniforms: uniforms.clone(),
             image: None,
+            group: None,
+            group_inset: Default::default(),
         }
     }
 

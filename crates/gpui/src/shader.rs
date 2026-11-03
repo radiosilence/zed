@@ -343,6 +343,16 @@ pub struct PaintShader {
     pub uniforms: std::sync::Arc<ShaderUniforms>,
     /// The image the program samples, in the sprite atlas.
     pub image: Option<AtlasTile>,
+    /// The layer group the program samples as its image: what was painted
+    /// inside [`Window::paint_layer_group`](crate::Window::paint_layer_group),
+    /// drawn into a texture of its own.
+    pub group: Option<usize>,
+    /// Where the shader's origin sits in its group's texture, which holds
+    /// the visible part of the shader's bounds with its content moved to the
+    /// texture's origin, or is the window's size with its content where it
+    /// was painted. Taken when the group closes, so an enclosing group
+    /// moving the shader leaves it as it is.
+    pub group_inset: crate::Point<ScaledPixels>,
 }
 
 impl From<PaintShader> for Primitive {
@@ -397,15 +407,25 @@ impl ShaderInstance {
             clip: rect(&shader.content_mask.bounds),
             uniforms,
             time: [time, 0.0, 0.0, 0.0],
-            tile: shader.image.as_ref().map_or([0.0; 4], |tile| {
-                let b = tile.bounds;
-                [
-                    b.origin.x.0 as f32,
-                    b.origin.y.0 as f32,
-                    b.size.width.0 as f32,
-                    b.size.height.0 as f32,
-                ]
-            }),
+            tile: match (&shader.image, shader.group) {
+                (Some(tile), _) => {
+                    let b = tile.bounds;
+                    [
+                        b.origin.x.0 as f32,
+                        b.origin.y.0 as f32,
+                        b.size.width.0 as f32,
+                        b.size.height.0 as f32,
+                    ]
+                }
+                // A group's texture holds the quad's bounds from its inset.
+                (None, Some(_)) => [
+                    shader.group_inset.x.0,
+                    shader.group_inset.y.0,
+                    shader.bounds.size.width.0,
+                    shader.bounds.size.height.0,
+                ],
+                (None, None) => [0.0; 4],
+            },
         }
     }
 }

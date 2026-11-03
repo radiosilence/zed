@@ -4991,8 +4991,40 @@ impl Window {
             program,
             uniforms,
             image: None,
+            group: None,
+            group_inset: Default::default(),
         };
         self.next_frame.scene.insert_primitive(shader);
+    }
+
+    /// Paints what `paint` paints into a texture of its own, which `program`
+    /// composes over `bounds` at each present, sampling it with
+    /// `sample_image`: content drawn once and moved, clipped or faded by the
+    /// program with no frame drawn. The texture is premultiplied.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_layer_group(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        program: &'static crate::ShaderProgram,
+        uniforms: Arc<crate::ShaderUniforms>,
+        cx: &mut App,
+        paint: impl FnOnce(&mut Self, &mut App),
+    ) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.scene.push_group();
+        paint(self, cx);
+        let shader = crate::PaintShader {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            program,
+            uniforms,
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        };
+        self.next_frame.scene.pop_group(shader);
     }
 
     /// Paints a quad drawn by `program` sampling `image` (`sample_image` in
@@ -5027,6 +5059,8 @@ impl Window {
             program,
             uniforms,
             image: Some(tile),
+            group: None,
+            group_inset: Default::default(),
         };
         self.next_frame.scene.insert_primitive(shader);
         Ok(())

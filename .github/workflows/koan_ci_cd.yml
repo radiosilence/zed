@@ -30,7 +30,7 @@ permissions:
 
 env:
   KOAN: radiosilence/koan
-  GPUI_KOAN_WORK: ${{ github.workspace }}/../gpui-koan
+  GPUI_KOAN_WORK: ${{ github.workspace }}/target/gpui-koan
 
 jobs:
   changes:

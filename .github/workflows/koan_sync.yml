@@ -28,7 +28,7 @@ permissions:
 env:
   ZED_UPSTREAM: https://github.com/zed-industries/zed
   KOAN: radiosilence/koan
-  GPUI_KOAN_WORK: ${{ github.workspace }}/../gpui-koan
+  GPUI_KOAN_WORK: ${{ github.workspace }}/target/gpui-koan
 
 jobs:
   sync:

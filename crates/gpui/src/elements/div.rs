@@ -3854,6 +3854,9 @@ pub(crate) fn register_tooltip_mouse_handlers(
                         window,
                         cx,
                     ) {
+                        // As for a hover, the element's own view draws again,
+                        // in case it is cached.
+                        cx.notify(current_view);
                         long_press_tooltip_active.set(true);
                         window.prevent_default();
                         cx.stop_propagation();
@@ -3980,6 +3983,11 @@ fn handle_tooltip_mouse_move(
                             window,
                             cx,
                         );
+                        // A refresh replays a cached view's last prepaint,
+                        // made before the tooltip was active, so the tooltip
+                        // of an element in a cached view never showed: its
+                        // own view draws again and asks for it.
+                        cx.notify(current_view);
                     })
                     .ok();
                 }
@@ -5421,6 +5429,61 @@ mod tests {
         })
         .unwrap();
         assert_eq!(*mouse_down_out_count.borrow(), 0);
+    }
+
+    static TOOLTIPS_DRAWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    struct Tip;
+
+    impl Render for Tip {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            TOOLTIPS_DRAWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            div().size(crate::px(20.))
+        }
+    }
+
+    struct TipPage;
+
+    impl Render for TipPage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .id("tip")
+                    .size(crate::px(50.))
+                    .tooltip(|_, cx| cx.new(|_| Tip).into()),
+            )
+        }
+    }
+
+    struct TipRoot(crate::Entity<TipPage>);
+
+    impl Render for TipRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                self.0
+                    .clone()
+                    .cached(crate::StyleRefinement::default().size_full()),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn test_tooltip_of_an_element_in_a_cached_view_shows(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, cx| TipRoot(cx.new(|_| TipPage)));
+        cx.run_until_parked();
+        let before = TOOLTIPS_DRAWN.load(std::sync::atomic::Ordering::Relaxed);
+        cx.simulate_mouse_move(
+            crate::point(crate::px(10.), crate::px(10.)),
+            None,
+            crate::Modifiers::none(),
+        );
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        assert!(
+            TOOLTIPS_DRAWN.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "no tooltip over an element in a cached view"
+        );
     }
 
     #[test]

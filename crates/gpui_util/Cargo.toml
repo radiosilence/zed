@@ -1,11 +1,12 @@
 [package]
-name = "gpui_util"
-version = "0.1.0"
+name = "gpui-koan-util"
+version = "0.2.0"
 publish.workspace = true
 edition.workspace = true
 license = "Apache-2.0"
 
 [lib]
+name = "gpui_util"
 doctest = false
 
 [dependencies]

@@ -1,6 +1,6 @@
 [package]
-name = "gpui"
-version = "0.2.2"
+name = "gpui-koan"
+version = "0.2.0"
 edition.workspace = true
 authors = ["Nathan Sobo <nathan@zed.dev>"]
 description = "Zed's GPU-accelerated UI framework"
@@ -57,6 +57,7 @@ hot-reload = [
 ]
 
 [lib]
+name = "gpui"
 path = "src/gpui.rs"
 
 [dependencies]

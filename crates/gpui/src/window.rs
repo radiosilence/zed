@@ -2054,7 +2054,18 @@ impl Window {
                             })
                             .log_err();
                     })
-                } else if needs_present {
+                } else if needs_present
+                    // A shader whose uniforms changed, or that moves with
+                    // time, is presented again with no frame drawn.
+                    || handle
+                        .update(&mut cx, |_, window, _| {
+                            window
+                                .rendered_frame
+                                .scene
+                                .take_shader_present(Instant::now())
+                        })
+                        .unwrap_or(false)
+                {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
                         .with_context(|| {
@@ -2063,13 +2074,17 @@ impl Window {
                         .log_err();
                 }
 
-                handle
+                // A live shader keeps the frames coming.
+                let live = handle
                     .update(&mut cx, |_, window, _| {
+                        let live = window.rendered_frame.scene.has_live_shaders(Instant::now());
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
+                            || live
                         {
                             window.platform_window.schedule_frame();
                         }
+                        live
                     })
                     .with_context(|| {
                         format!(
@@ -2077,14 +2092,15 @@ impl Window {
                             handle.window_id()
                         )
                     })
-                    .log_err();
+                    .log_err()
+                    .unwrap_or(false);
 
                 // Platforms that stop requesting frames for idle windows only
                 // deliver another request after a wakeup. If demand remains
                 // after this frame (the window was re-invalidated mid-draw, or
                 // animations scheduled next-frame callbacks), re-arm the frame
                 // source explicitly.
-                if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() {
+                if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() || live {
                     invalidator.wake_platform();
                 }
                 #[cfg(feature = "profiler")]
@@ -3846,6 +3862,10 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        // What this present shows of the shaders is taken as shown.
+        self.rendered_frame
+            .scene
+            .take_shader_present(Instant::now());
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -4925,6 +4945,75 @@ impl Window {
         } else {
             vertical_band
         }
+    }
+
+    /// Asks for a present with no frame drawn, so a shader whose uniforms
+    /// changed is shown with them. Wakes a parked window; a hidden or
+    /// occluded one stays asleep. Callable from the window's thread; a
+    /// write to a shader's uniforms from another thread asks for the
+    /// present its own way, through the window's waker.
+    pub fn request_present(&self) {
+        self.invalidator.wake_platform();
+    }
+
+    /// Paints a quad drawn by `program`, reading `uniforms` as each frame is
+    /// presented. See [`ShaderUniforms`](crate::ShaderUniforms) for keeping
+    /// it moving between frames.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_shader(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        program: &'static crate::ShaderProgram,
+        uniforms: Arc<crate::ShaderUniforms>,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let shader = crate::PaintShader {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            program,
+            uniforms,
+            image: None,
+        };
+        self.next_frame.scene.insert_primitive(shader);
+    }
+
+    /// Paints a quad drawn by `program` sampling `image` (`sample_image` in
+    /// the program), placed in the sprite atlas as `paint_image` places it.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_shader_image(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        program: &'static crate::ShaderProgram,
+        uniforms: Arc<crate::ShaderUniforms>,
+        image: Arc<RenderImage>,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+        let params = RenderImageParams {
+            image_id: image.id,
+            frame_index: 0,
+        };
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(params.into(), &mut || {
+                Ok(Some((
+                    image.size(0),
+                    Cow::Borrowed(image.as_bytes(0).expect("an image has a first frame")),
+                )))
+            })?
+            .expect("Callback above only returns Some");
+        let shader = crate::PaintShader {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            program,
+            uniforms,
+            image: Some(tile),
+        };
+        self.next_frame.scene.insert_primitive(shader);
+        Ok(())
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.

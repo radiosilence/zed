@@ -191,6 +191,11 @@ impl WindowInvalidator {
             }
             true
         } else {
+            // A notify while the window draws still reaches the entity's
+            // observers, after the draw, as the effects flush; the view is
+            // drawn by the frame the draw's end asks for (`Window::draw`).
+            drop(inner);
+            cx.push_effect(Effect::Notify { emitter: entity });
             false
         }
     }
@@ -267,6 +272,12 @@ impl WindowInvalidator {
 
     pub fn replace_views(&self, views: FxHashSet<EntityId>) {
         self.inner.borrow_mut().dirty_views = views;
+    }
+
+    /// Views for the next draw to mark dirty, with their ancestors as that
+    /// frame's dispatch tree has them.
+    fn note_views(&self, views: impl IntoIterator<Item = EntityId>) {
+        self.inner.borrow_mut().dirty_views.extend(views);
     }
 
     pub fn not_drawing(&self) -> bool {
@@ -3702,6 +3713,7 @@ impl Window {
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
         self.frames_drawn += 1;
+        cx.drawing_windows += 1;
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3835,6 +3847,21 @@ impl Window {
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
+        // An entity this frame shows, notified while it was drawn, is drawn
+        // by the next frame, which marking the window dirty asks the
+        // platform for, waking a parked one. What the frame shows is known
+        // only now, so a view drawn for the first time is covered too.
+        cx.drawing_windows -= 1;
+        let notified = mem::take(&mut cx.notified_while_drawing);
+        let shown = cx.tracked_entities.get(&self.handle.window_id());
+        let redraw: Vec<EntityId> = notified
+            .into_iter()
+            .filter(|entity| shown.is_some_and(|shown| shown.contains(entity)))
+            .collect();
+        if !redraw.is_empty() {
+            self.invalidator.note_views(redraw);
+            self.invalidator.set_dirty(true);
+        }
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
@@ -8363,6 +8390,74 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
         Ok(())
     } else {
         ELEMENT_ARENA.try_with(|arena| callback(&mut arena.borrow_mut()))
+    }
+}
+
+#[cfg(test)]
+mod notify_during_draw_tests {
+    use crate::{
+        AppContext as _, Context, Entity, IntoElement, ParentElement, Render, StyleRefinement,
+        Styled, TestAppContext, Window, div,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct Counter {
+        value: usize,
+    }
+
+    /// Asks to be drawn again while it is drawn, as a list measuring its
+    /// rows does, and updates an entity: once.
+    struct Remeasures {
+        renders: usize,
+        model: Entity<Counter>,
+    }
+
+    impl Render for Remeasures {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            if self.renders == 1 {
+                cx.notify();
+                self.model.update(cx, |model, cx| {
+                    model.value += 1;
+                    cx.notify();
+                });
+            }
+            let value = self.model.read(cx).value;
+            div().size_full().child(format!("{value}"))
+        }
+    }
+
+    struct Shell {
+        view: Entity<Remeasures>,
+    }
+
+    impl Render for Shell {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                self.view
+                    .clone()
+                    .cached(StyleRefinement::default().size_full()),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_notify_during_a_draw_draws_the_next_frame(cx: &mut TestAppContext) {
+        let model = cx.new(|_| Counter { value: 0 });
+        let observed = Rc::new(Cell::new(0));
+        let seen = observed.clone();
+        cx.update(|cx| {
+            cx.observe(&model, move |_, _| seen.set(seen.get() + 1))
+                .detach()
+        });
+        let view = cx.new(|_| Remeasures {
+            renders: 0,
+            model: model.clone(),
+        });
+        let _window = cx.add_window(|_, _| Shell { view: view.clone() });
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.renders), 2);
+        assert_eq!(observed.get(), 1);
     }
 }
 

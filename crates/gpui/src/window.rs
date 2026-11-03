@@ -2954,6 +2954,13 @@ impl Window {
         AsyncWindowContext::new_context(cx.to_async(), self.handle)
     }
 
+    /// The number of the frame being drawn, counted from the window's first:
+    /// what work spread over several frames, such as uploads, can be
+    /// budgeted by.
+    pub fn frame_number(&self) -> u64 {
+        self.frames_drawn
+    }
+
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
@@ -8361,6 +8368,21 @@ mod a11y_hook_tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             div()
         }
+    }
+
+    #[gpui::test]
+    fn the_frame_number_counts_the_frames_drawn(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        cx.run_until_parked();
+        let first = window
+            .update(cx, |_, window, _| window.frame_number())
+            .unwrap();
+        window.update(cx, |_, window, _| window.refresh()).unwrap();
+        cx.run_until_parked();
+        let second = window
+            .update(cx, |_, window, _| window.frame_number())
+            .unwrap();
+        assert_eq!(second, first + 1);
     }
 
     #[gpui::test]

@@ -15,7 +15,6 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -1363,13 +1362,7 @@ impl WgpuRenderer {
         // A scene with shaders is drawn once as the layers they are drawn
         // between, and each present composes them with the shaders.
         let rendered = if scene.shader_layers.is_some() && !core.uses_webgl_instance_data {
-            core.compose_frame(
-                scene,
-                &frame_view,
-                size,
-                premultiplied_alpha,
-                Instant::now(),
-            )
+            core.compose_frame(scene, &frame_view, size, premultiplied_alpha)
         } else {
             core.resources.shader_layers = ShaderLayers::default();
             core.render_frame(
@@ -1720,7 +1713,7 @@ impl WgpuRendererCore {
             for shader in &scene.shaders {
                 self.prepare_shader_pipeline(shader.program);
             }
-            let now = Instant::now();
+            let now = scene.present_time();
             let instances: Vec<gpui::ShaderInstance> = scene
                 .shaders
                 .iter()
@@ -2068,15 +2061,15 @@ impl WgpuRendererCore {
 
     /// Composes the scene's layers and shaders into `target`, drawing the
     /// layers first if this scene's are not drawn yet, with the shaders'
-    /// uniforms as they stand for a present at `at`.
+    /// uniforms as they stand when the present reaches the screen.
     fn compose_frame(
         &mut self,
         scene: &Scene,
         target: &wgpu::TextureView,
         size: Size<DevicePixels>,
         premultiplied_alpha: bool,
-        at: Instant,
     ) -> Result<()> {
+        let at = scene.present_time();
         let plan = scene.shader_layers.as_deref().context("no shader layers")?;
         let extent = (size.width.0 as u32, size.height.0 as u32);
         let held = &self.resources.shader_layers;
@@ -3045,8 +3038,7 @@ impl WgpuHeadlessRenderer {
             .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
             .view
             .clone();
-        self.core
-            .compose_frame(scene, &view, size, false, Instant::now())?;
+        self.core.compose_frame(scene, &view, size, false)?;
         self.read_image()
     }
 

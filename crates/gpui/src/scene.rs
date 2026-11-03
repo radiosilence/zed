@@ -54,6 +54,9 @@ pub struct Scene {
     /// Which drawn frame this scene holds, so a renderer can tell a
     /// re-present of the same frame from a new one.
     pub generation: u64,
+    /// When the present being made of this scene is expected to reach the
+    /// screen: what its shaders reckon their time at. `None` for now.
+    pub present_at: Option<scheduler::Instant>,
     /// The scene as layers its shaders are drawn between, so a re-present
     /// composes them rather than drawing the whole scene; `None` where the
     /// shaders cannot be drawn apart from the rest.
@@ -90,9 +93,15 @@ impl Scene {
         self.shaders.clear();
     }
 
+    /// When the present being made of this scene is expected to reach the
+    /// screen: what its shaders reckon their time at.
+    pub fn present_time(&self) -> scheduler::Instant {
+        self.present_at.unwrap_or_else(scheduler::Instant::now)
+    }
+
     /// Whether a shader on screen asks for the window to present every
     /// refresh at `now`.
-    pub fn has_live_shaders(&self, now: std::time::Instant) -> bool {
+    pub fn has_live_shaders(&self, now: scheduler::Instant) -> bool {
         self.shaders
             .iter()
             .any(|shader| shader.uniforms.is_live(now))
@@ -101,7 +110,7 @@ impl Scene {
     /// Whether this refresh at `now` should present again: a shader's
     /// uniforms changed, or one moves with time. Asks every shader, so each
     /// one's change is taken once.
-    pub fn take_shader_present(&self, now: std::time::Instant) -> bool {
+    pub fn take_shader_present(&self, now: scheduler::Instant) -> bool {
         self.shaders
             .iter()
             .fold(false, |any, shader| shader.uniforms.take_present(now) | any)

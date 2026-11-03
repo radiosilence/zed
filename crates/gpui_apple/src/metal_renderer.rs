@@ -31,7 +31,7 @@ use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc, time::Instant};
+use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -647,7 +647,7 @@ impl MetalRenderer {
         // re-presenting a moving shader costs the shaders and a few
         // full-screen copies, not the scene.
         let rendered = if scene.shader_layers.is_some() {
-            self.compose_frame(scene, &texture, viewport_size, Instant::now())
+            self.compose_frame(scene, &texture, viewport_size)
         } else {
             self.shader_layers.release();
             self.render_frame(scene, &texture, viewport_size, false)
@@ -1148,8 +1148,7 @@ impl MetalRenderer {
                 .context("allocating compose target")?;
             let mut last = None;
             for _ in 0..presents.max(1) {
-                let command_buffer =
-                    self.compose_frame(scene, &target_texture, size, Instant::now())?;
+                let command_buffer = self.compose_frame(scene, &target_texture, size)?;
                 command_buffer.commit();
                 last = Some(command_buffer);
             }
@@ -1191,14 +1190,14 @@ impl MetalRenderer {
 
     /// Composes the scene's layers and shaders into `texture`, drawing the
     /// layers first if this scene's are not drawn yet, with the shaders'
-    /// uniforms as they stand for a present at `at`.
+    /// uniforms as they stand when the present reaches the screen.
     fn compose_frame(
         &mut self,
         scene: &Scene,
         texture: &ProtocolObject<dyn MTLTexture>,
         viewport_size: Size<DevicePixels>,
-        at: Instant,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        let at = scene.present_time();
         let plan = scene.shader_layers.as_deref().context("no shader layers")?;
         let width = i32::from(viewport_size.width) as usize;
         let height = i32::from(viewport_size.height) as usize;
@@ -2263,7 +2262,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         }))?,
         // The shaders' uniforms as they are for this present.
         shaders: {
-            let now = Instant::now();
+            let now = scene.present_time();
             writer.write_iter(
                 scene
                     .shaders

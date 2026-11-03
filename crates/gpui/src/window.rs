@@ -1277,6 +1277,9 @@ pub struct Window {
         SingleSubscriberSet<Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// When the frame being made is expected to reach the screen, as the
+    /// latest frame request said.
+    present_at: Cell<Instant>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -2022,6 +2025,13 @@ impl Window {
                         .log_err();
                 }
 
+                let present_at = request_frame_options
+                    .present_at
+                    .unwrap_or_else(Instant::now);
+                handle
+                    .update(&mut cx, |_, window, _| window.present_at.set(present_at))
+                    .log_err();
+
                 let should_draw = invalidator.is_dirty() || force_render;
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
@@ -2056,10 +2066,8 @@ impl Window {
                     // time, is presented again with no frame drawn.
                     || handle
                         .update(&mut cx, |_, window, _| {
-                            window
-                                .rendered_frame
-                                .scene
-                                .take_shader_present(Instant::now())
+                            let at = window.present_time();
+                            window.rendered_frame.scene.take_shader_present(at)
                         })
                         .unwrap_or(false)
                 {
@@ -2074,7 +2082,10 @@ impl Window {
                 // A live shader keeps the frames coming.
                 let live = handle
                     .update(&mut cx, |_, window, _| {
-                        let live = window.rendered_frame.scene.has_live_shaders(Instant::now());
+                        let live = window
+                            .rendered_frame
+                            .scene
+                            .has_live_shaders(window.present_time());
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
                             || live
@@ -2415,6 +2426,7 @@ impl Window {
             visibility_observers: SingleSubscriberSet::new(),
             hovered,
             needs_present,
+            present_at: Cell::new(Instant::now()),
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3857,10 +3869,11 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
-        // What this present shows of the shaders is taken as shown.
-        self.rendered_frame
-            .scene
-            .take_shader_present(Instant::now());
+        // What this present shows of the shaders is taken as shown, as it
+        // stands when it reaches the screen.
+        let at = self.present_time();
+        self.rendered_frame.scene.present_at = Some(at);
+        self.rendered_frame.scene.take_shader_present(at);
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -4940,6 +4953,14 @@ impl Window {
         } else {
             vertical_band
         }
+    }
+
+    /// When the frame being made now is expected to reach the screen, as
+    /// the platform last said: what shaders reckon their time at, and what
+    /// an app retargeting a moving value should sample it at. Never before
+    /// now, and per window, since two displays refresh at different times.
+    pub fn present_time(&self) -> Instant {
+        self.present_at.get().max(Instant::now())
     }
 
     /// Asks for a present with no frame drawn, so a shader whose uniforms
@@ -8370,6 +8391,38 @@ mod tests {
         }
         cx.run_until_parked();
         assert!(!cx.app.borrow().windows.contains_key(window.window_id()));
+    }
+
+    #[gpui::test]
+    fn test_present_time_follows_the_frame_request(cx: &mut TestAppContext) {
+        use scheduler::Instant;
+        use std::time::Duration;
+
+        let window = cx.add_window(|_, _| EmptyView);
+        let platform_window = cx.test_window(window.into());
+        let target = Instant::now() + Duration::from_secs(60);
+        platform_window.simulate_frame_request(RequestFrameOptions {
+            present_at: Some(target),
+            ..Default::default()
+        });
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(window.present_time(), target);
+            })
+            .unwrap();
+
+        // A time already past is never handed out: shaders' time never
+        // runs back.
+        platform_window.simulate_frame_request(RequestFrameOptions {
+            present_at: Some(Instant::now() - Duration::from_secs(60)),
+            ..Default::default()
+        });
+        let before = Instant::now();
+        window
+            .update(cx, |_, window, _| {
+                assert!(window.present_time() >= before);
+            })
+            .unwrap();
     }
 
     #[cfg(feature = "profiler")]

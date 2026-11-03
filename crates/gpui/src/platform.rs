@@ -1074,6 +1074,12 @@ pub struct RequestFrameOptions {
     pub signal_at: Option<Instant>,
     /// Distinguishes native callbacks from local scheduling requests.
     pub signal_source: FrameRequestSource,
+    /// When a frame made for this request is expected to reach the screen,
+    /// where the platform says: shaders reckon their time at it.
+    ///
+    /// `None` where the platform does not say; the window then takes the
+    /// moment it presents.
+    pub present_at: Option<Instant>,
 }
 
 /// Preserves the first platform frame request time across coalesced notifications.

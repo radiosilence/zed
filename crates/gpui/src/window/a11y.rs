@@ -221,6 +221,12 @@ impl A11y {
         self.active_this_frame
     }
 
+    /// Acts as though assistive technology attached or left.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_active_flag(&self, active: bool) {
+        self.active_flag.store(active, Ordering::SeqCst);
+    }
+
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
         self.focus_ids.insert(node_id, focus_id);
     }

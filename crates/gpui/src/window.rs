@@ -7493,6 +7493,22 @@ impl Window {
             .push((action, Box::new(listener)));
     }
 
+    /// Acts as though assistive technology attached (or left), for tests:
+    /// the test platform never attaches any, so no accessibility tree is
+    /// built otherwise. The window is redrawn so the next frame builds it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_a11y_active_for_test(&mut self, active: bool) {
+        self.a11y.set_active_flag(active);
+        self.refresh();
+    }
+
+    /// Handles `request` as though assistive technology had sent it, so a
+    /// test can drive elements the way a screen reader does.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn dispatch_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
+        self.handle_a11y_action(request, cx);
+    }
+
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn handle_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
         // Take listeners out temporarily so the closures can borrow Window
@@ -8331,6 +8347,55 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
         Ok(())
     } else {
         ELEMENT_ARENA.try_with(|arena| callback(&mut arena.borrow_mut()))
+    }
+}
+
+#[cfg(test)]
+mod a11y_hook_tests {
+    use crate::{Context, IntoElement, Render, TestAppContext, Window, div};
+    use std::{cell::Cell, rc::Rc};
+
+    struct Empty;
+
+    impl Render for Empty {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn a_test_can_attach_assistive_technology_and_send_it_actions(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| {
+                assert!(!window.is_a11y_active());
+                window.set_a11y_active_for_test(true);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let called = Rc::new(Cell::new(false));
+        window
+            .update(cx, |_, window, cx| {
+                assert!(window.is_a11y_active());
+                assert!(window.debug_a11y_tree_json().is_some());
+                let node = accesskit::NodeId(42);
+                let seen = called.clone();
+                window.on_a11y_action(node, accesskit::Action::Click, move |_, _, _| {
+                    seen.set(true)
+                });
+                window.dispatch_a11y_action(
+                    accesskit::ActionRequest {
+                        action: accesskit::Action::Click,
+                        target_tree: accesskit::TreeId::ROOT,
+                        target_node: node,
+                        data: None,
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        assert!(called.get());
     }
 }
 

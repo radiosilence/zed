@@ -41,10 +41,12 @@ jobs:
     outputs:
       release: ${{ steps.version.outputs.release }}
       version: ${{ steps.version.outputs.version }}
+      apple: ${{ steps.apple.outputs.apple }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 2
+          fetch-depth: 0
+          filter: blob:none
           sparse-checkout: script/koan
       - name: Version
         id: version
@@ -83,22 +85,46 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "release=$release" >> "$GITHUB_OUTPUT"
+      - name: Apple backend touched
+        id: apple
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # The macOS backend and its Metal shaders build only on macOS, so
+          # the macOS job runs when they, or the crates they build on,
+          # change; a manual run checks them regardless.
+          apple=true
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] && [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            if ! git diff --name-only "$BASE" HEAD | grep -qE '^(crates/gpui(_apple|_macos|_ios)?/|Cargo\.(toml|lock)$)'; then
+              apple=false
+            fi
+          fi
+          echo "apple=$apple" >> "$GITHUB_OUTPUT"
 
   crates:
     name: Crates
     needs: changes
-    # gpui_macos's build script compiles Metal shaders, which only macOS can.
-    runs-on: macos-latest
-    timeout-minutes: 180
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       VERSION: ${{ needs.changes.outputs.version }}
     steps:
+      # Toolchains the image ships and nothing here uses, for disk.
+      - name: Make room
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           filter: blob:none
+      - name: Install system deps
+        run: ./script/linux
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/koan' }}
+          shared-key: gpui-koan-linux
+          cache-on-failure: true
       - uses: oven-sh/setup-bun@v2
       - name: Versions in step
         # A git dependency on this branch is held to the same requirement a
@@ -120,35 +146,73 @@ jobs:
           include-hidden-files: true
           retention-days: 7
 
+  macos:
+    name: macOS backend
+    needs: changes
+    # The one thing Linux cannot do: build gpui_macos and gpui_apple, whose
+    # build script compiles the Metal shaders with Xcode's metal compiler,
+    # and run their tests against a Metal device.
+    if: needs.changes.outputs.apple == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          filter: blob:none
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/koan' }}
+          shared-key: gpui-koan-macos
+          cache-on-failure: true
+      - name: Test the macOS backend
+        run: cargo test -p gpui-koan-macos -p gpui-koan-apple
+
   koan:
     name: koan
     needs: [changes, crates]
-    runs-on: macos-latest
-    timeout-minutes: 180
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       VERSION: ${{ needs.changes.outputs.version }}
       GH_TOKEN: ${{ secrets.KOAN_TOKEN || github.token }}
     steps:
+      - name: Make room
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: script/koan
+      - name: Builds on gpui-koan
+        id: uses
+        run: |
+          gh repo clone "$KOAN" "$RUNNER_TEMP/koan" -- --depth 1
+          if grep -rqs 'gpui-koan' "$RUNNER_TEMP"/koan/Cargo.toml "$RUNNER_TEMP"/koan/crates/*/Cargo.toml; then
+            echo "uses=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::radiosilence/koan does not build on gpui-koan yet"
+            echo "uses=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install koan's system deps
+        if: steps.uses.outputs.uses == 'true'
+        uses: radiosilence/koan/.github/actions/linux-deps@main
       - uses: actions/download-artifact@v4
+        if: steps.uses.outputs.uses == 'true'
         with:
           name: gpui-koan
           path: ${{ env.GPUI_KOAN_WORK }}/workspace
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.uses.outputs.uses == 'true'
         with:
           toolchain: stable
       - uses: oven-sh/setup-bun@v2
+        if: steps.uses.outputs.uses == 'true'
       - name: Build and test koan against the staged crates
+        if: steps.uses.outputs.uses == 'true'
         run: |
           set -euo pipefail
-          gh repo clone "$KOAN" "$RUNNER_TEMP/koan" -- --depth 1
           cd "$RUNNER_TEMP/koan"
-          if ! grep -rqs 'gpui-koan' Cargo.toml crates/*/Cargo.toml; then
-            echo "::notice::radiosilence/koan does not build on gpui-koan yet"
-            exit 0
-          fi
           bun "$GITHUB_WORKSPACE/script/koan/point-koan.ts" --staged "$GPUI_KOAN_WORK/workspace" --version "$VERSION"
           cargo test -p koan-kit
           cargo test -p koan-gui --lib
@@ -157,7 +221,7 @@ jobs:
     name: Checks
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [changes, crates, koan]
+    needs: [changes, crates, macos, koan]
     if: always()
     steps:
       - env:

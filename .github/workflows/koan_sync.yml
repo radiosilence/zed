@@ -34,9 +34,10 @@ jobs:
   sync:
     name: Sync
     if: github.repository == 'radiosilence/zed'
-    # gpui_macos's build script compiles Metal shaders, which only macOS can.
-    runs-on: macos-latest
-    timeout-minutes: 240
+    # Linux: gpui and the staged crates. The macOS backend is checked by
+    # CI/CD's macOS job on the push this makes.
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,6 +45,10 @@ jobs:
           fetch-depth: 0
           filter: blob:none
           token: ${{ secrets.FORK_TOKEN }}
+      - name: Make room
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift
+      - name: Install system deps
+        run: ./script/linux
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable

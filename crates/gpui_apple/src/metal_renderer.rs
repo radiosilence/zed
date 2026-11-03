@@ -155,6 +155,10 @@ pub struct MetalRenderer {
     group_textures: Vec<Option<Texture>>,
     group_generation: u64,
     group_moving: Vec<bool>,
+    /// The dynamic colour table as the last present uploaded it, and the
+    /// entries that changed at this present.
+    dynamic_colors: Vec<f32>,
+    dynamic_changed: gpui::DynamicColorSet,
     compose_pipelines: Option<ComposePipelines>,
     /// What a shader with no image is given to sample.
     blank_texture: Option<Texture>,
@@ -451,6 +455,8 @@ impl MetalRenderer {
             group_textures: Vec::new(),
             group_generation: 0,
             group_moving: Vec::new(),
+            dynamic_colors: Vec::new(),
+            dynamic_changed: Default::default(),
             compose_pipelines: None,
             blank_texture: None,
             unit_vertices,
@@ -650,6 +656,7 @@ impl MetalRenderer {
             (texture.height() as i32).into(),
         );
 
+        self.refresh_dynamic_colors(scene);
         // Each layer group drawn into its texture first.
         if let Err(error) = self.draw_layer_groups(scene, viewport_size) {
             log::error!("failed to draw layer groups: {error:#}");
@@ -788,6 +795,7 @@ impl MetalRenderer {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             anyhow::bail!("Invalid size for render_offscreen: {:?}", size);
         }
+        self.refresh_dynamic_colors(scene);
         self.draw_layer_groups(scene, size)?;
 
         let texture_descriptor = MTLTextureDescriptor::new();
@@ -923,6 +931,7 @@ impl MetalRenderer {
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
                         writer,
+                        &instance_bindings.dynamic_colors,
                         viewport_size,
                         &command_buffer,
                     )?;
@@ -1005,6 +1014,7 @@ impl MetalRenderer {
         &self,
         paths: &[Path<ScaledPixels>],
         writer: &mut InstanceBufferWriter,
+        dynamic_colors: &InstanceBinding,
         viewport_size: Size<DevicePixels>,
         command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<bool> {
@@ -1074,6 +1084,11 @@ impl MetalRenderer {
                 vertex_instance_bindings.offset,
                 PathRasterizationInputIndex::Vertices as usize,
             );
+            command_encoder.setFragmentBuffer_offset_atIndex(
+                Some(&dynamic_colors.buffer),
+                dynamic_colors.offset,
+                DYNAMIC_COLORS_INDEX,
+            );
             command_encoder.drawPrimitives_vertexStart_vertexCount(
                 MTLPrimitiveType::Triangle,
                 0,
@@ -1097,6 +1112,14 @@ impl MetalRenderer {
         }
 
         command_encoder.setRenderPipelineState(&self.shadows_pipeline_state);
+        // SAFETY: the table was written with the frame's instances and lives as long.
+        unsafe {
+            command_encoder.setVertexBuffer_offset_atIndex(
+                Some(&instance_bindings.dynamic_colors.buffer),
+                instance_bindings.dynamic_colors.offset,
+                DYNAMIC_COLORS_INDEX,
+            );
+        }
         // SAFETY: Six unit vertices and the scene's shadow range match the uploaded shader layouts and slots.
         // Metal retains the buffers, writer.finish publishes their writes, and viewport bytes are copied.
         unsafe {
@@ -1142,6 +1165,7 @@ impl MetalRenderer {
     ) -> Result<RgbaImage> {
         objc2::rc::autoreleasepool(|_| {
             self.update_path_intermediate_textures(size)?;
+            self.refresh_dynamic_colors(scene);
             self.draw_layer_groups(scene, size)?;
             let texture_descriptor = MTLTextureDescriptor::new();
             // SAFETY: The dimensions are positive and this descriptor creates a 2D texture.
@@ -1263,6 +1287,19 @@ impl MetalRenderer {
                 height,
                 layers: drawn,
             };
+        } else {
+            // A held layer drawn in a dynamic colour that changed is drawn
+            // again; the rest are kept.
+            for (k, layer) in plan.layers.iter().enumerate() {
+                if !layer.dynamic_colors.intersects(&self.dynamic_changed) {
+                    continue;
+                }
+                if let Some(target) = self.shader_layers.layers[k].clone() {
+                    // After the last compose that read it: the same queue.
+                    self.render_frame(layer, &target, viewport_size, k > 0)?
+                        .commit();
+                }
+            }
         }
         let pipelines = self
             .compose_pipelines
@@ -1381,6 +1418,16 @@ impl MetalRenderer {
         Ok(command_buffer)
     }
 
+    /// Fills the dynamic colour table for this present and notes which
+    /// entries changed since the last.
+    fn refresh_dynamic_colors(&mut self, scene: &Scene) {
+        gpui::refresh_dynamic_colors(scene.present_time());
+        let mut table = Vec::new();
+        gpui::dynamic_colors_frame(&mut table);
+        self.dynamic_changed = gpui::changed_dynamic_colors(&self.dynamic_colors, &table);
+        self.dynamic_colors = table;
+    }
+
     /// Each layer group's scene drawn into a texture of its own: the
     /// visible part of the shader composing it, its content moved to the
     /// texture's origin, or the window's size for one holding paths or too
@@ -1433,8 +1480,13 @@ impl MetalRenderer {
             let fits = held[index]
                 .as_ref()
                 .is_some_and(|t| t.width() == width && t.height() == height);
-            let stale =
-                scene.layer_group_stale(index, now, &mut self.group_moving[index], &redrawn);
+            let stale = scene.layer_group_stale(
+                index,
+                now,
+                &self.dynamic_changed,
+                &mut self.group_moving[index],
+                &redrawn,
+            );
             if fits && !new_frame && !stale {
                 continue;
             }
@@ -1560,6 +1612,14 @@ impl MetalRenderer {
         }
 
         command_encoder.setRenderPipelineState(&self.quads_pipeline_state);
+        // SAFETY: the table was written with the frame's instances and lives as long.
+        unsafe {
+            command_encoder.setVertexBuffer_offset_atIndex(
+                Some(&instance_bindings.dynamic_colors.buffer),
+                instance_bindings.dynamic_colors.offset,
+                DYNAMIC_COLORS_INDEX,
+            );
+        }
         // SAFETY: Six unit vertices and the scene's quad range match the uploaded shader layouts and slots.
         // Metal retains the buffers, writer.finish publishes their writes, and viewport bytes are copied.
         unsafe {
@@ -1682,6 +1742,14 @@ impl MetalRenderer {
         }
 
         command_encoder.setRenderPipelineState(&self.underlines_pipeline_state);
+        // SAFETY: the table was written with the frame's instances and lives as long.
+        unsafe {
+            command_encoder.setVertexBuffer_offset_atIndex(
+                Some(&instance_bindings.dynamic_colors.buffer),
+                instance_bindings.dynamic_colors.offset,
+                DYNAMIC_COLORS_INDEX,
+            );
+        }
         // SAFETY: Six unit vertices and the scene's underline range match the uploaded shader layouts and slots.
         // Metal retains the buffers, writer.finish publishes their writes, and viewport bytes are copied.
         unsafe {
@@ -1735,6 +1803,14 @@ impl MetalRenderer {
             DevicePixels(texture.height() as i32),
         );
         command_encoder.setRenderPipelineState(&self.monochrome_sprites_pipeline_state);
+        // SAFETY: the table was written with the frame's instances and lives as long.
+        unsafe {
+            command_encoder.setVertexBuffer_offset_atIndex(
+                Some(&instance_bindings.dynamic_colors.buffer),
+                instance_bindings.dynamic_colors.offset,
+                DYNAMIC_COLORS_INDEX,
+            );
+        }
         // SAFETY: The scene's sprite range, six unit vertices, and copied sizes match the shader layouts and slots.
         // Metal retains the buffers and texture, and writer.finish publishes the instance writes.
         unsafe {
@@ -2146,7 +2222,11 @@ struct InstanceBindings {
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
     shaders: InstanceBinding,
+    dynamic_colors: InstanceBinding,
 }
+
+/// The buffer index the stock shaders read the dynamic colour table from.
+const DYNAMIC_COLORS_INDEX: usize = 20;
 
 /// The Metal objects the shader-quad code holds.
 type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
@@ -2360,6 +2440,17 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
             bounds: surface.bounds,
             content_mask: surface.content_mask,
         }))?,
+        // The dynamic colours as they stand for this present.
+        dynamic_colors: {
+            thread_local! {
+                static TABLE: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            TABLE.with(|table| {
+                let mut table = table.borrow_mut();
+                gpui::dynamic_colors_frame(&mut table);
+                writer.write(&table)
+            })?
+        },
         // The shaders' uniforms as they are for this present.
         shaders: {
             let now = scene.present_time();
@@ -3069,5 +3160,86 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
             .map(|(x, y)| x.abs_diff(*y))
             .max();
         assert!(worst <= Some(2), "worst channel difference {worst:?}");
+    }
+
+    // A held layer drawn in a dynamic colour follows the colour source at
+    // each present, with no frame drawn: the layer is drawn again for the
+    // entry that changed, and a shader over it is composed as before.
+    #[test]
+    fn a_dynamic_colour_follows_its_source_with_no_frame_drawn() {
+        static SOLID: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-dynamic-solid",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return float4(0.0, 0.0, 1.0, 1.0);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds {
+            origin: Point::new(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        };
+        let red = gpui::Rgba {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let handle = gpui::ColorHandle::claim(red).expect("a free entry");
+        let index = handle.index();
+        let green = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source_green = green.clone();
+        gpui::set_color_source(move |_, colors| {
+            if source_green.load(std::sync::atomic::Ordering::Relaxed) {
+                colors[index] = gpui::Rgba {
+                    r: 0.0,
+                    g: 1.0,
+                    b: 0.0,
+                    a: 1.0,
+                };
+            }
+            None
+        });
+        let mut scene = Scene::default();
+        let whole = rect(0.0, 0.0, 32.0, 16.0);
+        scene.insert_primitive(gpui::Quad {
+            bounds: whole,
+            content_mask: ContentMask { bounds: whole },
+            background: handle.hsla(1.0).into(),
+            ..Default::default()
+        });
+        let corner = rect(24.0, 0.0, 8.0, 8.0);
+        scene.insert_primitive(gpui::PaintShader {
+            order: 0,
+            bounds: corner,
+            content_mask: ContentMask { bounds: corner },
+            program: &SOLID,
+            uniforms: Arc::new(gpui::ShaderUniforms::new()),
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        });
+        scene.finish();
+        let viewport = size(DevicePixels(32), DevicePixels(16));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        let before = renderer
+            .compose_scene_to_image(&scene, viewport, 1)
+            .unwrap();
+        assert!(before.get_pixel(4, 8).0[0] > 200, "red");
+        green.store(true, std::sync::atomic::Ordering::Relaxed);
+        let after = renderer
+            .compose_scene_to_image(&scene, viewport, 1)
+            .unwrap();
+        assert!(
+            after.get_pixel(4, 8).0[1] > 200,
+            "green, from the same scene"
+        );
+        assert!(
+            after.get_pixel(28, 4).0[2] > 200,
+            "the shader composed over it"
+        );
     }
 }

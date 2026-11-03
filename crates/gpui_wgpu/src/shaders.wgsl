@@ -93,6 +93,8 @@ struct GammaParams {
 
 @group(0) @binding(0) var<uniform> globals: GlobalParams;
 @group(0) @binding(1) var<uniform> gamma_params: GammaParams;
+// The dynamic colour table: per entry, red, green, blue and alpha.
+@group(0) @binding(2) var<uniform> dynamic_colors: array<vec4<f32>, 255>;
 @group(2) @binding(0) var t_sprite: texture_2d<f32>;
 @group(2) @binding(1) var s_sprite: sampler;
 
@@ -553,9 +555,12 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
         quad.background.colors
     );
     out.background_solid = gradient.solid;
+    if (quad.background.tag != 1u && quad.background.solid.h >= 2.0) {
+        out.background_solid = dynamic_rgba(quad.background.solid);
+    }
     out.background_color0 = gradient.color0;
     out.background_color1 = gradient.color1;
-    out.border_color = hsla_to_rgba(quad.border_color);
+    out.border_color = dynamic_rgba(quad.border_color);
     out.quad_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
     return out;
@@ -990,7 +995,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
 
     var out = ShadowVarying();
     out.position = to_device_position(unit_vertex, geometry);
-    out.color = hsla_to_rgba(shadow.color);
+    out.color = dynamic_rgba(shadow.color);
     out.shadow_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
     return out;
@@ -1098,12 +1103,15 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         let distance = f / length(gradient);
         alpha = saturate(0.5 - distance);
     }
-    let prepared_gradient = prepare_gradient_color(
+    var prepared_gradient = prepare_gradient_color(
         background.tag,
         background.color_space,
         background.solid,
         background.colors,
     );
+    if (background.tag != 1u && background.solid.h >= 2.0) {
+        prepared_gradient.solid = dynamic_rgba(background.solid);
+    }
     let color = gradient_color(background, input.position.xy, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
@@ -1172,7 +1180,7 @@ fn vs_underline(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
 
     var out = UnderlineVarying();
     out.position = to_device_position(unit_vertex, underline.bounds);
-    out.color = hsla_to_rgba(underline.color);
+    out.color = dynamic_rgba(underline.color);
     out.underline_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask);
     return out;
@@ -1239,7 +1247,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
-    out.color = hsla_to_rgba(sprite.color);
+    out.color = dynamic_rgba(sprite.color);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
 }
@@ -1359,4 +1367,15 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         1.0);
 
     return ycbcr_to_RGB * y_cb_cr;
+}
+
+// A colour whose hue is 2 or more names entry `hue - 2` of the dynamic
+// colour table, its alpha scaling the entry's.
+fn dynamic_rgba(hsla: Hsla) -> vec4<f32> {
+    if (hsla.h < 2.0) {
+        return hsla_to_rgba(hsla);
+    }
+    var color = dynamic_colors[min(u32(hsla.h - 2.0), 254u)];
+    color.a *= hsla.a;
+    return color;
 }

@@ -44,6 +44,9 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_subpixel.wgsl"),
 );
 
+/// The dynamic colour table's size in bytes: four floats per entry.
+const DYNAMIC_COLORS_BYTES: u64 = (gpui::DYNAMIC_COLORS * 16) as u64;
+
 /// What a program's `shade` is compiled between: the globals, the instance
 /// and the image sampler. Storage buffers only; the WebGL path draws no
 /// shaders.
@@ -309,6 +312,11 @@ struct WgpuResources {
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
+    dynamic_colors_buffer: wgpu::Buffer,
+    /// The dynamic colour table as the last present uploaded it, and the
+    /// entries that changed at this present.
+    dynamic_colors: Vec<f32>,
+    dynamic_changed: gpui::DynamicColorSet,
     instance_data: InstanceData,
     path_intermediate_texture: Option<wgpu::Texture>,
     path_intermediate_view: Option<wgpu::TextureView>,
@@ -697,6 +705,18 @@ impl WgpuRendererCore {
                             min_binding_size: NonZeroU64::new(
                                 std::mem::size_of::<GammaParams>() as u64
                             ),
+                        },
+                        count: None,
+                    },
+                    // The dynamic colour table, read by the stock shaders'
+                    // vertices and by path rasterisation's fragments.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: NonZeroU64::new(DYNAMIC_COLORS_BYTES),
                         },
                         count: None,
                     },
@@ -1372,6 +1392,7 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+        core.refresh_dynamic_colors(scene);
         // Each layer group drawn into its texture first.
         if let Err(error) = core.draw_layer_groups(scene, size, premultiplied_alpha) {
             log::error!("failed to draw layer groups: {error:#}");
@@ -1441,6 +1462,12 @@ impl WgpuRendererCore {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let dynamic_colors_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dynamic_colors"),
+            size: DYNAMIC_COLORS_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let (
             instance_data,
             instance_data_capacity,
@@ -1500,6 +1527,10 @@ impl WgpuRendererCore {
                         size: NonZeroU64::new(gamma_size),
                     }),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: dynamic_colors_buffer.as_entire_binding(),
+                },
             ],
         });
         let path_globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1521,6 +1552,10 @@ impl WgpuRendererCore {
                         offset: gamma_offset,
                         size: NonZeroU64::new(gamma_size),
                     }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: dynamic_colors_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1569,6 +1604,9 @@ impl WgpuRendererCore {
                 globals_buffer,
                 globals_bind_group,
                 path_globals_bind_group,
+                dynamic_colors_buffer,
+                dynamic_colors: Vec::new(),
+                dynamic_changed: Default::default(),
                 instance_data,
                 path_intermediate_texture: None,
                 path_intermediate_view: None,
@@ -2105,6 +2143,24 @@ impl WgpuRendererCore {
         Ok(())
     }
 
+    /// Fills the dynamic colour table for this present, uploads it, and
+    /// notes which entries changed since the last.
+    fn refresh_dynamic_colors(&mut self, scene: &Scene) {
+        gpui::refresh_dynamic_colors(scene.present_time());
+        let mut table = Vec::new();
+        gpui::dynamic_colors_frame(&mut table);
+        let resources = self.resources_mut();
+        resources.dynamic_changed = gpui::changed_dynamic_colors(&resources.dynamic_colors, &table);
+        if !resources.dynamic_changed.is_empty() {
+            resources.queue.write_buffer(
+                &resources.dynamic_colors_buffer,
+                0,
+                bytemuck::cast_slice(&table),
+            );
+        }
+        resources.dynamic_colors = table;
+    }
+
     /// Each layer group's scene drawn into a texture of its own, over
     /// clear: the visible part of the shader composing it, its content moved
     /// to the texture's origin, or the window's size for one holding paths or
@@ -2157,7 +2213,8 @@ impl WgpuRendererCore {
             let fits = held[index]
                 .as_ref()
                 .is_some_and(|(t, _)| t.width() == width && t.height() == height);
-            let stale = scene.layer_group_stale(index, now, &mut moving[index], &redrawn);
+            let changed = self.resources().dynamic_changed.clone();
+            let stale = scene.layer_group_stale(index, now, &changed, &mut moving[index], &redrawn);
             if fits && !new_frame && !stale {
                 continue;
             }
@@ -2286,6 +2343,34 @@ impl WgpuRendererCore {
                 layers: drawn,
                 moving: Vec::new(),
             };
+        } else {
+            // A held layer drawn in a dynamic colour that changed is drawn
+            // again; the rest are kept.
+            for (k, layer) in plan.layers.iter().enumerate() {
+                if !layer
+                    .dynamic_colors
+                    .intersects(&self.resources().dynamic_changed)
+                {
+                    continue;
+                }
+                let Some(view) =
+                    self.resources().shader_layers.layers[k]
+                        .as_ref()
+                        .map(|(texture, _)| {
+                            texture.create_view(&wgpu::TextureViewDescriptor::default())
+                        })
+                else {
+                    continue;
+                };
+                // After the last compose that read it: the same queue.
+                self.render_frame(
+                    layer,
+                    &view,
+                    size,
+                    premultiplied_alpha,
+                    wgpu::Color::TRANSPARENT,
+                )?;
+            }
         }
         if self.resources().compose_pipelines.is_none() {
             let pipelines = self.create_compose_pipelines();
@@ -3175,6 +3260,7 @@ impl WgpuHeadlessRenderer {
             .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
             .view
             .clone();
+        self.core.refresh_dynamic_colors(scene);
         self.core.draw_layer_groups(scene, size, false)?;
         self.core
             .render_frame(scene, &view, size, false, wgpu::Color::BLACK)?;
@@ -3197,6 +3283,7 @@ impl WgpuHeadlessRenderer {
             .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
             .view
             .clone();
+        self.core.refresh_dynamic_colors(scene);
         self.core.draw_layer_groups(scene, size, false)?;
         self.core.compose_frame(scene, &view, size, false)?;
         self.read_image()

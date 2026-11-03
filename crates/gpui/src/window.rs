@@ -72,9 +72,9 @@ mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
 
-use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
+use self::a11y::{A11y, CapturedA11y};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -1047,6 +1047,12 @@ pub(crate) struct DeferredDraw {
     /// The entities the deferred element accessed while it was last drawn, in
     /// any phase, restored when its prepaint is reused.
     accessed_entities: FxHashSet<EntityId>,
+    /// The accessibility nodes the element's prepaint added, kept when it ran
+    /// while the tree was being built. A deferred draw that is reused (it sits
+    /// in a cached view) doesn't prepaint again, so this is what puts its
+    /// nodes back in the tree. Shared, since the draw is copied into every
+    /// frame that reuses it.
+    a11y: Option<Rc<CapturedA11y>>,
 }
 
 pub(crate) struct Frame {
@@ -4206,7 +4212,15 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
+                let (
+                    element,
+                    parent_node,
+                    current_view,
+                    rem_size,
+                    absolute_offset,
+                    prepaint_range,
+                    a11y,
+                ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -4219,12 +4233,17 @@ impl Window {
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
                         deferred_draw.prepaint_range.clone(),
+                        deferred_draw.a11y.take(),
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
+                    // Like a cached view, a deferred draw that is reused later
+                    // must be able to put its nodes back: they are added here,
+                    // outside of any view's prepaint.
+                    let a11y_mark = self.a11y.is_active().then(|| self.a11y.mark());
                     let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
                         self.with_rendered_view(current_view, |window| {
                             window.with_rem_size(Some(rem_size), |window| {
@@ -4236,7 +4255,9 @@ impl Window {
                     });
                     self.next_frame.deferred_draws[deferred_draw_ix].accessed_entities =
                         accessed_entities;
-                    self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
+                    let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
+                    deferred_draw.element = Some(element);
+                    deferred_draw.a11y = a11y_mark.map(|mark| Rc::new(self.a11y.capture(&mark)));
                 } else {
                     cx.entities.extend_accessed(
                         self.next_frame.deferred_draws[deferred_draw_ix]
@@ -4245,6 +4266,12 @@ impl Window {
                             .copied(),
                     );
                     self.reuse_prepaint(prepaint_range);
+                    if self.a11y.is_active()
+                        && let Some(a11y) = &a11y
+                    {
+                        self.a11y.replay(a11y, self.focus);
+                    }
+                    self.next_frame.deferred_draws[deferred_draw_ix].a11y = a11y;
                 }
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
@@ -4291,6 +4318,11 @@ impl Window {
                 deferred_draw.accessed_entities.extend(accessed_entities);
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
+                if self.a11y.is_active()
+                    && let Some(a11y) = &deferred_draw.a11y
+                {
+                    self.a11y.reuse_action_listeners(a11y);
+                }
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
@@ -4365,6 +4397,7 @@ impl Window {
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                     accessed_entities: deferred_draw.accessed_entities.clone(),
+                    a11y: deferred_draw.a11y.clone(),
                 }),
         );
     }
@@ -4848,6 +4881,7 @@ impl Window {
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
             accessed_entities: FxHashSet::default(),
+            a11y: None,
         });
     }
 

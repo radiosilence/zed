@@ -21,8 +21,11 @@ on:
     branches: [koan]
   workflow_dispatch:
 
+# A manual run (a release, or its retry after crates.io's rate limit) and the
+# runs pushes start queue apart: in one group, retrying a release cancelled
+# a push's checks still waiting for a runner.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && 'release' || 'checks' }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:

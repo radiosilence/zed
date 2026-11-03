@@ -1437,6 +1437,20 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Report this element as disabled: present and perceivable, but taking
+    /// no input.
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().aria.disabled = disabled;
+        self
+    }
+
+    /// Announce changes to this element's subtree, politely or at once,
+    /// without moving focus.
+    fn aria_live(mut self, live: accesskit::Live) -> Self {
+        self.interactivity().aria.live = Some(live);
+        self
+    }
+
     /// Set the selected state for this element.
     fn aria_selected(mut self, selected: bool) -> Self {
         self.interactivity().aria.selected = Some(selected);
@@ -2161,6 +2175,8 @@ pub(crate) struct AriaProperties {
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
     pub(crate) toggled: Option<accesskit::Toggled>,
+    pub(crate) live: Option<accesskit::Live>,
+    pub(crate) disabled: bool,
     pub(crate) numeric_value: Option<f64>,
     pub(crate) min_numeric_value: Option<f64>,
     pub(crate) max_numeric_value: Option<f64>,
@@ -3609,6 +3625,12 @@ impl Interactivity {
         }
         if let Some(toggled) = self.aria.toggled {
             node.set_toggled(toggled);
+        }
+        if let Some(live) = self.aria.live {
+            node.set_live(live);
+        }
+        if self.aria.disabled {
+            node.set_disabled();
         }
         if let Some(value) = self.aria.numeric_value {
             node.set_numeric_value(value);
@@ -5411,6 +5433,24 @@ mod tests {
         element.interactivity().write_a11y_info(&mut node);
 
         assert_eq!(node.author_id(), Some("settings.buffer-font-size"));
+    }
+
+    #[test]
+    fn test_write_a11y_info_disabled_and_live() {
+        let mut element = div()
+            .id("status")
+            .aria_disabled(true)
+            .aria_live(accesskit::Live::Polite);
+        let mut node = accesskit::Node::new(accesskit::Role::Status);
+        element.interactivity().write_a11y_info(&mut node);
+        assert!(node.is_disabled());
+        assert_eq!(node.live(), Some(accesskit::Live::Polite));
+
+        let mut element = div().id("button");
+        let mut node = accesskit::Node::new(accesskit::Role::Button);
+        element.interactivity().write_a11y_info(&mut node);
+        assert!(!node.is_disabled());
+        assert_eq!(node.live(), None);
     }
 
     #[test]

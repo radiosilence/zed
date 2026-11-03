@@ -408,6 +408,25 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
     }
 }
 
+/// The window's accessibility hit test, passed on to its content view. The
+/// window answers it by default from its own children, which stop at the
+/// content view, so an assistive technology pointing into the window (the
+/// pointer, a touch on the trackpad) never reaches the nodes the view
+/// reports for the app's elements.
+extern "C" fn window_accessibility_hit_test(
+    this: &AnyObject,
+    _: Sel,
+    point: NSPoint,
+) -> *mut AnyObject {
+    unsafe {
+        let view: *mut AnyObject = msg_send![this, contentView];
+        if view.is_null() {
+            return ptr::null_mut();
+        }
+        msg_send![view, accessibilityHitTest: point]
+    }
+}
+
 unsafe fn build_window_class(name: &CStr, superclass: &AnyClass) -> *const AnyClass {
     unsafe {
         let mut decl = ClassBuilder::new(name, superclass).unwrap();
@@ -468,6 +487,11 @@ unsafe fn build_window_class(name: &CStr, superclass: &AnyClass) -> *const AnyCl
         );
 
         decl.add_method(sel!(close), close_window as extern "C" fn(_, Sel));
+
+        decl.add_method(
+            sel!(accessibilityHitTest:),
+            window_accessibility_hit_test as extern "C" fn(_, Sel, NSPoint) -> *mut AnyObject,
+        );
 
         decl.add_method(
             sel!(draggingEntered:),
@@ -4100,6 +4124,70 @@ extern "C" fn toggle_tab_bar(this: &AnyObject, _sel: Sel, _id: *mut AnyObject) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    extern "C" fn test_view_hit_test(this: &AnyObject, _: Sel, _: NSPoint) -> *mut AnyObject {
+        // The view answers with itself: the forwarder must return it.
+        this as *const AnyObject as *mut AnyObject
+    }
+
+    extern "C" fn test_window_content_view(this: &AnyObject, _: Sel) -> *mut AnyObject {
+        unsafe {
+            *this
+                .class()
+                .instance_variable(c"testContentView")
+                .expect("test content view ivar")
+                .load::<*mut AnyObject>(this)
+        }
+    }
+
+    #[test]
+    fn window_hit_test_is_passed_to_the_content_view() {
+        unsafe {
+            for class in [WINDOW_CLASS, PANEL_CLASS] {
+                let responds: bool = msg_send![
+                    &*class,
+                    instancesRespondToSelector: sel!(accessibilityHitTest:)
+                ];
+                assert!(responds);
+            }
+        }
+        autoreleasepool(|_| unsafe {
+            let mut view = ClassBuilder::new(c"GPUIHitTestTestView", class!(NSObject))
+                .expect("test view class");
+            view.add_method(
+                sel!(accessibilityHitTest:),
+                test_view_hit_test as extern "C" fn(_, Sel, NSPoint) -> *mut AnyObject,
+            );
+            let view: Retained<AnyObject> = msg_send![view.register(), new];
+
+            let mut window = ClassBuilder::new(c"GPUIHitTestTestWindow", class!(NSObject))
+                .expect("test window class");
+            window.add_ivar::<*mut AnyObject>(c"testContentView");
+            window.add_method(
+                sel!(contentView),
+                test_window_content_view as extern "C" fn(_, Sel) -> *mut AnyObject,
+            );
+            let window: Retained<AnyObject> = msg_send![window.register(), new];
+            let content_view = window
+                .class()
+                .instance_variable(c"testContentView")
+                .expect("test content view ivar")
+                .load_ptr::<*mut AnyObject>(&window);
+
+            let point = NSPoint::new(10., 10.);
+            content_view.write(ptr::null_mut());
+            assert!(
+                window_accessibility_hit_test(&window, sel!(accessibilityHitTest:), point)
+                    .is_null()
+            );
+
+            content_view.write(Retained::as_ptr(&view).cast_mut());
+            assert_eq!(
+                window_accessibility_hit_test(&window, sel!(accessibilityHitTest:), point),
+                Retained::as_ptr(&view).cast_mut()
+            );
+        });
+    }
 
     #[test]
     fn display_id_for_screen_handles_missing_metadata() {

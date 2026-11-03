@@ -1280,6 +1280,9 @@ pub struct Window {
     /// When the frame being made is expected to reach the screen, as the
     /// latest frame request said.
     present_at: Cell<Instant>,
+    /// Whether the dynamic colours the frame is drawn in were moving at
+    /// the last present: the present after they stop lands them.
+    dynamic_colors_moved: Cell<bool>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -2070,7 +2073,8 @@ impl Window {
                     || handle
                         .update(&mut cx, |_, window, _| {
                             let at = window.present_time();
-                            window.rendered_frame.scene.take_shader_present(at)
+                            let colors = window.take_dynamic_color_present(at);
+                            window.rendered_frame.scene.take_shader_present(at) | colors
                         })
                         .unwrap_or(false)
                 {
@@ -2085,10 +2089,9 @@ impl Window {
                 // A live shader keeps the frames coming.
                 let live = handle
                     .update(&mut cx, |_, window, _| {
-                        let live = window
-                            .rendered_frame
-                            .scene
-                            .has_live_shaders(window.present_time());
+                        let at = window.present_time();
+                        let live = window.rendered_frame.scene.has_live_shaders(at)
+                            || window.dynamic_colors_live(at);
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
                             || live
@@ -2430,6 +2433,7 @@ impl Window {
             hovered,
             needs_present,
             present_at: Cell::new(Instant::now()),
+            dynamic_colors_moved: Cell::new(false),
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -4966,6 +4970,26 @@ impl Window {
     /// now, and per window, since two displays refresh at different times.
     pub fn present_time(&self) -> Instant {
         self.present_at.get().max(Instant::now())
+    }
+
+    /// Whether the frame is drawn in dynamic colours that move at `at`, or
+    /// that stopped since the last present.
+    fn dynamic_colors_live(&self, at: Instant) -> bool {
+        let scene = &self.rendered_frame.scene;
+        !scene.dynamic_colors.is_empty()
+            && (crate::dynamic_colors_moving(at) || self.dynamic_colors_moved.get())
+    }
+
+    /// Whether the refresh at `at` should present for the frame's dynamic
+    /// colours: they move, or the present landing them is due.
+    fn take_dynamic_color_present(&self, at: Instant) -> bool {
+        if self.rendered_frame.scene.dynamic_colors.is_empty() {
+            self.dynamic_colors_moved.set(false);
+            return false;
+        }
+        let moving = crate::dynamic_colors_moving(at);
+        let landed = self.dynamic_colors_moved.replace(moving) && !moving;
+        moving || landed
     }
 
     /// Asks for a present with no frame drawn, so a shader whose uniforms

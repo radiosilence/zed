@@ -193,6 +193,10 @@ impl Serialize for Rgba {
 
 impl From<Hsla> for Rgba {
     fn from(color: Hsla) -> Self {
+        // A colour naming a dynamic colour is the colour its entry holds.
+        if let Some(index) = crate::dynamic_color_of(&color) {
+            return crate::dynamic_color_rgba(index, color.a);
+        }
         let h = color.h;
         let s = color.s;
         let l = color.l;

@@ -75,6 +75,10 @@ pub struct Scene {
     /// intermediate texture is the window's).
     pub layer_group_frames: Vec<Option<Bounds<ScaledPixels>>>,
     group_stack: Vec<usize>,
+    /// The dynamic colours this scene's primitives are drawn in, layer
+    /// groups' included, so a renderer draws again what holds one that
+    /// changed.
+    pub dynamic_colors: crate::DynamicColorSet,
 }
 
 /// A scene with shaders, split where they are drawn: `layers[0]` first, then
@@ -108,6 +112,35 @@ impl Scene {
         self.layer_groups.clear();
         self.layer_group_frames.clear();
         self.group_stack.clear();
+        self.dynamic_colors = Default::default();
+    }
+
+    /// The dynamic colours the primitives are drawn in.
+    fn collect_dynamic_colors(&self) -> crate::DynamicColorSet {
+        let mut set = crate::DynamicColorSet::default();
+        for quad in &self.quads {
+            set.note(&quad.border_color);
+            set.note(&quad.background.solid);
+            for stop in &quad.background.colors {
+                set.note(&stop.color);
+            }
+        }
+        for shadow in &self.shadows {
+            set.note(&shadow.color);
+        }
+        for underline in &self.underlines {
+            set.note(&underline.color);
+        }
+        for sprite in &self.monochrome_sprites {
+            set.note(&sprite.color);
+        }
+        for sprite in &self.subpixel_sprites {
+            set.note(&sprite.color);
+        }
+        for path in &self.paths {
+            set.note(&path.color.solid);
+        }
+        set
     }
 
     /// When the present being made of this scene is expected to reach the
@@ -130,13 +163,15 @@ impl Scene {
 
     /// Whether group `group`, held from an earlier present, is drawn again
     /// at the present at `now`: while a shader in it is live, once more after
-    /// they stop so the last value lands, and when a group nested in it was
-    /// drawn again. `was_moving` is the group's from the last present,
-    /// updated here; `redrawn` holds the groups drawn this present.
+    /// they stop so the last value lands, when a dynamic colour it is drawn
+    /// in changed (`changed`), and when a group nested in it was drawn
+    /// again. `was_moving` is the group's from the last present, updated
+    /// here; `redrawn` holds the groups drawn this present.
     pub fn layer_group_stale(
         &self,
         group: usize,
         now: scheduler::Instant,
+        changed: &crate::DynamicColorSet,
         was_moving: &mut bool,
         redrawn: &[bool],
     ) -> bool {
@@ -147,6 +182,7 @@ impl Scene {
         let landing = std::mem::replace(was_moving, moving);
         moving
             || landing
+            || group.dynamic_colors.intersects(changed)
             || group.shaders.iter().any(|shader| {
                 shader
                     .group
@@ -393,6 +429,10 @@ impl Scene {
             group.finish();
             group.shader_layers = None;
         }
+        self.dynamic_colors = self.collect_dynamic_colors();
+        for group in &self.layer_groups {
+            self.dynamic_colors.extend(&group.dynamic_colors);
+        }
         self.shader_layers = self.plan_shader_layers().map(Box::new);
     }
 
@@ -549,6 +589,9 @@ impl Scene {
             let mut path = path.clone();
             path.id = PathId(paths.len());
             paths.push(path);
+        }
+        for layer in &mut layers {
+            layer.dynamic_colors = layer.collect_dynamic_colors();
         }
         Some(ShaderLayers { layers, groups })
     }
@@ -1462,7 +1505,13 @@ mod layer_group_tests {
     }
 
     fn stale(scene: &Scene, was_moving: &mut bool, redrawn: &[bool]) -> bool {
-        scene.layer_group_stale(0, scheduler::Instant::now(), was_moving, redrawn)
+        scene.layer_group_stale(
+            0,
+            scheduler::Instant::now(),
+            &Default::default(),
+            was_moving,
+            redrawn,
+        )
     }
 
     /// A group is drawn again while a shader in it is live, once more after,

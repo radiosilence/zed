@@ -11,11 +11,11 @@
 use scheduler::Instant;
 use std::cell::Cell;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, ReentrantMutex, ReentrantMutexGuard};
 
-use crate::{AtlasTile, Bounds, ContentMask, DrawOrder, Primitive, ScaledPixels};
+use crate::{AtlasTile, Bounds, ContentMask, DrawOrder, Hsla, Primitive, ScaledPixels};
 
 /// How many floats a shader's uniforms hold: twenty blocks of four.
 pub const SHADER_UNIFORMS: usize = 80;
@@ -101,10 +101,20 @@ pub struct ShaderUniforms {
     presented: Mutex<Option<Taken>>,
     /// The last present showed `presented` in place of a held block.
     stale: AtomicBool,
+    /// Per block of four, the dynamic colour the block draws, plus one; 0
+    /// for a plain colour or none. Resolved as each present is made.
+    colors: [AtomicU16; SHADER_UNIFORMS / 4],
+    /// How many of `colors` name a dynamic colour: with none, a write or a
+    /// present does no colour work.
+    colored: AtomicU32,
+    /// Whether the dynamic colours were moving at the last present: the
+    /// present after they stop lands them.
+    colors_moved: AtomicBool,
 }
 
-/// The origin and every value, as one publish left them.
-type Taken = (i64, [f32; SHADER_UNIFORMS]);
+/// The origin, every value, and the dynamic colour each block of four
+/// names, as one publish left them.
+type Taken = (i64, [f32; SHADER_UNIFORMS], [u16; SHADER_UNIFORMS / 4]);
 
 /// How many times a present looks again at a publish in progress before it
 /// shows the last copy instead.
@@ -149,6 +159,9 @@ impl Default for ShaderUniforms {
             owner: AtomicU64::new(0),
             presented: Mutex::new(None),
             stale: AtomicBool::new(false),
+            colors: std::array::from_fn(|_| AtomicU16::new(0)),
+            colored: AtomicU32::new(0),
+            colors_moved: AtomicBool::new(false),
         }
     }
 }
@@ -214,16 +227,69 @@ impl ShaderUniforms {
         Some(read())
     }
 
-    /// Writes `value` at `index`. Whether it changed.
+    /// Writes `value` at `index`. Whether it changed. A dynamic colour in
+    /// the block of four holding `index` is let go: the value stands as
+    /// written.
     pub fn set(&self, index: usize, value: f32) -> bool {
         self.publish(|| {
+            let let_go = self.colored.load(Ordering::Relaxed) != 0 && self.put_color(index / 4, 0);
             let bits = value.to_bits();
-            let changed = self.values[index].swap(bits, Ordering::Relaxed) != bits;
+            let changed = self.values[index].swap(bits, Ordering::Relaxed) != bits || let_go;
             if changed {
                 self.changed.store(true, Ordering::Relaxed);
             }
             changed
         })
+    }
+
+    /// Writes `color` into the block of four at `block`, as red, green,
+    /// blue and alpha. A colour naming a dynamic colour is read from its
+    /// entry as each present is made, its alpha scaling the entry's.
+    /// Whether anything changed.
+    pub fn set_color(&self, block: usize, color: Hsla) -> bool {
+        let entry = crate::dynamic_color_of(&color).map_or(0, |entry| entry as u16 + 1);
+        let rgba = if entry == 0 {
+            crate::Rgba::from(color)
+        } else {
+            crate::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: color.a,
+            }
+        };
+        self.publish(|| {
+            let mut changed = false;
+            for (i, value) in [rgba.r, rgba.g, rgba.b, rgba.a].into_iter().enumerate() {
+                let bits = value.to_bits();
+                changed |= self.values[block * 4 + i].swap(bits, Ordering::Relaxed) != bits;
+            }
+            changed |= self.put_color(block, entry);
+            if changed {
+                self.changed.store(true, Ordering::Relaxed);
+            }
+            changed
+        })
+    }
+
+    /// Names dynamic colour `entry` (plus one; 0 for none) at `block`,
+    /// keeping `colored`'s count. Whether it changed.
+    fn put_color(&self, block: usize, entry: u16) -> bool {
+        let old = self.colors[block].swap(entry, Ordering::Relaxed);
+        match (old != 0, entry != 0) {
+            (false, true) => {
+                self.colored.fetch_add(1, Ordering::Relaxed);
+            }
+            (true, false) => {
+                self.colored.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        old != entry
+    }
+
+    fn colors_moving(&self, now: Instant) -> bool {
+        self.colored.load(Ordering::Relaxed) != 0 && crate::dynamic_colors_moving(now)
     }
 
     /// The value at `index` as it stands.
@@ -279,6 +345,8 @@ impl ShaderUniforms {
         self.moving(now)
             || self.landing.load(Ordering::Relaxed)
             || self.stale.load(Ordering::Relaxed)
+            || self.colors_moving(now)
+            || self.colors_moved.load(Ordering::Relaxed)
     }
 
     /// Whether the refresh at `now` should present: the uniforms changed
@@ -288,7 +356,9 @@ impl ShaderUniforms {
         let changed = self.changed.swap(false, Ordering::Relaxed);
         let moving = self.moving(now);
         let landed = !moving && self.landing.swap(false, Ordering::Relaxed);
-        changed || moving || landed || self.stale.load(Ordering::Relaxed)
+        let colors = self.colors_moving(now);
+        let colors_landed = self.colors_moved.swap(colors, Ordering::Relaxed) && !colors;
+        changed || moving || landed || colors || colors_landed || self.stale.load(Ordering::Relaxed)
     }
 
     /// Every value, as one publish left them.
@@ -297,9 +367,17 @@ impl ShaderUniforms {
     }
 
     fn take(&self) -> Taken {
+        let colored = self.colored.load(Ordering::Relaxed) != 0;
         (
             self.origin.load(Ordering::Relaxed),
             std::array::from_fn(|i| f32::from_bits(self.values[i].load(Ordering::Relaxed))),
+            std::array::from_fn(|block| {
+                if colored {
+                    self.colors[block].load(Ordering::Relaxed)
+                } else {
+                    0
+                }
+            }),
         )
     }
 
@@ -323,7 +401,14 @@ impl ShaderUniforms {
             }
         };
         *presented = Some(taken);
-        let (origin, values) = taken;
+        let (origin, mut values, colors) = taken;
+        for (block, entry) in colors.into_iter().enumerate() {
+            if entry != 0 {
+                let alpha = values[block * 4 + 3];
+                let rgba = crate::dynamic_color_rgba(entry as usize - 1, alpha);
+                values[block * 4..block * 4 + 4].copy_from_slice(&[rgba.r, rgba.g, rgba.b, rgba.a]);
+            }
+        }
         ((since_epoch(at) - origin) as f64 / 1e9, values)
     }
 }

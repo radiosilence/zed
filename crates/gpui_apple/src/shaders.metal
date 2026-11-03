@@ -3,6 +3,8 @@
 
 using namespace metal;
 
+float4 dynamic_rgba(Hsla hsla, constant float4 *colors);
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
@@ -70,14 +72,15 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     constant Quad *quads
                                     [[buffer(QuadInputIndex_Quads)]],
                                     constant Size_DevicePixels *viewport_size
-                                    [[buffer(QuadInputIndex_ViewportSize)]]) {
+                                    [[buffer(QuadInputIndex_ViewportSize)]],
+                                    constant float4 *dynamic_colors [[buffer(20)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Quad quad = quads[quad_id];
   float4 device_position =
       to_device_position(unit_vertex, quad.bounds, viewport_size);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds,
                                                  quad.content_mask.bounds);
-  float4 border_color = hsla_to_rgba(quad.border_color);
+  float4 border_color = dynamic_rgba(quad.border_color, dynamic_colors);
 
   GradientColor gradient = prepare_fill_color(
     quad.background.tag,
@@ -86,6 +89,9 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
     quad.background.colors[0].color,
     quad.background.colors[1].color
   );
+  if (quad.background.tag != 1 && quad.background.solid.h >= 2.0) {
+    gradient.solid = dynamic_rgba(quad.background.solid, dynamic_colors);
+  }
 
   return QuadVertexOutput{
       quad_id,
@@ -464,7 +470,8 @@ vertex ShadowVertexOutput shadow_vertex(
     constant float2 *unit_vertices [[buffer(ShadowInputIndex_Vertices)]],
     constant Shadow *shadows [[buffer(ShadowInputIndex_Shadows)]],
     constant Size_DevicePixels *viewport_size
-    [[buffer(ShadowInputIndex_ViewportSize)]]) {
+    [[buffer(ShadowInputIndex_ViewportSize)]],
+    constant float4 *dynamic_colors [[buffer(20)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Shadow shadow = shadows[shadow_id];
 
@@ -485,7 +492,7 @@ vertex ShadowVertexOutput shadow_vertex(
       to_device_position(unit_vertex, bounds, viewport_size);
   float4 clip_distance =
       distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
-  float4 color = hsla_to_rgba(shadow.color);
+  float4 color = dynamic_rgba(shadow.color, dynamic_colors);
 
   return ShadowVertexOutput{
       device_position,
@@ -572,14 +579,15 @@ vertex UnderlineVertexOutput underline_vertex(
     constant float2 *unit_vertices [[buffer(UnderlineInputIndex_Vertices)]],
     constant Underline *underlines [[buffer(UnderlineInputIndex_Underlines)]],
     constant Size_DevicePixels *viewport_size
-    [[buffer(ShadowInputIndex_ViewportSize)]]) {
+    [[buffer(ShadowInputIndex_ViewportSize)]],
+    constant float4 *dynamic_colors [[buffer(20)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Underline underline = underlines[underline_id];
   float4 device_position =
       to_device_position(unit_vertex, underline.bounds, viewport_size);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
                                                  underline.content_mask.bounds);
-  float4 color = hsla_to_rgba(underline.color);
+  float4 color = dynamic_rgba(underline.color, dynamic_colors);
   return UnderlineVertexOutput{
       device_position,
       color,
@@ -639,7 +647,8 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
     constant Size_DevicePixels *viewport_size
     [[buffer(SpriteInputIndex_ViewportSize)]],
     constant Size_DevicePixels *atlas_size
-    [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
+    [[buffer(SpriteInputIndex_AtlasTextureSize)]],
+    constant float4 *dynamic_colors [[buffer(20)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   MonochromeSprite sprite = sprites[sprite_id];
   float4 device_position =
@@ -647,7 +656,7 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
   float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
                                                  sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
-  float4 color = hsla_to_rgba(sprite.color);
+  float4 color = dynamic_rgba(sprite.color, dynamic_colors);
   return MonochromeSpriteVertexOutput{
       device_position,
       tile_position,
@@ -771,7 +780,8 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
 
 fragment float4 path_rasterization_fragment(
   PathRasterizationFragmentInput input [[stage_in]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
+  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
+  constant float4 *dynamic_colors [[buffer(20)]]
 ) {
   float2 dx = dfdx(input.st_position);
   float2 dy = dfdy(input.st_position);
@@ -799,6 +809,9 @@ fragment float4 path_rasterization_fragment(
     background.colors[0].color,
     background.colors[1].color
   );
+  if (background.tag != 1 && background.solid.h >= 2.0) {
+    gradient_color.solid = dynamic_rgba(background.solid, dynamic_colors);
+  }
 
   float4 color = fill_color(
     background,
@@ -1275,5 +1288,16 @@ float4 fill_color(Background background,
     }
   }
 
+  return color;
+}
+
+// A colour whose hue is 2 or more names entry `hue - 2` of the dynamic
+// colour table at buffer 20, its alpha scaling the entry's.
+float4 dynamic_rgba(Hsla hsla, constant float4 *colors) {
+  if (hsla.h < 2.0) {
+    return hsla_to_rgba(hsla);
+  }
+  float4 color = colors[min(uint(hsla.h - 2.0), 254u)];
+  color.a *= hsla.a;
   return color;
 }

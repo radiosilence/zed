@@ -862,13 +862,11 @@ impl MacWindowState {
                 let Some(layer) = self.renderer.layer() else {
                     return;
                 };
-                let main_thread =
-                    crate::main_thread_marker().expect("macOS windows require the main thread");
                 // The link runs on the present thread, which presents moving
                 // shaders itself and hands every other update to `metal_step`.
                 let off_main = metal_frames.off_main().clone();
                 let link = off_main.link();
-                let source = MetalFrameSource::off_main(layer, main_thread, move |update| {
+                let source = MetalFrameSource::off_main(layer, move |update| {
                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
                     // How far ahead of now this frame reaches the screen, on
                     // the display link's clock.

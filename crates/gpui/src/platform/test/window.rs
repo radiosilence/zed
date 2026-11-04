@@ -51,6 +51,7 @@ pub(crate) struct TestWindowState {
     frame_wake_count: Rc<Cell<usize>>,
     frame_scheduled: bool,
     frame_callback_pending: bool,
+    presents_shaders: bool,
     input_handler: Option<PlatformInputHandler>,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
@@ -126,6 +127,7 @@ impl TestWindow {
             frame_wake_count: Rc::new(Cell::new(0)),
             frame_scheduled: false,
             frame_callback_pending: false,
+            presents_shaders: false,
             input_handler: None,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
@@ -275,6 +277,12 @@ impl TestWindow {
         drop(lock);
         callback();
         self.0.lock().appearance_change_callback = Some(callback);
+    }
+
+    /// Makes the window answer [`PlatformWindow::presents_shaders`] with
+    /// `presents`, as a platform presenting moving shaders itself would.
+    pub fn set_presents_shaders(&self, presents: bool) {
+        self.0.lock().presents_shaders = presents;
     }
 
     /// Returns how many times this window's frame waker has been invoked.
@@ -509,6 +517,10 @@ impl PlatformWindow for TestWindow {
         if !state.frame_callback_pending {
             state.frame_scheduled = true;
         }
+    }
+
+    fn presents_shaders(&self) -> bool {
+        self.0.lock().presents_shaders
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {

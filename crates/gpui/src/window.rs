@@ -2103,11 +2103,13 @@ impl Window {
                         .log_err();
                 }
 
-                // A live shader keeps the frames coming.
+                // A live shader keeps the frames coming, unless the platform
+                // presents shaders itself.
                 let live = handle
                     .update(&mut cx, |_, window, _| {
                         let at = window.present_time();
-                        let live = window.rendered_frame.scene.has_live_shaders(at)
+                        let live = (window.rendered_frame.scene.has_live_shaders(at)
+                            && !window.platform_window.presents_shaders())
                             || window.dynamic_colors_live(at);
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
@@ -9558,6 +9560,59 @@ mod tests {
 
         assert!(test_window.simulate_scheduled_frame());
         assert!(callback_ran.get());
+    }
+
+    struct MovingShader(std::sync::Arc<crate::ShaderUniforms>);
+
+    impl Render for MovingShader {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            static PROGRAM: crate::ShaderProgram = crate::ShaderProgram {
+                name: "test-moving",
+                msl: "",
+                wgsl: "",
+                prepare: None,
+            };
+            let uniforms = self.0.clone();
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| window.paint_shader(bounds, &PROGRAM, uniforms.clone()),
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn a_moving_shader_asks_for_frames_unless_the_platform_presents_shaders(
+        cx: &mut TestAppContext,
+    ) {
+        for presents in [false, true] {
+            let uniforms = std::sync::Arc::new(crate::ShaderUniforms::new());
+            uniforms.present_continuously();
+            let window = cx.add_window({
+                let uniforms = uniforms.clone();
+                move |_, _| MovingShader(uniforms)
+            });
+            let test_window = cx.test_window(window.into());
+            test_window.set_presents_shaders(presents);
+            cx.update_window(window.into(), |_, window, _| window.active.set(true))
+                .unwrap();
+
+            assert!(test_window.simulate_scheduled_frame());
+            assert_eq!(
+                cx.update_window(window.into(), |_, window, _| window.painted_shader_count())
+                    .unwrap(),
+                1
+            );
+            // The test platform asks for a frame after each present, as a
+            // compositor callback would; the window's own ask is its wake.
+            let wakes = test_window.frame_wake_count();
+            assert!(test_window.simulate_scheduled_frame());
+            assert_eq!(
+                test_window.frame_wake_count() > wakes,
+                !presents,
+                "presents shaders: {presents}"
+            );
+        }
     }
 
     struct RootView {

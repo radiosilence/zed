@@ -2299,8 +2299,8 @@ impl PresentPlan {
 
     /// Whether the plan alone can show the present at `at` in a drawable of
     /// `width` by `height`: the layers it holds are still the frame's. Runs
-    /// the app's colour source for that present when the layers are drawn
-    /// in dynamic colours.
+    /// the app's colour source for that present when the layers or the
+    /// shaders are drawn in dynamic colours.
     pub fn holds(&self, width: usize, height: usize, at: std::time::Instant) -> bool {
         if self.with_transaction
             || width != i32::from(self.viewport.width) as usize
@@ -2313,10 +2313,17 @@ impl PresentPlan {
         {
             return false;
         }
-        if self.drawn_colors.is_empty() {
+        let shaders_colored = self
+            .shaders
+            .iter()
+            .any(|shader| shader.uniforms.has_dynamic_colors());
+        if self.drawn_colors.is_empty() && !shaders_colored {
             return true;
         }
         gpui::refresh_dynamic_colors(at);
+        if self.drawn_colors.is_empty() {
+            return true;
+        }
         let mut table = Vec::new();
         gpui::dynamic_colors_frame(&mut table);
         !gpui::changed_dynamic_colors(&self.colors, &table).intersects(&self.drawn_colors)
@@ -2932,6 +2939,9 @@ mod tests {
     };
     use objc2_metal::MTLCommandBufferStatus;
 
+    /// Held by each test that sets the app-wide colour source.
+    static COLOUR_SOURCE: Mutex<()> = Mutex::new(());
+
     #[test]
     fn path_intermediate_textures_are_reused_until_resize() -> Result<()> {
         let mut renderer = MetalRenderer::new_headless(Default::default())?;
@@ -3324,6 +3334,91 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         assert!(plan.moving(at));
     }
 
+    // A shader drawing a dynamic colour follows the colour source when
+    // its plan is presented, as the window's thread would present it.
+    #[test]
+    fn a_present_plan_follows_the_colour_source_in_its_shaders() {
+        static FILL: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-plan-colour",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return float4(u[0], u[1], u[2], u[3]);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let _serial = COLOUR_SOURCE.lock();
+        let handle = gpui::ColorHandle::claim(gpui::Rgba {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        })
+        .expect("a free entry");
+        let index = handle.index();
+        let start = std::time::Instant::now();
+        let turn = start + std::time::Duration::from_secs(60);
+        gpui::set_color_source(move |at, colors| {
+            colors[index] = if at < turn {
+                gpui::Rgba {
+                    r: 1.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                }
+            } else {
+                gpui::Rgba {
+                    r: 0.0,
+                    g: 1.0,
+                    b: 0.0,
+                    a: 1.0,
+                }
+            };
+            Some(turn + std::time::Duration::from_secs(1))
+        });
+        let uniforms = Arc::new(gpui::ShaderUniforms::new());
+        uniforms.set_color(0, handle.hsla(1.0));
+        let bounds = Bounds {
+            origin: Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::PaintShader {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            program: &FILL,
+            uniforms,
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        });
+        scene.finish();
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        renderer
+            .compose_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)), 1)
+            .unwrap();
+        let plan = renderer.present_plan().expect("a plan");
+        let present = |at| {
+            assert!(plan.holds(16, 16, at));
+            let texture = renderer.layer_texture(16, 16).unwrap();
+            let command_buffer = plan.encode_taken(&texture, at).unwrap();
+            command_buffer.commit();
+            command_buffer.waitUntilCompleted();
+            read_texture_to_image(&texture).unwrap().get_pixel(8, 8).0
+        };
+        let before = present(turn - std::time::Duration::from_secs(1));
+        assert!(before[0] > 200 && before[1] < 50, "red before the turn");
+        let after = present(turn + std::time::Duration::from_millis(500));
+        assert!(
+            after[1] > 200 && after[0] < 50,
+            "green after it, with no frame drawn"
+        );
+        drop(handle);
+    }
+
     // A draw that presents nothing, here one outside its display link's
     // update, leaves no plan: the frame it replaced is no longer the
     // window's, so nothing may present it again.
@@ -3545,6 +3640,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
             b: 0.0,
             a: 1.0,
         };
+        let _serial = COLOUR_SOURCE.lock();
         let handle = gpui::ColorHandle::claim(red).expect("a free entry");
         let index = handle.index();
         let green = Arc::new(std::sync::atomic::AtomicBool::new(false));

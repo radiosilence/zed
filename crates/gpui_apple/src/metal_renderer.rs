@@ -648,6 +648,10 @@ impl MetalRenderer {
                 drawable
             }
             DisplayLinkMode::Detached => {
+                debug_assert!(
+                    !crate::display_link::is_layer_linked(&layer),
+                    "a synchronous draw asked a layer a display link still holds for a drawable"
+                );
                 let Some(drawable) = layer.nextDrawable() else {
                     log::error!(
                         "failed to retrieve next drawable, drawable size: {:?}",

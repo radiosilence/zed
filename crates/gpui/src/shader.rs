@@ -330,8 +330,15 @@ impl ShaderUniforms {
         self.colored.load(Ordering::Relaxed) != 0
     }
 
+    /// Whether a dynamic colour a block names moves at `now`: entries the
+    /// uniforms do not name may move without keeping them presenting.
     fn colors_moving(&self, now: Instant) -> bool {
-        self.colored.load(Ordering::Relaxed) != 0 && crate::dynamic_colors_moving(now)
+        self.colored.load(Ordering::Relaxed) != 0
+            && crate::dynamic_colors_moving(now)
+            && self.colors.iter().any(|entry| {
+                let entry = entry.load(Ordering::Relaxed);
+                entry != 0 && crate::dynamic_color_moving(entry as usize - 1, now)
+            })
     }
 
     /// The value at `index` as it stands.

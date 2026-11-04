@@ -3406,7 +3406,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         let index = handle.index();
         let start = std::time::Instant::now();
         let turn = start + std::time::Duration::from_secs(60);
-        gpui::set_color_source(move |at, colors| {
+        gpui::set_color_source(move |at, colors, until| {
             colors[index] = if at < turn {
                 gpui::Rgba {
                     r: 1.0,
@@ -3422,7 +3422,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
                     a: 1.0,
                 }
             };
-            Some(turn + std::time::Duration::from_secs(1))
+            until[index] = Some(turn + std::time::Duration::from_secs(1));
         });
         let uniforms = Arc::new(gpui::ShaderUniforms::new());
         uniforms.set_color(0, handle.hsla(1.0));
@@ -3754,7 +3754,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         let index = handle.index();
         let green = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let source_green = green.clone();
-        gpui::set_color_source(move |_, colors| {
+        gpui::set_color_source(move |_, colors, _| {
             if source_green.load(std::sync::atomic::Ordering::Relaxed) {
                 colors[index] = gpui::Rgba {
                     r: 0.0,
@@ -3763,7 +3763,6 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
                     a: 1.0,
                 };
             }
-            None
         });
         let mut scene = Scene::default();
         let whole = rect(0.0, 0.0, 32.0, 16.0);

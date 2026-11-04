@@ -84,6 +84,9 @@ impl ColorHandle {
         let index = table.used.iter().position(|used| !used)?;
         table.used[index] = true;
         table.values[index] = color;
+        // At rest until the source says otherwise: the deadline of whoever
+        // held the entry before is not this holder's.
+        MOVING_UNTIL[index].store(0, Ordering::Relaxed);
         GENERATION.fetch_add(1, Ordering::Relaxed);
         Some(Self(index as u16))
     }
@@ -121,7 +124,8 @@ impl Drop for ColorHandle {
 /// A window at rest presents nothing, so an app whose colours start to move
 /// asks the windows drawing them for a present
 /// ([`Window::request_present`](crate::Window::request_present)); from then
-/// on the deadline the source returns keeps them presenting.
+/// on, the deadlines the source writes keep them presenting while an entry
+/// they draw with moves.
 pub fn set_color_source(
     source: impl Fn(Instant, &mut [Rgba], &mut [Option<Instant>]) + Send + Sync + 'static,
 ) {
@@ -172,7 +176,9 @@ pub fn refresh_dynamic_colors(at: Instant) {
         entry.store(nanos, Ordering::Relaxed);
         any = any.max(nanos);
     }
-    ANY_MOVING_UNTIL.store(any, Ordering::Relaxed);
+    // Released after the entries: a reader that sees this refresh's latest
+    // deadline sees its entries' too.
+    ANY_MOVING_UNTIL.store(any, Ordering::Release);
     if values != before {
         // Only the entries the source changed: one claimed meanwhile keeps
         // the colour it was claimed at.
@@ -194,7 +200,8 @@ fn moving(until: &AtomicU64, at: Instant) -> bool {
 /// Whether the colour source said at the last present that any entry moves
 /// at `at`.
 pub fn dynamic_colors_moving(at: Instant) -> bool {
-    moving(&ANY_MOVING_UNTIL, at)
+    let until = ANY_MOVING_UNTIL.load(Ordering::Acquire);
+    until != 0 && nanos(at) < until
 }
 
 /// Whether the colour source said at the last present that entry `index`
@@ -299,6 +306,10 @@ mod tests {
     fn serial() -> parking_lot::MutexGuard<'static, ()> {
         let serial = SERIAL.lock();
         *REFRESHED.lock() = None;
+        for until in &MOVING_UNTIL {
+            until.store(0, Ordering::Relaxed);
+        }
+        ANY_MOVING_UNTIL.store(0, Ordering::Relaxed);
         serial
     }
 
@@ -457,6 +468,22 @@ mod tests {
     }
 
     #[test]
+    fn a_claimed_entry_starts_at_rest() {
+        let _serial = serial();
+        let handle = ColorHandle::claim(red()).expect("a free entry");
+        let index = handle.index();
+        let start = Instant::now();
+        let end = start + Duration::from_secs(3600);
+        set_color_source(move |_, _, until| until[index] = Some(end));
+        refresh_dynamic_colors(start);
+        TABLE.lock().source = None;
+        drop(handle);
+        let again = ColorHandle::claim(red()).expect("the freed entry");
+        assert_eq!(again.index(), index);
+        assert!(!dynamic_color_moving(index, start));
+    }
+
+    #[test]
     fn a_set_moves_only_while_an_entry_it_holds_moves() {
         let _serial = serial();
         let still = ColorHandle::claim(red()).expect("a free entry");
@@ -504,8 +531,12 @@ mod tests {
         assert!(!uniforms.is_live(during));
         assert!(!uniforms.take_present(during));
         uniforms.set_color(1, turning.hsla(1.0));
-        assert!(uniforms.take_present(during));
+        assert!(uniforms.take_present(during), "the colour was just set");
         assert!(uniforms.is_live(during), "an entry the uniforms name moves");
+        assert!(
+            uniforms.take_present(during),
+            "presented while an entry it names moves, with nothing written"
+        );
         refresh_dynamic_colors(end);
         assert!(uniforms.take_present(end), "the present landing it");
         assert!(!uniforms.is_live(end));

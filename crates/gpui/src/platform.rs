@@ -1334,6 +1334,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     fn schedule_frame(&self) {}
+    /// Whether the platform presents the last frame's moving shaders itself,
+    /// off the window's thread, waking the window only for a frame it asks
+    /// for or for what the last frame cannot show. A shader that moves then
+    /// asks the window for no frames of its own.
+    fn presents_shaders(&self) -> bool {
+        false
+    }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 

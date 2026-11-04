@@ -160,6 +160,9 @@ pub struct MetalRenderer {
     dynamic_colors: Vec<f32>,
     dynamic_changed: gpui::DynamicColorSet,
     compose_pipelines: Option<ComposePipelines>,
+    /// The last frame drawn with shaders, as another thread can present it
+    /// again; `None` after a frame without.
+    present_plan: Option<Arc<PresentPlan>>,
     /// What a shader with no image is given to sample.
     blank_texture: Option<Texture>,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -458,6 +461,7 @@ impl MetalRenderer {
             dynamic_colors: Vec::new(),
             dynamic_changed: Default::default(),
             compose_pipelines: None,
+            present_plan: None,
             blank_texture: None,
             unit_vertices,
             instance_buffer_pool,
@@ -669,6 +673,7 @@ impl MetalRenderer {
             self.compose_frame(scene, &texture, viewport_size)
         } else {
             self.shader_layers.release();
+            self.present_plan = None;
             self.render_frame(scene, &texture, viewport_size, false)
         };
         let command_buffer = match rendered {
@@ -985,7 +990,7 @@ impl MetalRenderer {
                     texture,
                     group,
                     range,
-                    instance_bindings,
+                    &instance_bindings.shaders,
                     viewport_size,
                     &command_encoder,
                 ),
@@ -1302,75 +1307,29 @@ impl MetalRenderer {
                 }
             }
         }
+        let present_plan = Arc::new(self.make_present_plan(scene, viewport_size)?);
+        let command_buffer = present_plan.encode(texture, at)?;
+        self.present_plan = Some(present_plan);
+        Ok(command_buffer)
+    }
+
+    /// What presenting `scene` again needs once its layers are drawn: the
+    /// layer textures, each run of shaders with its pipeline and image, and
+    /// what the layers were drawn with, to tell when they no longer hold.
+    fn make_present_plan(
+        &self,
+        scene: &Scene,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<PresentPlan> {
+        let plan = scene.shader_layers.as_deref().context("no shader layers")?;
         let pipelines = self
             .compose_pipelines
             .clone()
             .context("missing compose pipelines")?;
-
-        let mut writer = InstanceBufferWriter::new(
-            &self.device,
-            &self.instance_buffer_pool,
-            self.is_unified_memory,
-        )?;
-        let shaders = writer.write_iter(
-            scene
-                .shaders
-                .iter()
-                .map(|shader| gpui::ShaderInstance::of(shader, at)),
-        )?;
-        let command_buffer = self
-            .command_queue
-            .commandBuffer()
-            .context("creating command buffer")?;
-        let render_pass_descriptor = MTLRenderPassDescriptor::new();
-        // SAFETY: Index zero is within the render pass's color attachment array.
-        let color_attachment = unsafe {
-            render_pass_descriptor
-                .colorAttachments()
-                .objectAtIndexedSubscript(0)
-        };
-        color_attachment.setTexture(Some(texture));
-        color_attachment.setStoreAction(MTLStoreAction::Store);
-        let first = self.shader_layers.layers.first().cloned().flatten();
-        if first.is_some() {
-            color_attachment.setLoadAction(MTLLoadAction::DontCare);
-        } else {
-            let alpha = if self.opaque { 1. } else { 0. };
-            color_attachment.setLoadAction(MTLLoadAction::Clear);
-            color_attachment.setClearColor(MTLClearColor {
-                red: 0.,
-                green: 0.,
-                blue: 0.,
-                alpha,
-            });
-        }
-        let encoder = command_buffer
-            .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
-            .context("creating render command encoder")?;
-        encoder.setViewport(MTLViewport {
-            originX: 0.0,
-            originY: 0.0,
-            width: width as f64,
-            height: height as f64,
-            znear: 0.0,
-            zfar: 1.0,
-        });
-        let layer = |encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-                     pipeline: &Pipeline,
-                     texture: &Texture| {
-            encoder.setRenderPipelineState(pipeline);
-            // SAFETY: the compose program reads texture 0 texel for texel and
-            // draws one triangle covering the target.
-            unsafe {
-                encoder.setFragmentTexture_atIndex(Some(texture), 0);
-                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
-            }
-        };
-        if let Some(first) = &first {
-            layer(&encoder, &pipelines.copy, first);
-        }
-        let bindings = ShaderBindings(shaders);
+        let blank = self.blank_texture.clone().context("no blank texture")?;
+        let mut groups = Vec::with_capacity(plan.groups.len());
         for (k, group) in plan.groups.iter().enumerate() {
+            let mut runs = Vec::new();
             let mut start = group.start;
             while start < group.end {
                 let head = &scene.shaders[start];
@@ -1386,38 +1345,61 @@ impl MetalRenderer {
                     .iter()
                     .position(|s| key(s) != key(head) || s.group.is_some())
                     .map_or(group.end, |n| (start + n).max(start + 1));
-                self.draw_shaders(
-                    head.program,
-                    head.image.as_ref().map(|t| t.texture_id),
-                    head.group,
-                    start..end,
-                    &bindings,
-                    viewport_size,
-                    &encoder,
-                );
+                if let Some(pipeline) = self.shader_pipeline(head.program) {
+                    let image = head
+                        .group
+                        .and_then(|group| self.group_textures.get(group).cloned().flatten())
+                        .or_else(|| {
+                            head.image
+                                .as_ref()
+                                .and_then(|tile| self.sprite_atlas.metal_texture(tile.texture_id))
+                        })
+                        .unwrap_or_else(|| blank.clone());
+                    runs.push(ShaderRun {
+                        range: start..end,
+                        pipeline,
+                        image,
+                    });
+                }
                 start = end;
             }
-            if let Some(Some(over)) = self.shader_layers.layers.get(k + 1) {
-                layer(&encoder, &pipelines.over, over);
-            }
+            groups.push(PlanGroup {
+                runs,
+                over: self.shader_layers.layers.get(k + 1).cloned().flatten(),
+            });
         }
-        encoder.endEncoding();
+        let mut drawn_colors = gpui::DynamicColorSet::default();
+        for layer in plan.layers.iter().chain(&scene.layer_groups) {
+            drawn_colors.extend(&layer.dynamic_colors);
+        }
+        Ok(PresentPlan {
+            viewport: viewport_size,
+            device: self.device.clone(),
+            queue: self.command_queue.clone(),
+            unified_memory: self.is_unified_memory,
+            opaque: self.opaque,
+            with_transaction: self.presents_with_transaction,
+            pool: self.instance_buffer_pool.clone(),
+            pipelines,
+            unit_vertices: self.unit_vertices.clone(),
+            first: self.shader_layers.layers.first().cloned().flatten(),
+            groups,
+            shaders: scene.shaders.clone(),
+            group_uniforms: scene
+                .layer_groups
+                .iter()
+                .flat_map(|group| group.shaders.iter().map(|shader| shader.uniforms.clone()))
+                .collect(),
+            groups_moving: self.group_moving.iter().any(|moving| *moving),
+            drawn_colors,
+            colors: self.dynamic_colors.clone(),
+        })
+    }
 
-        let instance_buffer_pool = self.instance_buffer_pool.clone();
-        let instance_buffer = Cell::new(Some(writer.finish()));
-        let block = RcBlock::new(
-            move |buffer: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                note_gpu_time(buffer);
-                if let Some(instance_buffer) = instance_buffer.take() {
-                    instance_buffer_pool.lock().release(instance_buffer);
-                }
-            },
-        );
-        // SAFETY: as in `render_frame`.
-        unsafe {
-            command_buffer.addCompletedHandler(RcBlock::as_ptr(&block));
-        }
-        Ok(command_buffer)
+    /// The last frame drawn with shaders, as another thread can present it
+    /// again while only its shaders move. `None` after a frame without.
+    pub fn present_plan(&self) -> Option<Arc<PresentPlan>> {
+        self.present_plan.clone()
     }
 
     /// Fills the dynamic colour table for this present and notes which
@@ -1552,11 +1534,10 @@ impl MetalRenderer {
         texture: Option<AtlasTextureId>,
         group: Option<usize>,
         shaders: Range<usize>,
-        instance_bindings: &impl HasShaders,
+        binding: &InstanceBinding,
         viewport_size: Size<DevicePixels>,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
-        let binding = instance_bindings.shaders();
         if shaders.is_empty() {
             return;
         }
@@ -2254,6 +2235,249 @@ fn note_gpu_time(buffer: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>) {
 type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
 type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
+/// A frame drawn with shaders, presented again from any thread: the layers
+/// its shaders are drawn between, each run of shaders with its pipeline and
+/// image, and the shaders, whose uniforms each present reads as they stand.
+///
+/// A plan shows the frame only while what its layers were drawn with holds:
+/// no layer group moving and no dynamic colour drawn into a layer changed.
+/// Otherwise the window's thread draws the frame again, making a new plan.
+pub struct PresentPlan {
+    viewport: Size<DevicePixels>,
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    unified_memory: bool,
+    opaque: bool,
+    with_transaction: bool,
+    pool: Arc<Mutex<InstanceBufferPool>>,
+    pipelines: ComposePipelines,
+    unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
+    first: Option<Texture>,
+    groups: Vec<PlanGroup>,
+    shaders: Vec<gpui::PaintShader>,
+    /// The uniforms of the shaders inside layer groups, whose textures only
+    /// the window's thread draws.
+    group_uniforms: Vec<Arc<gpui::ShaderUniforms>>,
+    /// Whether a layer group moved at the frame, so the present landing it
+    /// is still to be drawn.
+    groups_moving: bool,
+    /// The dynamic colours the layers and layer groups are drawn in, and the
+    /// table as they were drawn with it.
+    drawn_colors: gpui::DynamicColorSet,
+    colors: Vec<f32>,
+}
+
+// SAFETY: Metal's devices, queues, buffers, textures and pipeline states may
+// be used from any thread, the instance buffer pool is behind its lock, and
+// the shaders' uniforms are atomics read without waiting on a writer.
+unsafe impl Send for PresentPlan {}
+// SAFETY: as for `Send`; nothing in a plan changes once it is made.
+unsafe impl Sync for PresentPlan {}
+
+struct PlanGroup {
+    runs: Vec<ShaderRun>,
+    /// The layer drawn over the group's shaders.
+    over: Option<Texture>,
+}
+
+struct ShaderRun {
+    range: Range<usize>,
+    pipeline: Pipeline,
+    image: Texture,
+}
+
+impl PresentPlan {
+    /// Whether presenting the plan at `at` shows something new: a shader on
+    /// it moves, changed, or has its landing present due.
+    pub fn moving(&self, at: std::time::Instant) -> bool {
+        self.shaders
+            .iter()
+            .any(|shader| shader.uniforms.is_live(at))
+    }
+
+    /// Whether the plan alone can show the present at `at` in a drawable of
+    /// `width` by `height`: the layers it holds are still the frame's. Runs
+    /// the app's colour source for that present when the layers are drawn
+    /// in dynamic colours.
+    pub fn holds(&self, width: usize, height: usize, at: std::time::Instant) -> bool {
+        if self.with_transaction
+            || width != i32::from(self.viewport.width) as usize
+            || height != i32::from(self.viewport.height) as usize
+            || self.groups_moving
+            || self
+                .group_uniforms
+                .iter()
+                .any(|uniforms| uniforms.is_live(at))
+        {
+            return false;
+        }
+        if self.drawn_colors.is_empty() {
+            return true;
+        }
+        gpui::refresh_dynamic_colors(at);
+        let mut table = Vec::new();
+        gpui::dynamic_colors_frame(&mut table);
+        !gpui::changed_dynamic_colors(&self.colors, &table).intersects(&self.drawn_colors)
+    }
+
+    /// Presents the plan into `drawable` for the present at `at`, from any
+    /// thread, if the plan holds for it. Whether it did; a drawable not
+    /// presented is the caller's to use.
+    pub fn present(
+        &self,
+        drawable: &ProtocolObject<dyn CAMetalDrawable>,
+        at: std::time::Instant,
+    ) -> bool {
+        let texture = drawable.texture();
+        if !self.holds(texture.width(), texture.height(), at) {
+            return false;
+        }
+        match self.encode_taken(&texture, at) {
+            Ok(command_buffer) => {
+                command_buffer.presentDrawable(ProtocolObject::from_ref(drawable));
+                command_buffer.commit();
+                true
+            }
+            Err(error) => {
+                log::error!("failed to present shaders: {error:#}");
+                false
+            }
+        }
+    }
+
+    /// As `encode`, taking each shader's change as shown, as the window's
+    /// thread takes it when it presents.
+    fn encode_taken(
+        &self,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        at: std::time::Instant,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        for shader in &self.shaders {
+            shader.uniforms.take_present(at);
+        }
+        self.encode(texture, at)
+    }
+
+    /// The layers and the shaders composed into `texture`, the shaders'
+    /// uniforms as they stand when the present at `at` reaches the screen.
+    fn encode(
+        &self,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        at: std::time::Instant,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        let width = i32::from(self.viewport.width) as f64;
+        let height = i32::from(self.viewport.height) as f64;
+        let mut writer = InstanceBufferWriter::new(&self.device, &self.pool, self.unified_memory)?;
+        let shaders = writer.write_iter(
+            self.shaders
+                .iter()
+                .map(|shader| gpui::ShaderInstance::of(shader, at)),
+        )?;
+        let command_buffer = self
+            .queue
+            .commandBuffer()
+            .context("creating command buffer")?;
+        let render_pass_descriptor = MTLRenderPassDescriptor::new();
+        // SAFETY: Index zero is within the render pass's color attachment array.
+        let color_attachment = unsafe {
+            render_pass_descriptor
+                .colorAttachments()
+                .objectAtIndexedSubscript(0)
+        };
+        color_attachment.setTexture(Some(texture));
+        color_attachment.setStoreAction(MTLStoreAction::Store);
+        if self.first.is_some() {
+            color_attachment.setLoadAction(MTLLoadAction::DontCare);
+        } else {
+            let alpha = if self.opaque { 1. } else { 0. };
+            color_attachment.setLoadAction(MTLLoadAction::Clear);
+            color_attachment.setClearColor(MTLClearColor {
+                red: 0.,
+                green: 0.,
+                blue: 0.,
+                alpha,
+            });
+        }
+        let encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
+            .context("creating render command encoder")?;
+        encoder.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width,
+            height,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        let layer = |pipeline: &Pipeline, texture: &Texture| {
+            encoder.setRenderPipelineState(pipeline);
+            // SAFETY: the compose program reads texture 0 texel for texel and
+            // draws one triangle covering the target.
+            unsafe {
+                encoder.setFragmentTexture_atIndex(Some(texture), 0);
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        };
+        if let Some(first) = &self.first {
+            layer(&self.pipelines.copy, first);
+        }
+        let viewport = [width as f32, height as f32];
+        for group in &self.groups {
+            for run in &group.runs {
+                encoder.setRenderPipelineState(&run.pipeline);
+                // SAFETY: six unit vertices and the run's range match the
+                // instances written above; the viewport bytes are copied.
+                unsafe {
+                    encoder.setVertexBuffer_offset_atIndex(Some(&self.unit_vertices), 0, 0);
+                    encoder.setVertexBuffer_offset_atIndex(
+                        Some(&shaders.buffer),
+                        shaders.offset,
+                        1,
+                    );
+                    encoder.setFragmentBuffer_offset_atIndex(
+                        Some(&shaders.buffer),
+                        shaders.offset,
+                        1,
+                    );
+                    encoder.setFragmentTexture_atIndex(Some(&run.image), 0);
+                    encoder.setVertexBytes_length_atIndex(
+                        ptr::NonNull::from(&viewport).cast(),
+                        mem::size_of_val(&viewport),
+                        2,
+                    );
+                    encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                        MTLPrimitiveType::Triangle,
+                        0,
+                        6,
+                        run.range.len(),
+                        run.range.start,
+                    );
+                }
+            }
+            if let Some(over) = &group.over {
+                layer(&self.pipelines.over, over);
+            }
+        }
+        encoder.endEncoding();
+
+        let pool = self.pool.clone();
+        let instance_buffer = Cell::new(Some(writer.finish()));
+        let block = RcBlock::new(
+            move |buffer: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                note_gpu_time(buffer);
+                if let Some(instance_buffer) = instance_buffer.take() {
+                    pool.lock().release(instance_buffer);
+                }
+            },
+        );
+        // SAFETY: as in `render_frame`.
+        unsafe {
+            command_buffer.addCompletedHandler(RcBlock::as_ptr(&block));
+        }
+        Ok(command_buffer)
+    }
+}
+
 /// The layers of the last frame drawn with shaders, `None` for a blank one,
 /// kept while presents compose them.
 #[derive(Default)]
@@ -2285,26 +2509,6 @@ impl ShaderLayerTextures {
 
     fn release(&mut self) {
         *self = Self::default();
-    }
-}
-
-/// Where a frame's shader instances are, whether written with the whole
-/// scene or alone for a compose.
-trait HasShaders {
-    fn shaders(&self) -> &InstanceBinding;
-}
-
-impl HasShaders for InstanceBindings {
-    fn shaders(&self) -> &InstanceBinding {
-        &self.shaders
-    }
-}
-
-struct ShaderBindings(InstanceBinding);
-
-impl HasShaders for ShaderBindings {
-    fn shaders(&self) -> &InstanceBinding {
-        &self.0
     }
 }
 
@@ -3027,6 +3231,95 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
             let whole = renderer.render_scene_to_image(&scene, viewport).unwrap();
             assert!(close(&whole, &moved), "covered: {covered}, moved");
         }
+    }
+
+    // The present plan a composed frame leaves shows that frame again with
+    // no scene: the same picture as the compose, its shaders read afresh at
+    // each present, and it holds only for a drawable of the frame's size.
+    #[test]
+    fn a_present_plan_presents_the_frame_again_without_its_scene() {
+        static PROGRAM: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-plan-half",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return position.x < size.x * u[0] ? float4(1.0, 0.0, 0.0, 0.5) : float4(0.0);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds {
+            origin: Point::new(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        };
+        let uniforms = Arc::new(gpui::ShaderUniforms::new());
+        uniforms.set(0, 0.5);
+        let mut scene = Scene::default();
+        let whole = rect(0.0, 0.0, 64.0, 32.0);
+        scene.insert_primitive(gpui::Quad {
+            bounds: whole,
+            content_mask: ContentMask { bounds: whole },
+            background: gpui::hsla(0.6, 0.5, 0.5, 1.0).into(),
+            ..Default::default()
+        });
+        let shader = rect(8.0, 8.0, 32.0, 16.0);
+        scene.insert_primitive(gpui::PaintShader {
+            order: 0,
+            bounds: shader,
+            content_mask: ContentMask { bounds: shader },
+            program: &PROGRAM,
+            uniforms: uniforms.clone(),
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        });
+        let over = rect(30.0, 10.0, 20.0, 4.0);
+        scene.insert_primitive(gpui::Quad {
+            bounds: over,
+            content_mask: ContentMask { bounds: over },
+            background: gpui::hsla(0.1, 0.8, 0.5, 1.0).into(),
+            ..Default::default()
+        });
+        scene.finish();
+        let viewport = size(DevicePixels(64), DevicePixels(32));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        assert!(renderer.present_plan().is_none());
+        let composed = renderer
+            .compose_scene_to_image(&scene, viewport, 1)
+            .unwrap();
+        let plan = renderer
+            .present_plan()
+            .expect("a composed frame leaves a plan");
+        let at = std::time::Instant::now();
+
+        let present = |plan: &PresentPlan| {
+            let texture = renderer.layer_texture(64, 32).unwrap();
+            let command_buffer = plan.encode_taken(&texture, at).unwrap();
+            command_buffer.commit();
+            command_buffer.waitUntilCompleted();
+            read_texture_to_image(&texture).unwrap()
+        };
+        assert_eq!(present(&plan).as_raw(), composed.as_raw());
+
+        uniforms.set(0, 1.0);
+        let moved = present(&plan);
+        assert_ne!(moved.as_raw(), composed.as_raw());
+        let whole = renderer.render_scene_to_image(&scene, viewport).unwrap();
+        assert!(
+            whole
+                .as_raw()
+                .iter()
+                .zip(moved.as_raw())
+                .all(|(a, b)| a.abs_diff(*b) <= 1),
+            "the plan presents the moved shader as a whole render draws it"
+        );
+
+        assert!(plan.holds(64, 32, at));
+        assert!(!plan.holds(128, 64, at), "a resized drawable needs a frame");
+        assert!(!plan.moving(at), "a shader at rest asks for no presents");
+        uniforms.present_continuously();
+        assert!(plan.moving(at));
     }
 
     // Something drawn over a shader keeps what is drawn over

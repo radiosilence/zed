@@ -161,8 +161,10 @@ pub struct MetalRenderer {
     dynamic_changed: gpui::DynamicColorSet,
     compose_pipelines: Option<ComposePipelines>,
     /// The last frame drawn with shaders, as another thread can present it
-    /// again; `None` after a frame without.
+    /// again; `None` after a frame without, or while not kept.
     present_plan: Option<Arc<PresentPlan>>,
+    /// Whether frames drawn with shaders leave a present plan.
+    keeps_present_plan: bool,
     /// What a shader with no image is given to sample.
     blank_texture: Option<Texture>,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -462,6 +464,7 @@ impl MetalRenderer {
             dynamic_changed: Default::default(),
             compose_pipelines: None,
             present_plan: None,
+            keeps_present_plan: false,
             blank_texture: None,
             unit_vertices,
             instance_buffer_pool,
@@ -1309,19 +1312,22 @@ impl MetalRenderer {
                 }
             }
         }
-        let present_plan = Arc::new(self.make_present_plan(scene, viewport_size)?);
-        let command_buffer = present_plan.encode(texture, at)?;
-        self.present_plan = Some(present_plan);
+        let keep = self.keeps_present_plan;
+        let present_plan = self.make_present_plan(scene, viewport_size, keep)?;
+        let command_buffer = present_plan.encode(&scene.shaders, texture, at)?;
+        self.present_plan = keep.then(|| Arc::new(present_plan));
         Ok(command_buffer)
     }
 
     /// What presenting `scene` again needs once its layers are drawn: the
-    /// layer textures, each run of shaders with its pipeline and image, and
-    /// what the layers were drawn with, to tell when they no longer hold.
+    /// layer textures and each run of shaders with its pipeline and image.
+    /// A plan to `keep` also holds the shaders and what the layers were
+    /// drawn with, to tell when they no longer hold.
     fn make_present_plan(
         &self,
         scene: &Scene,
         viewport_size: Size<DevicePixels>,
+        keep: bool,
     ) -> Result<PresentPlan> {
         let plan = scene.shader_layers.as_deref().context("no shader layers")?;
         let pipelines = self
@@ -1371,8 +1377,10 @@ impl MetalRenderer {
             });
         }
         let mut drawn_colors = gpui::DynamicColorSet::default();
-        for layer in plan.layers.iter().chain(&scene.layer_groups) {
-            drawn_colors.extend(&layer.dynamic_colors);
+        if keep {
+            for layer in plan.layers.iter().chain(&scene.layer_groups) {
+                drawn_colors.extend(&layer.dynamic_colors);
+            }
         }
         Ok(PresentPlan {
             viewport: viewport_size,
@@ -1386,22 +1394,45 @@ impl MetalRenderer {
             unit_vertices: self.unit_vertices.clone(),
             first: self.shader_layers.layers.first().cloned().flatten(),
             groups,
-            shaders: scene.shaders.clone(),
-            group_uniforms: scene
-                .layer_groups
-                .iter()
-                .flat_map(|group| group.shaders.iter().map(|shader| shader.uniforms.clone()))
-                .collect(),
+            shaders: if keep {
+                scene.shaders.clone()
+            } else {
+                Vec::new()
+            },
+            group_uniforms: if keep {
+                scene
+                    .layer_groups
+                    .iter()
+                    .flat_map(|group| group.shaders.iter().map(|shader| shader.uniforms.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             groups_moving: self.group_moving.iter().any(|moving| *moving),
             drawn_colors,
-            colors: self.dynamic_colors.clone(),
+            colors: if keep {
+                self.dynamic_colors.clone()
+            } else {
+                Vec::new()
+            },
         })
     }
 
     /// The last frame drawn with shaders, as another thread can present it
-    /// again while only its shaders move. `None` after a frame without.
+    /// again while only its shaders move. `None` after a frame without, or
+    /// unless plans are kept.
     pub fn present_plan(&self) -> Option<Arc<PresentPlan>> {
         self.present_plan.clone()
+    }
+
+    /// Whether frames drawn with shaders leave a [`PresentPlan`], for a
+    /// platform presenting them from another thread. Off by default, so a
+    /// renderer whose frames nobody presents again builds none.
+    pub fn set_keeps_present_plan(&mut self, keep: bool) {
+        self.keeps_present_plan = keep;
+        if !keep {
+            self.present_plan = None;
+        }
     }
 
     /// Fills the dynamic colour table for this present and notes which
@@ -2362,17 +2393,19 @@ impl PresentPlan {
         texture: &ProtocolObject<dyn MTLTexture>,
         at: std::time::Instant,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        let command_buffer = self.encode(texture, at)?;
+        let command_buffer = self.encode(&self.shaders, texture, at)?;
         for shader in &self.shaders {
             shader.uniforms.take_present(at);
         }
         Ok(command_buffer)
     }
 
-    /// The layers and the shaders composed into `texture`, the shaders'
-    /// uniforms as they stand when the present at `at` reaches the screen.
+    /// The layers and `shaders`, the frame's, composed into `texture`, the
+    /// shaders' uniforms as they stand when the present at `at` reaches the
+    /// screen.
     fn encode(
         &self,
+        shaders: &[gpui::PaintShader],
         texture: &ProtocolObject<dyn MTLTexture>,
         at: std::time::Instant,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
@@ -2380,7 +2413,7 @@ impl PresentPlan {
         let height = i32::from(self.viewport.height) as f64;
         let mut writer = InstanceBufferWriter::new(&self.device, &self.pool, self.unified_memory)?;
         let shaders = writer.write_iter(
-            self.shaders
+            shaders
                 .iter()
                 .map(|shader| gpui::ShaderInstance::of(shader, at)),
         )?;
@@ -3298,10 +3331,18 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         let viewport = size(DevicePixels(64), DevicePixels(32));
         let mut renderer =
             MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
-        assert!(renderer.present_plan().is_none());
+        let unkept = renderer
+            .compose_scene_to_image(&scene, viewport, 1)
+            .unwrap();
+        assert!(
+            renderer.present_plan().is_none(),
+            "a renderer not keeping plans builds none"
+        );
+        renderer.set_keeps_present_plan(true);
         let composed = renderer
             .compose_scene_to_image(&scene, viewport, 1)
             .unwrap();
+        assert_eq!(unkept.as_raw(), composed.as_raw());
         let plan = renderer
             .present_plan()
             .expect("a composed frame leaves a plan");
@@ -3399,6 +3440,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         scene.finish();
         let mut renderer =
             MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        renderer.set_keeps_present_plan(true);
         renderer
             .compose_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)), 1)
             .unwrap();
@@ -3454,6 +3496,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         scene.finish();
         let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
         let mut renderer = MetalRenderer::new_headless(pool.clone()).unwrap();
+        renderer.set_keeps_present_plan(true);
         renderer
             .compose_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)), 1)
             .unwrap();
@@ -3496,6 +3539,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
             prepare: None,
         };
         let mut renderer = MetalRenderer::new(Default::default(), false, false)?;
+        renderer.set_keeps_present_plan(true);
         renderer.update_drawable_size(size(DevicePixels(64), DevicePixels(64)));
         let bounds = Bounds {
             origin: Point::new(ScaledPixels(8.0), ScaledPixels(8.0)),

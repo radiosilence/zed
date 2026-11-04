@@ -1041,7 +1041,10 @@ impl MacWindow {
         marker: MainThreadMarker,
     ) -> Result<Self> {
         autoreleasepool(|_| unsafe {
-            let renderer = renderer::new_renderer(renderer_context, false, use_display_p3)?;
+            let mut renderer = renderer::new_renderer(renderer_context, false, use_display_p3)?;
+            // Only a window with a Metal display link presents from the
+            // plans its frames leave, on the link's thread.
+            renderer.set_keeps_present_plan(MetalFrameSource::is_available());
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
             if allows_automatic_window_tabbing {
                 let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: Bool::YES];

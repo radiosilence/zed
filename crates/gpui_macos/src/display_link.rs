@@ -761,6 +761,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         };
         let mut renderer =
             crate::renderer::MetalRenderer::new(Default::default(), false, false).unwrap();
+        renderer.set_keeps_present_plan(true);
         renderer.update_drawable_size(gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)));
         let layer = renderer
             .layer()
@@ -837,6 +838,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         }
         let mut renderer =
             crate::renderer::MetalRenderer::new(Default::default(), false, false).unwrap();
+        renderer.set_keeps_present_plan(true);
         renderer.update_drawable_size(gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)));
         let layer = renderer.layer().expect("window renderer has a layer");
         // The link is never added to a run loop: attaching it to the layer is

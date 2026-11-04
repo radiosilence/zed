@@ -5056,7 +5056,7 @@ impl Window {
     fn dynamic_colors_live(&self, at: Instant) -> bool {
         let scene = &self.rendered_frame.scene;
         !scene.dynamic_colors.is_empty()
-            && (crate::dynamic_colors_moving(at) || self.dynamic_colors_moved.get())
+            && (scene.dynamic_colors.moving(at) || self.dynamic_colors_moved.get())
     }
 
     /// Whether the refresh at `at` should present for the frame's dynamic
@@ -5066,7 +5066,7 @@ impl Window {
             self.dynamic_colors_moved.set(false);
             return false;
         }
-        let moving = crate::dynamic_colors_moving(at);
+        let moving = self.rendered_frame.scene.dynamic_colors.moving(at);
         let landed = self.dynamic_colors_moved.replace(moving) && !moving;
         moving || landed
     }

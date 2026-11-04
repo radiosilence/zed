@@ -103,6 +103,15 @@ impl PresentThread {
             std::thread::Builder::new()
                 .name("gpui-present".into())
                 .spawn(move || {
+                    // Presents are on the display's deadline, as the main
+                    // thread's are.
+                    // SAFETY: sets this thread's own QoS class.
+                    unsafe {
+                        libc::pthread_set_qos_class_self_np(
+                            libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+                            0,
+                        );
+                    }
                     let run_loop = NSRunLoop::currentRunLoop();
                     let cf_run_loop = CFRunLoop::current().expect("the thread's run loop");
                     // A port keeps the run loop waiting while no link is on it.
@@ -294,5 +303,19 @@ mod tests {
             Some("gpui-present".to_owned())
         );
         drop(source);
+    }
+
+    #[test]
+    fn the_present_thread_runs_at_user_interactive_qos() {
+        let qos = on_present_thread(|| {
+            let mut qos = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+            let mut relative = 0;
+            // SAFETY: both out-pointers are valid for the call.
+            unsafe {
+                libc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, &mut relative)
+            };
+            qos as u32
+        });
+        assert_eq!(qos, libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE as u32);
     }
 }

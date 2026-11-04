@@ -1053,6 +1053,9 @@ pub(crate) struct DeferredDraw {
     /// nodes back in the tree. Shared, since the draw is copied into every
     /// frame that reuses it.
     a11y: Option<Rc<CapturedA11y>>,
+    /// Whether it was deferred from inside `Window::with_inert`, so that it
+    /// is drawn inert too.
+    inert: bool,
 }
 
 pub(crate) struct Frame {
@@ -1311,6 +1314,9 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// How many `with_inert` calls are drawing: while any is, hitboxes and
+    /// tab stops are left out of the frame.
+    inert: usize,
     pub(crate) activation_observers: SingleSubscriberSet<AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2466,6 +2472,7 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            inert: 0,
             activation_observers: SingleSubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -4222,6 +4229,7 @@ impl Window {
                     absolute_offset,
                     prepaint_range,
                     a11y,
+                    inert,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
@@ -4236,6 +4244,7 @@ impl Window {
                         deferred_draw.absolute_offset,
                         deferred_draw.prepaint_range.clone(),
                         deferred_draw.a11y.take(),
+                        deferred_draw.inert,
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
@@ -4250,7 +4259,9 @@ impl Window {
                         self.with_rendered_view(current_view, |window| {
                             window.with_rem_size(Some(rem_size), |window| {
                                 window.with_absolute_element_offset(absolute_offset, |window| {
-                                    element.prepaint(window, cx);
+                                    window.with_inert_if(inert, |window| {
+                                        element.prepaint(window, cx);
+                                    });
                                 });
                             });
                         });
@@ -4307,12 +4318,15 @@ impl Window {
 
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
+            let inert = deferred_draw.inert;
             if let Some(element) = deferred_draw.element.as_mut() {
                 let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
                     self.with_rendered_view(deferred_draw.current_view, |window| {
                         window.with_content_mask(content_mask, |window| {
                             window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                                element.paint(window, cx);
+                                window.with_inert_if(inert, |window| {
+                                    element.paint(window, cx);
+                                });
                             });
                         })
                     })
@@ -4400,6 +4414,7 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                     accessed_entities: deferred_draw.accessed_entities.clone(),
                     a11y: deferred_draw.a11y.clone(),
+                    inert: deferred_draw.inert,
                 }),
         );
     }
@@ -4884,7 +4899,32 @@ impl Window {
             paint_range: PaintIndex::default()..PaintIndex::default(),
             accessed_entities: FxHashSet::default(),
             a11y: None,
+            inert: self.inert > 0,
         });
+    }
+
+    /// Draws what `f` draws inert: seen but not used. It inserts no hitboxes
+    /// and no tab stops, so the pointer passes through it to whatever is
+    /// beneath and the keyboard never tabs into it; what it defers is drawn
+    /// inert too. For something on its way out, such as a dialog fading
+    /// after it was dismissed.
+    ///
+    /// This method should be called around both the prepaint and the paint
+    /// of the elements it covers, as `Inert` does.
+    pub fn with_inert<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.inert += 1;
+        let result = f(self);
+        self.inert -= 1;
+        result
+    }
+
+    /// Whether elements are being drawn inert, inside `with_inert`.
+    pub fn is_inert(&self) -> bool {
+        self.inert > 0
+    }
+
+    fn with_inert_if<R>(&mut self, inert: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        if inert { self.with_inert(f) } else { f(self) }
     }
 
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch
@@ -5806,7 +5846,11 @@ impl Window {
             content_mask,
             behavior,
         };
-        self.next_frame.hitboxes.push(hitbox.clone());
+        // Inert, the hitbox is never hit: the element under it is not hovered,
+        // clicked or scrolled, and blocks nothing beneath it.
+        if self.inert == 0 {
+            self.next_frame.hitboxes.push(hitbox.clone());
+        }
         hitbox
     }
 

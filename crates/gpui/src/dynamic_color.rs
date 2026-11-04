@@ -144,12 +144,12 @@ static REFRESHED: Mutex<Option<Instant>> = Mutex::new(None);
 /// Fills the table for a present reaching the screen at `at`: runs the
 /// colour source and notes until when the colours move. Called by
 /// renderers as they present, from any thread. A present reaching the
-/// screen before the one the table was last filled for leaves it as it is.
+/// screen before the one the table was last filled for fills it for that
+/// later present again, so the colours never step back and a source set
+/// meanwhile is still heard.
 pub fn refresh_dynamic_colors(at: Instant) {
     let mut refreshed = REFRESHED.lock();
-    if refreshed.is_some_and(|last| at < last) {
-        return;
-    }
+    let at = refreshed.map_or(at, |last| at.max(last));
     let (source, before) = {
         let table = TABLE.lock();
         (table.source.clone(), table.values)
@@ -342,6 +342,37 @@ mod tests {
         );
         refresh_dynamic_colors(start + Duration::from_millis(750));
         assert!((handle.rgba().r - 0.75).abs() < 1e-3);
+        TABLE.lock().source = None;
+    }
+
+    #[test]
+    fn a_present_behind_the_last_refresh_hears_a_new_source() {
+        let _serial = serial();
+        let handle = ColorHandle::claim(red()).expect("a free entry");
+        let index = handle.index();
+        let start = Instant::now();
+        let source = move |level: f32| {
+            move |at: Instant, colors: &mut [Rgba]| {
+                let t = at.saturating_duration_since(start).as_secs_f32();
+                colors[index] = Rgba {
+                    r: t,
+                    g: level,
+                    b: 0.0,
+                    a: 1.0,
+                };
+                None
+            }
+        };
+        set_color_source(source(0.0));
+        refresh_dynamic_colors(start + Duration::from_millis(500));
+        set_color_source(source(1.0));
+        refresh_dynamic_colors(start + Duration::from_millis(250));
+        let rgba = handle.rgba();
+        assert_eq!(rgba.g, 1.0, "the new source is heard");
+        assert!(
+            (rgba.r - 0.5).abs() < 1e-3,
+            "at the later present, not the older one"
+        );
         TABLE.lock().source = None;
     }
 

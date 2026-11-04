@@ -2354,17 +2354,19 @@ impl PresentPlan {
         }
     }
 
-    /// As `encode`, taking each shader's change as shown, as the window's
-    /// thread takes it when it presents.
+    /// As `encode`, taking each shader's change as shown once it is
+    /// encoded, as the window's thread takes it when it presents. A failed
+    /// encode leaves the changes for the next present.
     fn encode_taken(
         &self,
         texture: &ProtocolObject<dyn MTLTexture>,
         at: std::time::Instant,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        let command_buffer = self.encode(texture, at)?;
         for shader in &self.shaders {
             shader.uniforms.take_present(at);
         }
-        self.encode(texture, at)
+        Ok(command_buffer)
     }
 
     /// The layers and the shaders composed into `texture`, the shaders'
@@ -3417,6 +3419,65 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
             "green after it, with no frame drawn"
         );
         drop(handle);
+    }
+
+    // A present that fails to encode leaves each shader's change for the
+    // next one; one that encodes takes it.
+    #[test]
+    fn a_failed_present_leaves_shader_changes_untaken() {
+        static PROGRAM: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-plan-untaken",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return float4(u[0], 0.0, 0.0, 1.0);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let uniforms = Arc::new(gpui::ShaderUniforms::new());
+        let bounds = Bounds {
+            origin: Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::PaintShader {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            program: &PROGRAM,
+            uniforms: uniforms.clone(),
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        });
+        scene.finish();
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut renderer = MetalRenderer::new_headless(pool.clone()).unwrap();
+        renderer
+            .compose_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)), 1)
+            .unwrap();
+        let plan = renderer.present_plan().expect("a plan");
+        let texture = renderer.layer_texture(16, 16).unwrap();
+        let at = std::time::Instant::now();
+        uniforms.set(0, 1.0);
+
+        // No instance buffer can be had, so the encode fails.
+        pool.lock().reset(usize::MAX / 2);
+        assert!(plan.encode_taken(&texture, at).is_err());
+        pool.lock().reset(InstanceBufferPool::default().buffer_size);
+        plan.encode_taken(&texture, at).unwrap().commit();
+        assert!(
+            !uniforms.take_present(at),
+            "the encode that succeeded took the change"
+        );
+        uniforms.set(0, 0.5);
+        pool.lock().reset(usize::MAX / 2);
+        assert!(plan.encode_taken(&texture, at).is_err());
+        assert!(
+            uniforms.take_present(at),
+            "the encode that failed left the change"
+        );
     }
 
     // A draw that presents nothing, here one outside its display link's

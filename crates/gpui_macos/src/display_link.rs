@@ -71,7 +71,7 @@ use std::{
     collections::{BTreeMap, btree_map},
     ffi::c_void,
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError, TryLockError,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -421,10 +421,18 @@ impl OffMain {
     /// The link's update: presented here when no frame is wanted and the
     /// plan shows something new and holds for it, handed to the main thread
     /// otherwise. Whether it was presented here.
+    ///
+    /// Never waits for the plan: the thread presenting is shared by every
+    /// window, so one drawing on the main thread must not hold up the rest.
+    /// An update arriving while its window draws goes to the main thread.
     pub fn update(&self, frame: PendingFrame) -> bool {
         if !self.wanted.load(Ordering::Relaxed) && !self.busy.load(Ordering::Relaxed) {
-            let plan = self.hold();
-            if let Some(plan) = plan.as_ref()
+            let plan = match self.plan.try_lock() {
+                Ok(plan) => Some(plan),
+                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(plan) = plan.as_ref().and_then(|plan| plan.as_ref())
                 && plan.moving(frame.present_at)
                 && plan.present(&frame.drawable, frame.present_at)
             {
@@ -829,6 +837,19 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         frames.wake();
         assert!(!off_main.update(frame()), "a frame GPUI wants goes to it");
         assert!(off_main.take().is_some());
+        off_main.done();
+
+        frames.begin_frame();
+        {
+            let _drawing = off_main.hold();
+            assert!(
+                !off_main.update(frame()),
+                "an update while the window draws goes to the main thread, unwaited"
+            );
+        }
+        assert!(off_main.take().is_some());
+        off_main.done();
+        assert!(off_main.update(frame()), "and the next is presented here");
     }
 
     #[test]

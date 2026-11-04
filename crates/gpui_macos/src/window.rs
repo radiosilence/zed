@@ -862,12 +862,11 @@ impl MacWindowState {
                 let Some(layer) = self.renderer.layer() else {
                     return;
                 };
-                let main_thread =
-                    crate::main_thread_marker().expect("macOS windows require the main thread");
                 // The link runs on the present thread, which presents moving
                 // shaders itself and hands every other update to `metal_step`.
                 let off_main = metal_frames.off_main().clone();
-                let source = MetalFrameSource::off_main(layer, main_thread, move |update| {
+                let link = off_main.link();
+                let source = MetalFrameSource::off_main(layer, move |update| {
                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
                     // How far ahead of now this frame reaches the screen, on
                     // the display link's clock.
@@ -880,6 +879,7 @@ impl MacWindowState {
                         drawable: update.drawable(),
                         signal_at,
                         present_at,
+                        link,
                     });
                 });
                 if let Some(source) = source {
@@ -1041,7 +1041,10 @@ impl MacWindow {
         marker: MainThreadMarker,
     ) -> Result<Self> {
         autoreleasepool(|_| unsafe {
-            let renderer = renderer::new_renderer(renderer_context, false, use_display_p3)?;
+            let mut renderer = renderer::new_renderer(renderer_context, false, use_display_p3)?;
+            // Only a window with a Metal display link presents from the
+            // plans its frames leave, on the link's thread.
+            renderer.set_keeps_present_plan(MetalFrameSource::is_available());
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
             if allows_automatic_window_tabbing {
                 let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: Bool::YES];
@@ -1482,8 +1485,7 @@ impl Drop for MacWindow {
 fn discards_marked_text(change: gpui::TextInputStateChange) -> bool {
     matches!(
         change,
-        gpui::TextInputStateChange::ContentChanged
-            | gpui::TextInputStateChange::SelectionChanged
+        gpui::TextInputStateChange::ContentChanged | gpui::TextInputStateChange::SelectionChanged
     )
 }
 
@@ -4243,8 +4245,8 @@ mod tests {
             );
             let context: Retained<AnyObject> = msg_send![context.register(), new];
 
-            let mut view = ClassBuilder::new(c"GPUIImeTestView", class!(NSObject))
-                .expect("test view class");
+            let mut view =
+                ClassBuilder::new(c"GPUIImeTestView", class!(NSObject)).expect("test view class");
             view.add_ivar::<*mut AnyObject>(c"testInputContext");
             view.add_method(
                 sel!(inputContext),
@@ -4264,7 +4266,10 @@ mod tests {
 
             slot.write(Retained::as_ptr(&context).cast_mut());
             discard_marked_text(Retained::as_ptr(&view).cast_mut());
-            assert_eq!(DISCARDS.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+            assert_eq!(
+                DISCARDS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
         });
     }
 

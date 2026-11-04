@@ -324,6 +324,12 @@ impl ShaderUniforms {
         old != entry
     }
 
+    /// Whether a block names a dynamic colour, which each present resolves
+    /// from the colour table.
+    pub fn has_dynamic_colors(&self) -> bool {
+        self.colored.load(Ordering::Relaxed) != 0
+    }
+
     fn colors_moving(&self, now: Instant) -> bool {
         self.colored.load(Ordering::Relaxed) != 0 && crate::dynamic_colors_moving(now)
     }

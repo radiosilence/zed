@@ -137,23 +137,42 @@ pub fn dynamic_color_rgba(index: usize, alpha: f32) -> Rgba {
     rgba
 }
 
+/// The present the table was last filled for. Held across a whole refresh,
+/// so refreshes from different threads run one at a time.
+static REFRESHED: Mutex<Option<Instant>> = Mutex::new(None);
+
 /// Fills the table for a present reaching the screen at `at`: runs the
 /// colour source and notes until when the colours move. Called by
-/// renderers as they present.
+/// renderers as they present, from any thread. A present reaching the
+/// screen before the one the table was last filled for leaves it as it is.
 pub fn refresh_dynamic_colors(at: Instant) {
-    let source = TABLE.lock().source.clone();
+    let mut refreshed = REFRESHED.lock();
+    if refreshed.is_some_and(|last| at < last) {
+        return;
+    }
+    let (source, before) = {
+        let table = TABLE.lock();
+        (table.source.clone(), table.values)
+    };
     let Some(source) = source else {
         return;
     };
-    let mut values = TABLE.lock().values;
-    let before = values;
+    *refreshed = Some(at);
+    let mut values = before;
     let until = source(at, &mut values);
     MOVING_UNTIL.store(
         until.map_or(0, |until| nanos(until).max(1)),
         Ordering::Relaxed,
     );
     if values != before {
-        TABLE.lock().values = values;
+        // Only the entries the source changed: one claimed meanwhile keeps
+        // the colour it was claimed at.
+        let mut table = TABLE.lock();
+        for (index, value) in values.iter().enumerate() {
+            if *value != before[index] {
+                table.values[index] = *value;
+            }
+        }
         GENERATION.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -240,6 +259,13 @@ mod tests {
 
     static SERIAL: Mutex<()> = Mutex::new(());
 
+    /// One colour test at a time, each starting with no refresh behind it.
+    fn serial() -> parking_lot::MutexGuard<'static, ()> {
+        let serial = SERIAL.lock();
+        *REFRESHED.lock() = None;
+        serial
+    }
+
     fn red() -> Rgba {
         Rgba {
             r: 1.0,
@@ -251,7 +277,7 @@ mod tests {
 
     #[test]
     fn a_handle_names_its_entry_and_frees_it() {
-        let _serial = SERIAL.lock();
+        let _serial = serial();
         let handle = ColorHandle::claim(red()).expect("a free entry");
         let named = handle.hsla(0.5);
         assert_eq!(dynamic_color_of(&named), Some(handle.index()));
@@ -265,7 +291,7 @@ mod tests {
 
     #[test]
     fn the_source_fills_the_table_and_says_until_when_it_moves() {
-        let _serial = SERIAL.lock();
+        let _serial = serial();
         let handle = ColorHandle::claim(red()).expect("a free entry");
         let index = handle.index();
         let start = Instant::now();
@@ -288,6 +314,76 @@ mod tests {
         refresh_dynamic_colors(end);
         assert_eq!(handle.rgba().g, 1.0);
         assert!(!dynamic_colors_moving(end));
+        TABLE.lock().source = None;
+    }
+
+    #[test]
+    fn a_present_behind_the_last_refresh_leaves_the_table() {
+        let _serial = serial();
+        let handle = ColorHandle::claim(red()).expect("a free entry");
+        let index = handle.index();
+        let start = Instant::now();
+        set_color_source(move |at, colors| {
+            let t = at.saturating_duration_since(start).as_secs_f32();
+            colors[index] = Rgba {
+                r: t,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            };
+            None
+        });
+        refresh_dynamic_colors(start + Duration::from_millis(500));
+        assert!((handle.rgba().r - 0.5).abs() < 1e-3);
+        refresh_dynamic_colors(start + Duration::from_millis(250));
+        assert!(
+            (handle.rgba().r - 0.5).abs() < 1e-3,
+            "an older present does not step the colours back"
+        );
+        refresh_dynamic_colors(start + Duration::from_millis(750));
+        assert!((handle.rgba().r - 0.75).abs() < 1e-3);
+        TABLE.lock().source = None;
+    }
+
+    #[test]
+    fn concurrent_refreshes_keep_the_latest_present() {
+        let _serial = serial();
+        let handle = ColorHandle::claim(red()).expect("a free entry");
+        let index = handle.index();
+        let start = Instant::now();
+        set_color_source(move |at, colors| {
+            let t = at.saturating_duration_since(start).as_secs_f32();
+            // Long enough for another refresh to start meanwhile.
+            std::thread::yield_now();
+            colors[index] = Rgba {
+                r: t,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            };
+            None
+        });
+        let threads: Vec<_> = (1..=8u64)
+            .map(|thread| {
+                std::thread::spawn(move || {
+                    for step in 0..50u64 {
+                        refresh_dynamic_colors(start + Duration::from_millis(step * 8 + thread));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let last = *REFRESHED.lock();
+        let last = last
+            .expect("refreshed")
+            .saturating_duration_since(start)
+            .as_secs_f32();
+        assert!(
+            (handle.rgba().r - last).abs() < 1e-6,
+            "the table holds the latest present's colours"
+        );
         TABLE.lock().source = None;
     }
 

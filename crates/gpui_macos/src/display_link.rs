@@ -71,8 +71,8 @@ use std::{
     collections::{BTreeMap, btree_map},
     ffi::c_void,
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError, TryLockError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -327,6 +327,7 @@ impl MetalFrames {
                 busy: AtomicBool::new(false),
                 plan: Mutex::new(None),
                 pending: Mutex::new(None),
+                link: AtomicU64::new(0),
                 frame_requests: main_queue_source(data, callback),
             }),
         }
@@ -336,7 +337,13 @@ impl MetalFrames {
         &self.off_main
     }
 
+    /// Sets the window's link. A link is made for the generation
+    /// [`OffMain::link`] gives; detaching one ends that generation, so its
+    /// updates still on their way are dropped.
     pub fn replace(&self, source: Option<MetalFrameSource>) {
+        if source.is_none() {
+            self.off_main.detach();
+        }
         *self.source.borrow_mut() = source;
     }
 
@@ -403,6 +410,8 @@ pub struct OffMain {
     plan: Mutex<Option<Arc<PresentPlan>>>,
     /// The update handed to the main thread, replaced by a newer one.
     pending: Mutex<Option<PendingFrame>>,
+    /// The generation of the window's current link; each detach ends one.
+    link: AtomicU64,
     frame_requests: DispatchRetained<DispatchSource>,
 }
 
@@ -412,6 +421,8 @@ pub struct PendingFrame {
     pub signal_at: Option<Instant>,
     /// When the update's drawable reaches the screen.
     pub present_at: Instant,
+    /// The generation of the link the update came from.
+    pub link: u64,
 }
 
 // SAFETY: a drawable may be drawn into and presented from any thread.
@@ -421,10 +432,22 @@ impl OffMain {
     /// The link's update: presented here when no frame is wanted and the
     /// plan shows something new and holds for it, handed to the main thread
     /// otherwise. Whether it was presented here.
+    ///
+    /// Never waits for the plan: the thread presenting is shared by every
+    /// window, so one drawing on the main thread must not hold up the rest.
+    /// An update arriving while its window draws goes to the main thread.
     pub fn update(&self, frame: PendingFrame) -> bool {
+        // A link detached since may still deliver an update or two.
+        if frame.link != self.link() {
+            return false;
+        }
         if !self.wanted.load(Ordering::Relaxed) && !self.busy.load(Ordering::Relaxed) {
-            let plan = self.hold();
-            if let Some(plan) = plan.as_ref()
+            let plan = match self.plan.try_lock() {
+                Ok(plan) => Some(plan),
+                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(plan) = plan.as_ref().and_then(|plan| plan.as_ref())
                 && plan.moving(frame.present_at)
                 && plan.present(&frame.drawable, frame.present_at)
             {
@@ -437,12 +460,30 @@ impl OffMain {
         false
     }
 
-    /// The update handed to the main thread, if one is waiting.
+    /// The update handed to the main thread, if one from the current link
+    /// is waiting.
     pub fn take(&self) -> Option<PendingFrame> {
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+            .filter(|frame| frame.link == self.link())
+    }
+
+    /// The generation of the window's current link, for a new link to tag
+    /// its updates with.
+    pub fn link(&self) -> u64 {
+        self.link.load(Ordering::Acquire)
+    }
+
+    /// The window's link is gone: its generation ends, and any update it
+    /// handed over is dropped.
+    fn detach(&self) {
+        self.link.fetch_add(1, Ordering::AcqRel);
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
     }
 
     /// The main thread is done with the updates it was handed.
@@ -761,18 +802,20 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         };
         let mut renderer =
             crate::renderer::MetalRenderer::new(Default::default(), false, false).unwrap();
+        renderer.set_keeps_present_plan(true);
         renderer.update_drawable_size(gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)));
         let layer = renderer
             .layer()
             .expect("window renderer has a layer")
             .retain();
+        let frames = MetalFrames::new(std::ptr::null_mut(), no_frame);
+        let off_main = frames.off_main().clone();
         let frame = || PendingFrame {
             drawable: layer.nextDrawable().expect("a drawable"),
             signal_at: None,
             present_at: Instant::now(),
+            link: off_main.link(),
         };
-        let frames = MetalFrames::new(std::ptr::null_mut(), no_frame);
-        let off_main = frames.off_main().clone();
 
         assert!(
             !off_main.update(frame()),
@@ -828,6 +871,60 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         frames.wake();
         assert!(!off_main.update(frame()), "a frame GPUI wants goes to it");
         assert!(off_main.take().is_some());
+        off_main.done();
+
+        frames.begin_frame();
+        {
+            let _drawing = off_main.hold();
+            assert!(
+                !off_main.update(frame()),
+                "an update while the window draws goes to the main thread, unwaited"
+            );
+        }
+        assert!(off_main.take().is_some());
+        off_main.done();
+        assert!(off_main.update(frame()), "and the next is presented here");
+    }
+
+    // A link detached is a generation ended: an update it delivers late, or
+    // one it handed over and the main thread has not taken, is dropped, so
+    // a link started after it never sees them.
+    #[test]
+    fn a_detached_links_updates_are_dropped() {
+        let mut renderer =
+            crate::renderer::MetalRenderer::new(Default::default(), false, false).unwrap();
+        renderer.update_drawable_size(gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)));
+        let layer = renderer
+            .layer()
+            .expect("window renderer has a layer")
+            .retain();
+        let frames = MetalFrames::new(std::ptr::null_mut(), no_frame);
+        let off_main = frames.off_main().clone();
+        let frame = |link| PendingFrame {
+            drawable: layer.nextDrawable().expect("a drawable"),
+            signal_at: None,
+            present_at: Instant::now(),
+            link,
+        };
+
+        let old = off_main.link();
+        assert!(!off_main.update(frame(old)));
+        frames.replace(None);
+        assert!(
+            off_main.take().is_none(),
+            "detaching drops what was handed over"
+        );
+        off_main.done();
+
+        let new = off_main.link();
+        assert_ne!(new, old);
+        assert!(!off_main.update(frame(old)));
+        assert!(
+            off_main.take().is_none(),
+            "a late update of the old link is dropped"
+        );
+        assert!(!off_main.update(frame(new)));
+        assert!(off_main.take().is_some(), "the new link's is handed over");
     }
 
     #[test]
@@ -837,6 +934,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         }
         let mut renderer =
             crate::renderer::MetalRenderer::new(Default::default(), false, false).unwrap();
+        renderer.set_keeps_present_plan(true);
         renderer.update_drawable_size(gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)));
         let layer = renderer.layer().expect("window renderer has a layer");
         // The link is never added to a run loop: attaching it to the layer is

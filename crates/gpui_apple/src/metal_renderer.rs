@@ -624,6 +624,9 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        // Whatever this draw leaves, the last frame's plan no longer shows
+        // the window: a draw that fails presents nothing in its place.
+        self.present_plan = None;
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -673,7 +676,6 @@ impl MetalRenderer {
             self.compose_frame(scene, &texture, viewport_size)
         } else {
             self.shader_layers.release();
-            self.present_plan = None;
             self.render_frame(scene, &texture, viewport_size, false)
         };
         let command_buffer = match rendered {
@@ -3320,6 +3322,47 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         assert!(!plan.moving(at), "a shader at rest asks for no presents");
         uniforms.present_continuously();
         assert!(plan.moving(at));
+    }
+
+    // A draw that presents nothing, here one outside its display link's
+    // update, leaves no plan: the frame it replaced is no longer the
+    // window's, so nothing may present it again.
+    #[test]
+    fn a_draw_that_presents_nothing_leaves_no_present_plan() -> Result<()> {
+        static PROGRAM: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-plan-dropped",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return float4(1.0, 0.0, 0.0, 1.0);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let mut renderer = MetalRenderer::new(Default::default(), false, false)?;
+        renderer.update_drawable_size(size(DevicePixels(64), DevicePixels(64)));
+        let bounds = Bounds {
+            origin: Point::new(ScaledPixels(8.0), ScaledPixels(8.0)),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::PaintShader {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            program: &PROGRAM,
+            uniforms: Arc::new(gpui::ShaderUniforms::new()),
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        });
+        scene.finish();
+        renderer.draw(&scene);
+        assert!(renderer.present_plan().is_some());
+        renderer.set_display_link_attached(true);
+        renderer.draw(&scene);
+        assert!(renderer.present_plan().is_none());
+        Ok(())
     }
 
     // Something drawn over a shader keeps what is drawn over

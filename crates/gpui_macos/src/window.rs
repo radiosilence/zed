@@ -1482,8 +1482,7 @@ impl Drop for MacWindow {
 fn discards_marked_text(change: gpui::TextInputStateChange) -> bool {
     matches!(
         change,
-        gpui::TextInputStateChange::ContentChanged
-            | gpui::TextInputStateChange::SelectionChanged
+        gpui::TextInputStateChange::ContentChanged | gpui::TextInputStateChange::SelectionChanged
     )
 }
 
@@ -4243,8 +4242,8 @@ mod tests {
             );
             let context: Retained<AnyObject> = msg_send![context.register(), new];
 
-            let mut view = ClassBuilder::new(c"GPUIImeTestView", class!(NSObject))
-                .expect("test view class");
+            let mut view =
+                ClassBuilder::new(c"GPUIImeTestView", class!(NSObject)).expect("test view class");
             view.add_ivar::<*mut AnyObject>(c"testInputContext");
             view.add_method(
                 sel!(inputContext),
@@ -4264,7 +4263,10 @@ mod tests {
 
             slot.write(Retained::as_ptr(&context).cast_mut());
             discard_marked_text(Retained::as_ptr(&view).cast_mut());
-            assert_eq!(DISCARDS.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+            assert_eq!(
+                DISCARDS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
         });
     }
 

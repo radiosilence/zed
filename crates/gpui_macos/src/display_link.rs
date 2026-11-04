@@ -61,14 +61,19 @@ use dispatch2::{
     _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
 };
 use gpui::{FrameRequestSource, PlatformFrameSignal};
-use gpui_apple::display_link::MetalFrameSource;
+use gpui_apple::{display_link::MetalFrameSource, metal_renderer::PresentPlan};
 use gpui_util::ResultExt;
+use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_quartz_core::CAMetalDrawable;
 use scheduler::Instant;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, btree_map},
     ffi::c_void,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -301,14 +306,36 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
 /// nor asked for another frame, so an idle window acquires no drawables. GPUI
 /// decides when frames are needed (including presenting after high-rate
 /// input); this only stops the link between those decisions.
-#[derive(Default)]
 pub struct MetalFrames {
     source: RefCell<Option<MetalFrameSource>>,
     /// Whether GPUI asked for a frame since the current update began.
     woken: Cell<bool>,
+    /// What the link's thread presents itself, and hands the main thread.
+    off_main: Arc<OffMain>,
 }
 
 impl MetalFrames {
+    /// Frames for a window whose link runs off the main thread: what it
+    /// does not present itself it hands to `callback(data)` on the main
+    /// queue, which takes it with [`OffMain::take`].
+    pub fn new(data: *mut c_void, callback: extern "C" fn(*mut c_void)) -> Self {
+        Self {
+            source: RefCell::default(),
+            woken: Cell::default(),
+            off_main: Arc::new(OffMain {
+                wanted: AtomicBool::new(true),
+                busy: AtomicBool::new(false),
+                plan: Mutex::new(None),
+                pending: Mutex::new(None),
+                frame_requests: main_queue_source(data, callback),
+            }),
+        }
+    }
+
+    pub fn off_main(&self) -> &Arc<OffMain> {
+        &self.off_main
+    }
+
     pub fn replace(&self, source: Option<MetalFrameSource>) {
         *self.source.borrow_mut() = source;
     }
@@ -319,6 +346,7 @@ impl MetalFrames {
 
     pub fn wake(&self) {
         self.woken.set(true);
+        self.off_main.wanted.store(true, Ordering::Relaxed);
         // A source being replaced starts unpaused, so skipping it is safe.
         if let Ok(source) = self.source.try_borrow()
             && let Some(source) = source.as_ref()
@@ -329,6 +357,7 @@ impl MetalFrames {
 
     pub fn begin_frame(&self) {
         self.woken.set(false);
+        self.off_main.wanted.store(false, Ordering::Relaxed);
     }
 
     /// Ends an update, pausing the link if GPUI neither used its drawable nor
@@ -339,6 +368,114 @@ impl MetalFrames {
             source.set_paused(true);
         }
         pause
+    }
+}
+
+impl MetalFrames {
+    /// Stops the link for good, as its window closes. The link's thread may
+    /// still hold the main-queue source; cancelling it means its handler,
+    /// whose context is the window's view, never runs again.
+    pub fn close(&self) {
+        self.replace(None);
+        self.off_main.frame_requests.cancel();
+    }
+}
+
+impl Drop for MetalFrames {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// A window's frames on the thread its `CAMetalDisplayLink` runs on.
+///
+/// While GPUI has asked for no frame and only shaders move, the link's
+/// thread presents the window's last frame again itself, from its present
+/// plan, and the main thread sleeps. Every other update, and every one the
+/// plan cannot show, is handed to the main thread as before.
+pub struct OffMain {
+    /// GPUI asked for a frame since the main thread last took one.
+    wanted: AtomicBool,
+    /// A frame handed to the main thread is not yet done.
+    busy: AtomicBool,
+    /// The window's last frame drawn with shaders. The main thread holds it
+    /// while it draws, so no older frame is presented after a newer one.
+    plan: Mutex<Option<Arc<PresentPlan>>>,
+    /// The update handed to the main thread, replaced by a newer one.
+    pending: Mutex<Option<PendingFrame>>,
+    frame_requests: DispatchRetained<DispatchSource>,
+}
+
+/// An update of a window's link, for the main thread to draw.
+pub struct PendingFrame {
+    pub drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+    pub signal_at: Option<Instant>,
+    /// When the update's drawable reaches the screen.
+    pub present_at: Instant,
+}
+
+// SAFETY: a drawable may be drawn into and presented from any thread.
+unsafe impl Send for PendingFrame {}
+
+impl OffMain {
+    /// The link's update: presented here when no frame is wanted and the
+    /// plan shows something new and holds for it, handed to the main thread
+    /// otherwise. Whether it was presented here.
+    pub fn update(&self, frame: PendingFrame) -> bool {
+        if !self.wanted.load(Ordering::Relaxed) && !self.busy.load(Ordering::Relaxed) {
+            let plan = self.hold();
+            if let Some(plan) = plan.as_ref()
+                && plan.moving(frame.present_at)
+                && plan.present(&frame.drawable, frame.present_at)
+            {
+                return true;
+            }
+        }
+        self.busy.store(true, Ordering::Relaxed);
+        *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
+        self.frame_requests.merge_data(1);
+        false
+    }
+
+    /// The update handed to the main thread, if one is waiting.
+    pub fn take(&self) -> Option<PendingFrame> {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// The main thread is done with the updates it was handed.
+    pub fn done(&self) {
+        self.busy.store(false, Ordering::Relaxed);
+    }
+
+    /// The plan the link's thread presents from, to be replaced by the
+    /// main thread as it draws, while held.
+    pub fn hold(&self) -> MutexGuard<'_, Option<Arc<PresentPlan>>> {
+        self.plan.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A dispatch source that coalesces `merge_data` calls from any thread into
+/// calls of `callback(data)` on the main queue.
+fn main_queue_source(
+    data: *mut c_void,
+    callback: extern "C" fn(*mut c_void),
+) -> DispatchRetained<DispatchSource> {
+    unsafe {
+        let source = DispatchSource::new(
+            &raw const _dispatch_source_type_data_add as *mut _,
+            0,
+            0,
+            Some(DispatchQueue::main()),
+        );
+        source.set_context(data);
+        source.set_event_handler_f(callback);
+        // Resume before this source can ever be dropped: destroying a
+        // suspended dispatch source is undefined behavior (#50875).
+        source.resume();
+        source
     }
 }
 
@@ -353,22 +490,8 @@ pub struct WindowFrameSource {
 
 impl WindowFrameSource {
     pub fn new(data: *mut c_void, callback: extern "C" fn(*mut c_void)) -> Self {
-        let frame_requests = unsafe {
-            let frame_requests = DispatchSource::new(
-                &raw const _dispatch_source_type_data_add as *mut _,
-                0,
-                0,
-                Some(DispatchQueue::main()),
-            );
-            frame_requests.set_context(data);
-            frame_requests.set_event_handler_f(callback);
-            // Resume before this source can ever be dropped: destroying a
-            // suspended dispatch source is undefined behavior (#50875).
-            frame_requests.resume();
-            frame_requests
-        };
         Self {
-            frame_requests,
+            frame_requests: main_queue_source(data, callback),
             registration: None,
             signal: Arc::new(PlatformFrameSignal::new()),
         }
@@ -588,12 +711,14 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use objc2::AnyThread;
+    use objc2::{AnyThread, Message};
     use objc2_quartz_core::CAMetalDisplayLink;
+
+    extern "C" fn no_frame(_: *mut c_void) {}
 
     #[test]
     fn metal_frames_pause_only_when_gpui_neither_draws_nor_asks_again() {
-        let frames = MetalFrames::default();
+        let frames = MetalFrames::new(std::ptr::null_mut(), no_frame);
 
         frames.begin_frame();
         assert!(
@@ -617,6 +742,92 @@ mod tests {
 
         frames.begin_frame();
         assert!(frames.end_frame(false), "an idle update pauses the link");
+    }
+
+    // An update is presented on the link's thread only while GPUI wants no
+    // frame, no frame handed over is still being drawn, and the window's last
+    // frame has a shader that moves; every other update goes to the main thread.
+    #[test]
+    fn an_update_is_presented_off_the_main_thread_only_while_only_shaders_move() {
+        static PROGRAM: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-off-main",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return float4(1.0, 0.0, 0.0, 1.0);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let mut renderer =
+            crate::renderer::MetalRenderer::new(Default::default(), false, false).unwrap();
+        renderer.update_drawable_size(gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(64)));
+        let layer = renderer
+            .layer()
+            .expect("window renderer has a layer")
+            .retain();
+        let frame = || PendingFrame {
+            drawable: layer.nextDrawable().expect("a drawable"),
+            signal_at: None,
+            present_at: Instant::now(),
+        };
+        let frames = MetalFrames::new(std::ptr::null_mut(), no_frame);
+        let off_main = frames.off_main().clone();
+
+        assert!(
+            !off_main.update(frame()),
+            "a new window wants its first frame"
+        );
+        assert!(off_main.take().is_some());
+        frames.begin_frame();
+        assert!(
+            !off_main.update(frame()),
+            "a frame handed over is being drawn"
+        );
+        off_main.done();
+        assert!(off_main.take().is_some());
+        assert!(!off_main.update(frame()), "nothing drawn yet to present");
+        off_main.done();
+
+        let uniforms = Arc::new(gpui::ShaderUniforms::new());
+        let bounds = gpui::Bounds {
+            origin: gpui::point(gpui::ScaledPixels(8.0), gpui::ScaledPixels(8.0)),
+            size: gpui::size(gpui::ScaledPixels(16.0), gpui::ScaledPixels(16.0)),
+        };
+        let mut scene = gpui::Scene::default();
+        scene.insert_primitive(gpui::PaintShader {
+            order: 0,
+            bounds,
+            content_mask: gpui::ContentMask { bounds },
+            program: &PROGRAM,
+            uniforms: uniforms.clone(),
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        });
+        scene.finish();
+        {
+            let mut plan = off_main.hold();
+            renderer.draw(&scene);
+            *plan = renderer.present_plan();
+        }
+        assert!(off_main.hold().is_some());
+        assert!(
+            !off_main.update(frame()),
+            "a shader at rest shows nothing new"
+        );
+        assert!(off_main.take().is_some());
+        off_main.done();
+        uniforms.present_continuously();
+        assert!(
+            off_main.update(frame()),
+            "a moving shader is presented here"
+        );
+        assert!(off_main.take().is_none());
+
+        frames.wake();
+        assert!(!off_main.update(frame()), "a frame GPUI wants goes to it");
+        assert!(off_main.take().is_some());
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use crate::{
-    BoolExt, MacDisplay, MetalFrames, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
-    TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
-    kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
-    ns_string, renderer,
+    BoolExt, MacDisplay, MetalFrames, NSRange, NSStringExt, PendingFrame,
+    TISCopyCurrentKeyboardInputSource, TISGetInputSourceProperty, WindowFrameSource,
+    events::platform_input_from_native, kTISPropertyInputSourceIsASCIICapable,
+    kTISPropertyInputSourceType, kTISTypeKeyboardInputMode, ns_string, renderer,
 };
 use anyhow::Result;
 use block2::RcBlock;
@@ -848,9 +848,7 @@ impl MacWindowState {
         }
     }
 
-    /// `window_state` is the handle this state lives in; a Metal link holds it
-    /// weakly to deliver frames.
-    fn start_display_link(&mut self, window_state: &Rc<Mutex<MacWindowState>>) {
+    fn start_display_link(&mut self) {
         self.stop_display_link();
         if !self
             .native_window()
@@ -866,11 +864,23 @@ impl MacWindowState {
                 };
                 let main_thread =
                     crate::main_thread_marker().expect("macOS windows require the main thread");
-                let window_state = Rc::downgrade(window_state);
-                let source = MetalFrameSource::new(layer, main_thread, move |update| {
-                    if let Some(window_state) = window_state.upgrade() {
-                        metal_frame(&window_state, update);
-                    }
+                // The link runs on the present thread, which presents moving
+                // shaders itself and hands every other update to `metal_step`.
+                let off_main = metal_frames.off_main().clone();
+                let source = MetalFrameSource::off_main(layer, main_thread, move |update| {
+                    let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
+                    // How far ahead of now this frame reaches the screen, on
+                    // the display link's clock.
+                    let lead = update.targetPresentationTimestamp()
+                        - objc2_quartz_core::CACurrentMediaTime();
+                    let present_at = scheduler::Instant::now()
+                        + std::time::Duration::try_from_secs_f64(lead.clamp(0.0, 0.1))
+                            .unwrap_or_default();
+                    off_main.update(PendingFrame {
+                        drawable: update.drawable(),
+                        signal_at,
+                        present_at,
+                    });
                 });
                 if let Some(source) = source {
                     metal_frames.replace(Some(source));
@@ -1132,7 +1142,8 @@ impl MacWindow {
             let native_view: *mut AnyObject = msg_send![native_view, initWithFrame: content_bounds];
             assert!(!native_view.is_null());
 
-            let metal_frames = MetalFrameSource::is_available().then(Rc::<MetalFrames>::default);
+            let metal_frames = MetalFrameSource::is_available()
+                .then(|| Rc::new(MetalFrames::new(native_view.cast(), metal_step)));
             let state = Rc::new(Mutex::new(MacWindowState {
                 handle,
                 foreground_executor,
@@ -1437,7 +1448,7 @@ impl Drop for MacWindow {
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         match &mut this.frame_source {
-            FrameSource::Metal(metal_frames) => metal_frames.replace(None),
+            FrameSource::Metal(metal_frames) => metal_frames.close(),
             FrameSource::DisplayLink(frame_source) => drop(frame_source.take()),
         }
         unsafe {
@@ -2195,7 +2206,20 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        match &self.2 {
+            // The plan is replaced under its lock, so the present thread
+            // never presents an older frame after this one.
+            Some(metal_frames) => {
+                let mut plan = metal_frames.off_main().hold();
+                this.renderer.draw(scene);
+                *plan = this.renderer.present_plan();
+            }
+            None => this.renderer.draw(scene),
+        }
+    }
+
+    fn presents_shaders(&self) -> bool {
+        self.2.is_some()
     }
 
     // GPUI calls this without waking the frame waker when a window only needs
@@ -3130,7 +3154,7 @@ extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mu
         .contains(NSWindowOcclusionState::Visible)
     {
         lock.move_traffic_light();
-        lock.start_display_link(&window_state);
+        lock.start_display_link();
     } else {
         lock.stop_display_link();
     }
@@ -3259,7 +3283,7 @@ fn update_window_scale_factor(window_state: &Rc<Mutex<MacWindowState>>) {
 extern "C" fn window_did_change_screen(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
-    lock.start_display_link(&window_state);
+    lock.start_display_link();
     drop(lock);
     update_window_scale_factor(&window_state);
     report_display_change(&window_state);
@@ -3347,7 +3371,7 @@ extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
                 lock.renderer.set_presents_with_transaction(false);
-                lock.start_display_link(&window_state);
+                lock.start_display_link();
             }
         } else {
             lock.activated_least_once = true;
@@ -3473,7 +3497,7 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
         lock.renderer.set_presents_with_transaction(false);
-        lock.start_display_link(&window_state);
+        lock.start_display_link();
     }
 }
 
@@ -3501,31 +3525,41 @@ extern "C" fn step(view: *mut c_void) {
     }
 }
 
-fn metal_frame(
-    window_state: &Rc<Mutex<MacWindowState>>,
-    update: &objc2_quartz_core::CAMetalDisplayLinkUpdate,
-) {
-    let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
-    let mut lock = window_state.lock();
+/// The main queue's side of a window's link: draws the update the present
+/// thread handed over, if the link it came from is still the window's.
+extern "C" fn metal_step(view: *mut c_void) {
+    let view = view as *mut AnyObject;
+    let window_state = unsafe { get_window_state(&*view) };
+    let lock = window_state.lock();
     let FrameSource::Metal(metal_frames) = &lock.frame_source else {
         return;
     };
     let metal_frames = metal_frames.clone();
+    drop(lock);
+    if let Some(frame) = metal_frames.off_main().take()
+        && metal_frames.is_attached()
+    {
+        metal_frame(&window_state, &metal_frames, frame);
+    }
+    metal_frames.off_main().done();
+}
+
+fn metal_frame(
+    window_state: &Rc<Mutex<MacWindowState>>,
+    metal_frames: &MetalFrames,
+    frame: PendingFrame,
+) {
+    let mut lock = window_state.lock();
     let Some(mut callback) = lock.request_frame_callback.take() else {
         return;
     };
-    lock.renderer.set_frame_drawable(Some(update.drawable()));
+    lock.renderer.set_frame_drawable(Some(frame.drawable));
     drop(lock);
-    // How far ahead of now this frame reaches the screen, on the display
-    // link's clock.
-    let lead = update.targetPresentationTimestamp() - objc2_quartz_core::CACurrentMediaTime();
-    let present_at = scheduler::Instant::now()
-        + std::time::Duration::try_from_secs_f64(lead.clamp(0.0, 0.1)).unwrap_or_default();
     metal_frames.begin_frame();
     callback(RequestFrameOptions {
-        signal_at,
+        signal_at: frame.signal_at,
         signal_source: FrameRequestSource::NativeCallback,
-        present_at: Some(present_at),
+        present_at: Some(frame.present_at),
         ..Default::default()
     });
     let mut lock = window_state.lock();

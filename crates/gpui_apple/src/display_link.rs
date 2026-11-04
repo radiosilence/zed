@@ -11,7 +11,13 @@ use objc2_foundation::{
 use objc2_quartz_core::{
     CAMetalDisplayLink, CAMetalDisplayLinkDelegate, CAMetalDisplayLinkUpdate, CAMetalLayer,
 };
-use std::{cell::Cell, marker::PhantomData, sync::OnceLock};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    marker::PhantomData,
+    sync::{Mutex, OnceLock, PoisonError},
+    thread::ThreadId,
+};
 
 struct MetalDisplayLinkDelegateIvars {
     callback: Box<dyn Fn(&CAMetalDisplayLinkUpdate)>,
@@ -86,6 +92,7 @@ impl PresentThreadDelegate {
 struct PresentThread {
     run_loop: Retained<NSRunLoop>,
     cf_run_loop: CFRetained<CFRunLoop>,
+    thread: ThreadId,
 }
 
 // SAFETY: the run loop is only handed to `addToRunLoop:forMode:`, which adds
@@ -123,6 +130,7 @@ impl PresentThread {
                         .send(PresentThread {
                             run_loop: run_loop.clone(),
                             cf_run_loop,
+                            thread: std::thread::current().id(),
                         })
                         .ok();
                     run_loop.run();
@@ -153,6 +161,51 @@ impl PresentThread {
         }
         self.cf_run_loop.wake_up();
     }
+
+    /// Runs `work` on the present thread after any work asked for before
+    /// it, and returns once it has run. Work on the present thread never
+    /// waits for the main thread, so the main thread may wait for it.
+    fn perform_and_wait(&self, work: impl FnOnce() + 'static) {
+        if std::thread::current().id() == self.thread {
+            work();
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        self.perform(move || {
+            work();
+            sender.send(()).ok();
+        });
+        receiver.recv().ok();
+    }
+}
+
+/// The layers a `CAMetalDisplayLink` holds, by address: from the link's
+/// creation until its invalidation has completed. While a link holds a
+/// layer, the layer's `nextDrawable` raises.
+static LINKED_LAYERS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+fn set_layer_linked(layer: usize, linked: bool) {
+    let mut layers = LINKED_LAYERS.lock().unwrap_or_else(PoisonError::into_inner);
+    let layers = layers.get_or_insert_with(HashMap::default);
+    let links = layers.entry(layer).or_default();
+    if linked {
+        *links += 1;
+    } else {
+        *links = links.saturating_sub(1);
+        if *links == 0 {
+            layers.remove(&layer);
+        }
+    }
+}
+
+/// Whether a display link still holds `layer`, so that calling its
+/// `nextDrawable` would raise.
+pub fn is_layer_linked(layer: &CAMetalLayer) -> bool {
+    LINKED_LAYERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|layers| layers.contains_key(&(layer as *const CAMetalLayer as usize)))
 }
 
 /// A source of Metal drawables on macOS 14+ and iOS/iPadOS 17+.
@@ -166,6 +219,8 @@ pub struct MetalFrameSource {
     link: Retained<CAMetalDisplayLink>,
     // The link holds its delegate weakly.
     delegate: Retained<NSObject>,
+    /// The address of the layer the link holds.
+    layer: usize,
     /// Whether the link runs on the present thread, where it is then paused
     /// and invalidated, never from the main thread under its updates.
     on_present_thread: bool,
@@ -196,9 +251,12 @@ impl MetalFrameSource {
         // SAFETY: the retained marker confines the source to the main thread,
         // and the main run loop outlives the source.
         unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
+        let layer = layer as *const CAMetalLayer as usize;
+        set_layer_linked(layer, true);
         Some(Self {
             link,
             delegate: Retained::into_super(delegate),
+            layer,
             on_present_thread: false,
             _not_send: PhantomData,
         })
@@ -221,9 +279,12 @@ impl MetalFrameSource {
         // SAFETY: the present thread's run loop runs for the life of the
         // process, and its sources may be added from any thread.
         unsafe { link.addToRunLoop_forMode(&PresentThread::get().run_loop, NSRunLoopCommonModes) };
+        let layer = layer as *const CAMetalLayer as usize;
+        set_layer_linked(layer, true);
         Some(Self {
             link,
             delegate: Retained::into_super(delegate),
+            layer,
             on_present_thread: true,
             _not_send: PhantomData,
         })
@@ -244,17 +305,21 @@ impl MetalFrameSource {
 impl Drop for MetalFrameSource {
     fn drop(&mut self) {
         if self.on_present_thread {
-            // The delegate lives until the link is invalidated, on the
-            // thread its updates run on, so none runs without it.
+            // The link is invalidated on the thread its updates run on, and
+            // the delegate lives until then, so none runs without it. The
+            // drop waits for the invalidation: until it completes the link
+            // holds the layer, and a synchronous draw's `nextDrawable` on it
+            // raises.
             let link = self.link.clone();
             let delegate = self.delegate.clone();
-            PresentThread::get().perform(move || {
+            PresentThread::get().perform_and_wait(move || {
                 link.invalidate();
                 drop(delegate);
             });
         } else {
             self.link.invalidate();
         }
+        set_layer_linked(self.layer, false);
     }
 }
 
@@ -303,6 +368,25 @@ mod tests {
             Some("gpui-present".to_owned())
         );
         drop(source);
+    }
+
+    // Dropping a present-thread link returns only once the link has let go
+    // of its layer, even while the present thread is busy, so the main
+    // thread can draw into the layer at once.
+    #[test]
+    fn a_dropped_present_thread_link_has_released_its_layer() {
+        if !MetalFrameSource::is_available() {
+            return;
+        }
+        let layer = CAMetalLayer::new();
+        layer.setDevice(MTLCreateSystemDefaultDevice().as_deref());
+        layer.setDrawableSize(objc2_core_foundation::CGSize::new(16.0, 16.0));
+        let source = MetalFrameSource::off_main(&layer, |_| {}).expect("a link");
+        assert!(is_layer_linked(&layer));
+        PresentThread::get().perform(|| std::thread::sleep(std::time::Duration::from_millis(100)));
+        drop(source);
+        assert!(!is_layer_linked(&layer));
+        assert!(layer.nextDrawable().is_some());
     }
 
     #[test]

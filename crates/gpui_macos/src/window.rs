@@ -867,6 +867,7 @@ impl MacWindowState {
                 // The link runs on the present thread, which presents moving
                 // shaders itself and hands every other update to `metal_step`.
                 let off_main = metal_frames.off_main().clone();
+                let link = off_main.link();
                 let source = MetalFrameSource::off_main(layer, main_thread, move |update| {
                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
                     // How far ahead of now this frame reaches the screen, on
@@ -880,6 +881,7 @@ impl MacWindowState {
                         drawable: update.drawable(),
                         signal_at,
                         present_at,
+                        link,
                     });
                 });
                 if let Some(source) = source {

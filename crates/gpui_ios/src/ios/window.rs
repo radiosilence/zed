@@ -1202,6 +1202,15 @@ impl PlatformWindow for IosWindow {
 
     fn draw(&self, scene: &Scene) {
         self.renderer.lock().draw(scene);
+        self.text_input_view.follow_field();
+    }
+
+    fn draws_text_selection(&self) -> bool {
+        self.text_input_view.draws_selection()
+    }
+
+    fn set_native_text_interaction(&self, on: bool) {
+        self.text_input_view.set_native(on);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

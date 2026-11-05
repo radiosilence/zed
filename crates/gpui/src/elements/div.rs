@@ -2235,6 +2235,8 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    /// How far the content scrolls, as laid out this frame.
+    pub(crate) scroll_max: Rc<Cell<Point<Pixels>>>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
@@ -2578,6 +2580,7 @@ impl Interactivity {
                 scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
             }
 
+            self.scroll_max.set(scroll_max);
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
@@ -3469,6 +3472,7 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
+            let scroll_max = self.scroll_max.clone();
             window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3484,22 +3488,19 @@ impl Interactivity {
                             .filter(&mut delta, event.touch_phase);
                     }
 
+                    // A wheel's one axis scrolls a container that scrolls only
+                    // the other; a finger moves in the plane, and its other
+                    // axis is the container around's to take.
+                    let touch = event.source == crate::ScrollSource::Touch;
+                    let cross_axis = !restrict_scroll_to_axis && !touch;
                     let mut delta_x = match overflow.x {
                         Overflow::Scroll if !delta.x.is_zero() => delta.x,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
-                        {
-                            delta.y
-                        }
+                        Overflow::Scroll if cross_axis && overflow.y != Overflow::Scroll => delta.y,
                         _ => Pixels::ZERO,
                     };
                     let mut delta_y = match overflow.y {
                         Overflow::Scroll if !delta.y.is_zero() => delta.y,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
-                        {
-                            delta.x
-                        }
+                        Overflow::Scroll if cross_axis && overflow.x != Overflow::Scroll => delta.x,
                         _ => Pixels::ZERO,
                     };
                     if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
@@ -3511,6 +3512,18 @@ impl Interactivity {
                     }
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
+                    // A finger's pan moves the innermost container under it
+                    // that can still move that way, and only that one; one
+                    // already at its end leaves the pan to the container
+                    // around it.
+                    if touch {
+                        let max = scroll_max.get();
+                        scroll_offset.x = scroll_offset.x.clamp(-max.x, px(0.));
+                        scroll_offset.y = scroll_offset.y.clamp(-max.y, px(0.));
+                        if *scroll_offset != old_scroll_offset {
+                            cx.stop_propagation();
+                        }
+                    }
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
                     }

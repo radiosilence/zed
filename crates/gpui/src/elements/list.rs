@@ -1625,6 +1625,7 @@ impl Element for List {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
+                let before = list_state.logical_scroll_top();
                 list_state.0.borrow_mut().scroll(
                     &scroll_top,
                     height,
@@ -1632,7 +1633,14 @@ impl Element for List {
                     current_view,
                     window,
                     cx,
-                )
+                );
+                // A finger's pan moves the innermost container under it that
+                // can still move, as a scrolling div's does.
+                if event.source == crate::ScrollSource::Touch
+                    && list_state.logical_scroll_top() != before
+                {
+                    cx.stop_propagation();
+                }
             }
         });
 

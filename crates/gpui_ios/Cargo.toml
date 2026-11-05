@@ -49,7 +49,7 @@ gpui_apple = { workspace = true, features = ["font-kit"] }
 log.workspace = true
 objc2.workspace = true
 objc2-foundation = { workspace = true, features = ["NSThread", "NSOperation", "NSUserActivity", "block2"] }
-objc2-ui-kit.workspace = true
+objc2-ui-kit = { workspace = true, features = ["UIColor", "UIInteraction", "UITextInteraction"] }
 objc2-quartz-core = { workspace = true, features = ["CADisplayLink"] }
 objc2-core-foundation = { workspace = true, default-features = true }
 parking_lot.workspace = true

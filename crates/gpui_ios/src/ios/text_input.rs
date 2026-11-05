@@ -4,7 +4,7 @@ use gpui::{
     TextInputStateChange, px,
 };
 use objc2::rc::{Retained, Weak};
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
@@ -124,6 +124,11 @@ pub(super) struct TextInputIvars {
     selection_changed: Cell<bool>,
     content_changed: Cell<bool>,
     native_edit: Cell<bool>,
+    /// UIKit's text interaction, while the window asks for it
+    /// (`set_native`): the view then lies over the focused field.
+    interaction: RefCell<Option<Retained<UITextInteraction>>>,
+    /// A placement over the field is asked for and not yet made.
+    place_pending: Cell<bool>,
 }
 
 define_class!(
@@ -140,6 +145,61 @@ define_class!(
         fn can_become_first_responder(&self) -> bool {
             self.ivars().keyboard_desired.get()
                 && self.ivars().keyboard_eligible.get()
+        }
+
+        // The edit menu's actions, against the field's selection and the
+        // general pasteboard.
+        #[unsafe(method(canPerformAction:withSender:))]
+        fn can_perform_action(&self, action: Sel, sender: Option<&AnyObject>) -> Bool {
+            let editable = self.ivars().keyboard_eligible.get();
+            let answer = if action == sel!(copy:) {
+                Some(self.selected_text().is_some())
+            } else if action == sel!(cut:) {
+                Some(editable && self.selected_text().is_some())
+            } else if action == sel!(paste:) {
+                Some(editable && unsafe { UIPasteboard::generalPasteboard().hasStrings() })
+            } else if action == sel!(selectAll:) {
+                Some(self.document_range().is_some_and(|range| !range.is_empty()))
+            } else {
+                None
+            };
+            match answer {
+                Some(answer) => Bool::new(answer),
+                None => unsafe { msg_send![super(self), canPerformAction: action, withSender: sender] },
+            }
+        }
+
+        #[unsafe(method(copy:))]
+        fn copy_action(&self, _sender: Option<&AnyObject>) {
+            self.copy_selection();
+        }
+
+        #[unsafe(method(cut:))]
+        fn cut_action(&self, _sender: Option<&AnyObject>) {
+            if self.copy_selection() {
+                self.edit(|handler| handler.replace_text_in_range(None, ""));
+                self.edited_by_menu(true);
+            }
+        }
+
+        #[unsafe(method(paste:))]
+        fn paste_action(&self, _sender: Option<&AnyObject>) {
+            let Some(text) = (unsafe { UIPasteboard::generalPasteboard().string() }) else {
+                return;
+            };
+            let text = text.to_string();
+            self.edit(|handler| handler.replace_text_in_range(None, &text));
+            self.edited_by_menu(true);
+        }
+
+        #[unsafe(method(selectAll:))]
+        fn select_all_action(&self, _sender: Option<&AnyObject>) {
+            self.with_handler(|handler| {
+                if let Some(document) = document_range(handler) {
+                    handler.set_selected_text_range(document);
+                }
+            });
+            self.edited_by_menu(false);
         }
 
         #[unsafe(method(resignFirstResponder))]
@@ -196,6 +256,7 @@ define_class!(
             if self.ivars().configuration_changed.replace(false) && self.isFirstResponder() {
                 self.reloadInputViews();
             }
+            self.place();
             let content_changed = self.ivars().content_changed.replace(false);
             let selection_changed = self.ivars().selection_changed.replace(false);
             if content_changed || selection_changed {
@@ -441,13 +502,13 @@ define_class!(
         }
         #[unsafe(method(firstRectForRange:))]
         fn first_rect(&self, range: &UITextRange) -> CGRect {
-            self.validated_range(range).and_then(|range| self.bounds(range)).unwrap_or(CGRect::ZERO)
+            self.validated_range(range).and_then(|range| self.bounds(range)).map(|rect| self.local(rect)).unwrap_or(CGRect::ZERO)
         }
         #[unsafe(method(caretRectForPosition:))]
         fn caret_rect(&self, position: &UITextPosition) -> CGRect {
             self.validated_offset(position)
                 .and_then(|offset| self.bounds(offset..offset))
-                .map(nonempty_caret_rect)
+                .map(|rect| nonempty_caret_rect(self.local(rect)))
                 .unwrap_or(CGRect::ZERO)
         }
         #[unsafe(method_id(selectionRectsForRange:))]
@@ -461,7 +522,7 @@ define_class!(
             let count = bounds.len();
             let rectangles = bounds.into_iter().enumerate().map(|(index, bounds)| {
                     let this = SelectionRect::alloc(self.mtm()).set_ivars(SelectionRectIvars {
-                        rect: native_rect(bounds),
+                        rect: self.local(native_rect(bounds)),
                         contains_start: index == 0,
                         contains_end: index + 1 == count,
                     });
@@ -473,6 +534,8 @@ define_class!(
         }
         #[unsafe(method_id(closestPositionToPoint:))]
         fn closest_position(&self, point: CGPoint) -> Option<Retained<UITextPosition>> {
+            let origin = if self.native() { self.frame().origin } else { CGPoint::ZERO };
+            let point = CGPoint::new(point.x + origin.x, point.y + origin.y);
             self.with_handler(|handler| {
                 let offset = handler.character_index_for_point(gpui::point(px(point.x as f32), px(point.y as f32)))?;
                 allowed_range(handler, &(offset..offset)).then_some(offset)
@@ -496,9 +559,21 @@ define_class!(
         }
         #[unsafe(method_id(textInputView))]
         fn text_input_view(&self) -> Retained<UIView> {
-            // GPUI's bounds and hit testing use the rendering view's coordinate space,
-            // not the hidden responder's one-point frame.
-            self.superview().unwrap_or_else(|| self.retain().into_super())
+            // With the text interaction, the view lies over the focused field
+            // (`place`) and UIKit draws the caret, the selection and its
+            // handles in it. Without, GPUI's bounds and hit testing use the
+            // rendering view's coordinate space, not this one-point view's.
+            if self.native() {
+                self.retain().into_super()
+            } else {
+                self.superview().unwrap_or_else(|| self.retain().into_super())
+            }
+        }
+
+        #[unsafe(method(placeTextInput))]
+        fn place_text_input(&self) {
+            self.ivars().place_pending.set(false);
+            self.place();
         }
     }
 
@@ -521,6 +596,8 @@ impl TextInputView {
             selection_changed: Cell::new(false),
             content_changed: Cell::new(false),
             native_edit: Cell::new(false),
+            interaction: RefCell::new(None),
+            place_pending: Cell::new(false),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -586,6 +663,133 @@ impl TextInputView {
 
     fn document_range(&self) -> Option<Range<usize>> {
         self.with_handler(document_range).flatten()
+    }
+
+    /// A rect in the window's coordinates, as GPUI gives them, in this view's.
+    fn local(&self, rect: CGRect) -> CGRect {
+        if !self.native() {
+            return rect;
+        }
+        let origin = self.frame().origin;
+        CGRect::new(
+            CGPoint::new(rect.origin.x - origin.x, rect.origin.y - origin.y),
+            rect.size,
+        )
+    }
+
+    /// Lies over the focused field while it holds the keyboard, and is a
+    /// point in the corner otherwise, so touches anywhere but the field
+    /// reach the window.
+    fn place(&self) {
+        if !self.native() {
+            return;
+        }
+        let field = self
+            .ivars()
+            .keyboard_eligible
+            .get()
+            .then(|| {
+                self.with_handler(|handler| handler.element_bounds())
+                    .flatten()
+            })
+            .flatten();
+        let frame = field
+            .map(native_rect)
+            .unwrap_or_else(|| CGRect::new(CGPoint::ZERO, CGSize::new(1.0, 1.0)));
+        if self.frame() != frame {
+            self.setFrame(frame);
+        }
+    }
+
+    fn native(&self) -> bool {
+        self.ivars().interaction.borrow().is_some()
+    }
+
+    /// Whether UIKit draws the focused field's caret and selection.
+    pub(super) fn draws_selection(&self) -> bool {
+        self.native()
+    }
+
+    /// Turns UIKit's text interaction on or off. On, the view is clear and
+    /// lies over the focused field, where UIKit draws the caret, the
+    /// selection, its handles and the loupe; its recognizers cancel no
+    /// touch, so GPUI still sees every touch on the field (a clear button
+    /// in it, a pan starting on it, an overlay drawn over it). Off, the
+    /// view is a hidden point and GPUI draws the text's selection itself.
+    pub(super) fn set_native(&self, on: bool) {
+        if on == self.native() {
+            return;
+        }
+        if on {
+            let interaction = UITextInteraction::textInteractionForMode(
+                UITextInteractionMode::Editable,
+                self.mtm(),
+            );
+            unsafe { interaction.setTextInput(Some(self)) };
+            self.addInteraction(ProtocolObject::from_ref(&*interaction));
+            if let Some(recognizers) = self.gestureRecognizers() {
+                for recognizer in recognizers.iter() {
+                    recognizer.setCancelsTouchesInView(false);
+                    recognizer.setDelaysTouchesEnded(false);
+                }
+            }
+            self.setBackgroundColor(Some(&UIColor::clearColor()));
+            self.setAlpha(1.0);
+            *self.ivars().interaction.borrow_mut() = Some(interaction);
+            self.follow_field();
+        } else {
+            if let Some(interaction) = self.ivars().interaction.borrow_mut().take() {
+                self.removeInteraction(ProtocolObject::from_ref(&*interaction));
+            }
+            self.setAlpha(0.01);
+            self.setFrame(CGRect::new(CGPoint::ZERO, CGSize::new(1.0, 1.0)));
+        }
+    }
+
+    /// The field may have moved (a scroll, a layout change): the view
+    /// follows it once the window has finished drawing, while the
+    /// interaction is on and a field holds the keyboard.
+    pub(super) fn follow_field(&self) {
+        if !self.native()
+            || !self.ivars().keyboard_eligible.get()
+            || self.ivars().place_pending.replace(true)
+        {
+            return;
+        }
+        unsafe {
+            self.performSelector_withObject_afterDelay(sel!(placeTextInput), None, 0.0);
+        }
+    }
+
+    /// UIKit is told of an edit it did not make itself (the edit menu's),
+    /// so its selection and handles follow.
+    fn edited_by_menu(&self, content: bool) {
+        if content {
+            self.ivars().content_changed.set(true);
+        }
+        self.ivars().selection_changed.set(true);
+        self.refresh_keyboard();
+    }
+
+    /// Puts the selection on the general pasteboard; whether there was one.
+    fn copy_selection(&self) -> bool {
+        let Some(text) = self.selected_text() else {
+            return false;
+        };
+        unsafe { UIPasteboard::generalPasteboard().setString(Some(&NSString::from_str(&text))) };
+        true
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.with_handler(|handler| {
+            let selection = handler.selected_text_range(false)?.range;
+            if selection.is_empty() || !allowed_range(handler, &selection) {
+                return None;
+            }
+            let mut adjusted = None;
+            handler.text_for_range(selection, &mut adjusted)
+        })
+        .flatten()
     }
 
     fn bounds(&self, range: Range<usize>) -> Option<CGRect> {

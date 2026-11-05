@@ -10545,7 +10545,7 @@ mod tests {
                         }
                     });
                     let up = events.clone();
-                    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, _| {
+                    window.on_mouse_event(move |event: &crate::MouseUpEvent, phase, _, _| {
                         if phase == DispatchPhase::Bubble {
                             up.borrow_mut().push(("up", event.position.x));
                         }

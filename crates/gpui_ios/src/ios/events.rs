@@ -1,13 +1,13 @@
 //! Conversion from UIKit events to GPUI input events.
 
 use gpui::{
-    BackGestureEvent, BackGesturePhase, Modifiers, Pixels, Point, ScrollDelta, ScrollEvent,
-    ScrollSource, TouchId, TouchPhase, px,
+    BackGestureEvent, BackGesturePhase, Keystroke, Modifiers, Pixels, Point, ScrollDelta,
+    ScrollEvent, ScrollSource, TouchId, TouchPhase, px,
 };
 use objc2_core_foundation::CGPoint;
 use objc2_ui_kit::{
-    UIGestureRecognizerState, UIKeyModifierFlags, UIPanGestureRecognizer, UIRectEdge,
-    UIScreenEdgePanGestureRecognizer, UITouch, UITouchPhase, UIView,
+    UIGestureRecognizerState, UIKeyModifierFlags, UIKeyboardHIDUsage, UIPanGestureRecognizer,
+    UIRectEdge, UIScreenEdgePanGestureRecognizer, UITouch, UITouchPhase, UIView,
 };
 
 /// A release faster than this, in points per second toward going back, commits
@@ -109,7 +109,7 @@ pub fn scroll_event(recognizer: &UIPanGestureRecognizer, view: &UIView) -> Optio
     })
 }
 
-fn modifiers(flags: UIKeyModifierFlags) -> Modifiers {
+pub(crate) fn modifiers(flags: UIKeyModifierFlags) -> Modifiers {
     Modifiers {
         control: flags.contains(UIKeyModifierFlags::Control),
         alt: flags.contains(UIKeyModifierFlags::Alternate),
@@ -125,4 +125,130 @@ pub fn touch_force(touch: &UITouch) -> Option<f32> {
         return None;
     }
     Some((touch.force() / maximum_force).clamp(0.0, 1.0) as f32)
+}
+
+/// The keystroke a hardware key press is to GPUI's bindings, from the key's
+/// HID usage, the characters it types with and without its modifiers, and
+/// the modifiers held. A modifier key alone is none.
+pub fn keystroke(
+    code: UIKeyboardHIDUsage,
+    characters: &str,
+    characters_ignoring_modifiers: &str,
+    flags: UIKeyModifierFlags,
+) -> Option<Keystroke> {
+    let named = match code {
+        UIKeyboardHIDUsage::KeyboardReturnOrEnter | UIKeyboardHIDUsage::KeypadEnter => "enter",
+        UIKeyboardHIDUsage::KeyboardEscape => "escape",
+        UIKeyboardHIDUsage::KeyboardDeleteOrBackspace => "backspace",
+        UIKeyboardHIDUsage::KeyboardDeleteForward => "delete",
+        UIKeyboardHIDUsage::KeyboardTab => "tab",
+        UIKeyboardHIDUsage::KeyboardSpacebar => "space",
+        UIKeyboardHIDUsage::KeyboardLeftArrow => "left",
+        UIKeyboardHIDUsage::KeyboardRightArrow => "right",
+        UIKeyboardHIDUsage::KeyboardUpArrow => "up",
+        UIKeyboardHIDUsage::KeyboardDownArrow => "down",
+        UIKeyboardHIDUsage::KeyboardHome => "home",
+        UIKeyboardHIDUsage::KeyboardEnd => "end",
+        UIKeyboardHIDUsage::KeyboardPageUp => "pageup",
+        UIKeyboardHIDUsage::KeyboardPageDown => "pagedown",
+        _ => "",
+    };
+    let function = (UIKeyboardHIDUsage::KeyboardF1.0..=UIKeyboardHIDUsage::KeyboardF12.0)
+        .contains(&code.0)
+        .then(|| format!("f{}", code.0 - UIKeyboardHIDUsage::KeyboardF1.0 + 1));
+    let modifier_key = (UIKeyboardHIDUsage::KeyboardLeftControl.0
+        ..=UIKeyboardHIDUsage::KeyboardRightGUI.0)
+        .contains(&code.0);
+    let mut modifiers = modifiers(flags);
+    let key = if !named.is_empty() {
+        named.to_string()
+    } else if let Some(function) = function {
+        function
+    } else if modifier_key || characters_ignoring_modifiers.is_empty() {
+        return None;
+    } else if modifiers.shift
+        && !characters_ignoring_modifiers
+            .chars()
+            .all(|c| c.is_ascii_alphabetic())
+    {
+        // As macOS reports it: a shifted symbol is the symbol, without shift
+        // (`?`, not `shift-/`), so bindings written as the symbol match.
+        modifiers.shift = false;
+        let shifted = if characters.is_empty() {
+            characters_ignoring_modifiers
+        } else {
+            characters
+        };
+        shifted.to_string()
+    } else {
+        characters_ignoring_modifiers.to_lowercase()
+    };
+    let types = !modifiers.control && !modifiers.platform;
+    let key_char = (types && (named.is_empty() || named == "space"))
+        .then(|| characters.to_string())
+        .filter(|typed| !typed.is_empty() && !typed.chars().any(char::is_control));
+    Some(Keystroke {
+        modifiers,
+        key,
+        key_char,
+    })
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn named_keys_and_shortcuts_become_gpui_keystrokes() {
+        let none = UIKeyModifierFlags::empty();
+        let enter =
+            keystroke(UIKeyboardHIDUsage::KeyboardReturnOrEnter, "\r", "\r", none).expect("a key");
+        assert_eq!((enter.key.as_str(), enter.key_char), ("enter", None));
+
+        let find = keystroke(
+            UIKeyboardHIDUsage::KeyboardK,
+            "k",
+            "k",
+            UIKeyModifierFlags::Command,
+        )
+        .expect("a key");
+        assert_eq!(find.key, "k");
+        assert!(find.modifiers.platform);
+        assert_eq!(find.key_char, None, "a shortcut types nothing");
+
+        let shifted = keystroke(
+            UIKeyboardHIDUsage::KeyboardA,
+            "A",
+            "A",
+            UIKeyModifierFlags::Shift,
+        )
+        .expect("a key");
+        assert_eq!(shifted.key, "a");
+        assert!(shifted.modifiers.shift);
+        assert_eq!(shifted.key_char.as_deref(), Some("A"));
+
+        let question = keystroke(
+            UIKeyboardHIDUsage::KeyboardSlash,
+            "?",
+            "/",
+            UIKeyModifierFlags::Shift,
+        )
+        .expect("a key");
+        assert_eq!(question.key, "?", "a shifted symbol is the symbol");
+        assert!(!question.modifiers.shift);
+
+        let f5 = keystroke(UIKeyboardHIDUsage::KeyboardF5, "", "", none).expect("a key");
+        assert_eq!(f5.key, "f5");
+
+        assert!(
+            keystroke(
+                UIKeyboardHIDUsage::KeyboardLeftShift,
+                "",
+                "",
+                UIKeyModifierFlags::Shift
+            )
+            .is_none(),
+            "a modifier alone is no keystroke"
+        );
+    }
 }

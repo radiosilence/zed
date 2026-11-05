@@ -1823,6 +1823,29 @@ impl HoverListenerMode {
     }
 }
 
+fn start_drag(
+    listener: DragListener,
+    cursor_offset: Point<Pixels>,
+    cursor_style: Option<crate::CursorStyle>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let view = (listener.render)(listener.value.as_ref(), cursor_offset, window, cx);
+    let external_payload_source = listener.external_payload.map(|external_payload| {
+        let value = listener.value.clone();
+        Box::new(move |window: &mut Window, cx: &mut App| {
+            external_payload(value.as_ref(), window, cx)
+        }) as ExternalDragPayloadSource
+    });
+    cx.active_drag = Some(AnyDrag {
+        view,
+        value: listener.value,
+        cursor_offset,
+        cursor_style,
+        external_payload_source,
+    });
+}
+
 pub(crate) struct DragListener {
     value: Arc<dyn Any>,
     render: Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>,
@@ -2626,7 +2649,9 @@ impl Interactivity {
                                         // sibling groups every container would then sort ahead of
                                         // every item, and `focus_next` from a container would jump
                                         // to the first item in the whole window instead of its own.
-                                        if let Some(focus_handle) = &self.tracked_focus_handle {
+                                        if let Some(focus_handle) = &self.tracked_focus_handle
+                                            && !window.is_inert()
+                                        {
                                             window.next_frame.tab_stops.insert(focus_handle);
                                         }
                                         if let Some(hitbox) = hitbox {
@@ -2971,7 +2996,9 @@ impl Interactivity {
 
         let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
 
-        let mut drag_listener = mem::take(&mut self.drag_listener);
+        let drag_listener = mem::take(&mut self.drag_listener);
+        let has_drag_listener = drag_listener.is_some();
+        let drag_listener = Rc::new(RefCell::new(drag_listener));
         let drop_listeners = mem::take(&mut self.drop_listeners);
         let click_listeners = mem::take(&mut self.click_listeners);
         let aux_click_listeners = mem::take(&mut self.aux_click_listeners);
@@ -3011,10 +3038,7 @@ impl Interactivity {
         }
 
         if let Some(element_state) = element_state {
-            if !click_listeners.is_empty()
-                || !aux_click_listeners.is_empty()
-                || drag_listener.is_some()
-            {
+            if !click_listeners.is_empty() || !aux_click_listeners.is_empty() || has_drag_listener {
                 let pending_mouse_down = element_state
                     .pending_mouse_down
                     .get_or_insert_with(Default::default)
@@ -3048,6 +3072,7 @@ impl Interactivity {
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
+                    let drag_listener = drag_listener.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
                             return;
@@ -3057,38 +3082,69 @@ impl Interactivity {
                         if let Some(mouse_down) = pending_mouse_down.clone()
                             && !cx.has_active_drag()
                             && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD
-                            && let Some(listener) = drag_listener.take()
                             && mouse_down.button == MouseButton::Left
+                            && let Some(listener) = drag_listener.borrow_mut().take()
                         {
                             *clicked_state.borrow_mut() = ElementClickedState::default();
                             let cursor_offset = event.position - hitbox.origin;
-                            let drag = (listener.render)(
-                                listener.value.as_ref(),
-                                cursor_offset,
-                                window,
-                                cx,
-                            );
-                            let external_payload_source =
-                                listener.external_payload.map(|external_payload| {
-                                    let value = listener.value.clone();
-                                    Box::new(move |window: &mut Window, cx: &mut App| {
-                                        external_payload(value.as_ref(), window, cx)
-                                    })
-                                        as ExternalDragPayloadSource
-                                });
-                            cx.active_drag = Some(AnyDrag {
-                                view: drag,
-                                value: listener.value,
-                                cursor_offset,
-                                cursor_style: drag_cursor_style,
-                                external_payload_source,
-                            });
+                            start_drag(listener, cursor_offset, drag_cursor_style, window, cx);
                             pending_mouse_down.take();
                             window.refresh();
                             cx.stop_propagation();
                         }
                     }
                 });
+
+                if has_drag_listener {
+                    let pending_lift = element_state
+                        .pending_lift
+                        .get_or_insert_with(Default::default)
+                        .clone();
+                    window.on_mouse_event({
+                        let hitbox = hitbox.clone();
+                        move |event: &LongPressEvent, phase, window, cx| match (phase, event.phase)
+                        {
+                            // Seen on the way down, before a listener above (a tooltip)
+                            // can claim the press and stop it: the drag can still lift.
+                            (DispatchPhase::Capture, TouchPhase::Started) => {
+                                let over = hitbox.is_hovered(window) && !cx.has_active_drag();
+                                pending_lift.set(over.then_some(event.position));
+                            }
+                            (DispatchPhase::Capture, TouchPhase::Ended | TouchPhase::Cancelled) => {
+                                pending_lift.set(None);
+                            }
+                            // Claimed if nothing above claimed it, so the held touch moves
+                            // as a long press rather than becoming a scroll.
+                            (DispatchPhase::Bubble, TouchPhase::Started) => {
+                                if pending_lift.get().is_some() && !window.default_prevented() {
+                                    window.prevent_default();
+                                }
+                            }
+                            (DispatchPhase::Bubble, TouchPhase::Moved) => {
+                                if let Some(held) = pending_lift.get()
+                                    && !cx.has_active_drag()
+                                    && (event.position - held).magnitude()
+                                        > f64::from(window.touch_slop())
+                                    && let Some(listener) = drag_listener.borrow_mut().take()
+                                {
+                                    pending_lift.set(None);
+                                    let cursor_offset = event.start_position - hitbox.origin;
+                                    start_drag(
+                                        listener,
+                                        cursor_offset,
+                                        drag_cursor_style,
+                                        window,
+                                        cx,
+                                    );
+                                    window.touch_lifted_drag = true;
+                                    window.refresh();
+                                    cx.stop_propagation();
+                                }
+                            }
+                            _ => {}
+                        }
+                    });
+                }
 
                 if is_focused {
                     // Record the focus generation at which an enter/space key
@@ -3695,6 +3751,9 @@ pub struct InteractiveElementState {
     pub(crate) hover_state: Option<Rc<RefCell<ElementHoverState>>>,
     pub(crate) hover_listener_state: Option<Rc<RefCell<bool>>>,
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
+    /// Where a long press that may lift this element's drag started, while
+    /// it is held and has not moved far enough to lift it.
+    pending_lift: Option<Rc<Cell<Option<Point<Pixels>>>>>,
     /// Set to the window's [`focus_generation`](crate::Window::focus_generation)
     /// when an Enter/Space keydown is received while this element is focused,
     /// recording that we are waiting for the matching keyup to fire a keyboard

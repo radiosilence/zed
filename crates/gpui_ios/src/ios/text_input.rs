@@ -9,7 +9,7 @@ use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_clas
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
     NSArray, NSAttributedStringKey, NSComparisonResult, NSCopying, NSDictionary,
-    NSObjectNSDelayedPerforming, NSObjectProtocol, NSRange, NSString,
+    NSObjectNSDelayedPerforming, NSObjectProtocol, NSRange, NSSet, NSString,
 };
 use objc2_ui_kit::*;
 use std::{
@@ -155,6 +155,24 @@ define_class!(
             resigned
         }
 
+        // A hardware keyboard's modifiers, noted for what UIKit turns into
+        // text (Return), then the presses go on as UIKit would send them.
+        #[unsafe(method(pressesBegan:withEvent:))]
+        fn presses_began(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            self.ivars().window.with_window(|window| window.note_press_modifiers(presses));
+            unsafe {
+                let _: () = msg_send![super(self), pressesBegan: presses, withEvent: event];
+            }
+        }
+
+        #[unsafe(method(pressesEnded:withEvent:))]
+        fn presses_ended(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            self.ivars().window.with_window(|window| window.note_press_modifiers(presses));
+            unsafe {
+                let _: () = msg_send![super(self), pressesEnded: presses, withEvent: event];
+            }
+        }
+
         #[unsafe(method(reconcileTextInput))]
         fn reconcile_text_input(&self) {
             self.ivars().update_pending.set(false);
@@ -170,7 +188,9 @@ define_class!(
                 if !self.isFirstResponder() { self.becomeFirstResponder(); }
             } else if self.isFirstResponder() {
                 let previous = self.ivars().reconciling_responder.replace(true);
-                self.resignFirstResponder();
+                if self.resignFirstResponder() {
+                    super::window::reclaim_hardware_keys(self);
+                }
                 self.ivars().reconciling_responder.set(previous);
             }
             if self.ivars().configuration_changed.replace(false) && self.isFirstResponder() {
@@ -200,7 +220,14 @@ define_class!(
         }
         #[unsafe(method(insertText:))]
         fn insert_text(&self, text: &NSString) {
-            self.edit(|handler| handler.replace_text_in_range(None, &text.to_string()));
+            let text = text.to_string();
+            // The software keyboard's Return arrives as a newline. It is the
+            // enter key to GPUI's bindings first, as a hardware Return is,
+            // and typed only where nothing handles it.
+            if text == "\n" && self.return_key_handled() {
+                return;
+            }
+            self.edit(|handler| handler.replace_text_in_range(None, &text));
         }
         #[unsafe(method(deleteBackward))]
         fn delete_backward(&self) {
@@ -533,6 +560,13 @@ impl TextInputView {
             .window
             .with_window(|window| window.with_input_handler(callback))
             .flatten()
+    }
+
+    fn return_key_handled(&self) -> bool {
+        self.ivars()
+            .window
+            .with_window(|window| window.dispatch_enter())
+            .unwrap_or(false)
     }
 
     fn edit(&self, callback: impl FnOnce(&mut PlatformInputHandler)) {

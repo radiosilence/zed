@@ -29,7 +29,19 @@ mod window {
         ) -> Option<R> {
             None
         }
+
+        pub(crate) fn dispatch_enter(&self) -> bool {
+            false
+        }
+
+        pub(crate) fn note_press_modifiers(
+            &self,
+            _presses: &objc2_foundation::NSSet<objc2_ui_kit::UIPress>,
+        ) {
+        }
     }
+
+    pub(crate) fn reclaim_hardware_keys(_from: &objc2_ui_kit::UIResponder) {}
 
     #[derive(Default)]
     pub(crate) struct WindowReference(pub(crate) RefCell<Weak<IosWindowState>>);

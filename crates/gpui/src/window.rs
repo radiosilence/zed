@@ -1053,6 +1053,9 @@ pub(crate) struct DeferredDraw {
     /// nodes back in the tree. Shared, since the draw is copied into every
     /// frame that reuses it.
     a11y: Option<Rc<CapturedA11y>>,
+    /// Whether it was deferred from inside `Window::with_inert`, so that it
+    /// is drawn inert too.
+    inert: bool,
 }
 
 pub(crate) struct Frame {
@@ -1310,7 +1313,13 @@ pub struct Window {
     touch_prediction_enabled: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
+    /// The active drag was lifted by the current long press, which carries
+    /// it until the touch ends.
+    pub(crate) touch_lifted_drag: bool,
     pub(crate) refreshing: bool,
+    /// How many `with_inert` calls are drawing: while any is, hitboxes and
+    /// tab stops are left out of the frame.
+    inert: usize,
     pub(crate) activation_observers: SingleSubscriberSet<AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2465,7 +2474,9 @@ impl Window {
             touch_prediction_enabled: true,
             long_press_timer: None,
             long_press_capture: None,
+            touch_lifted_drag: false,
             refreshing: false,
+            inert: 0,
             activation_observers: SingleSubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -4222,6 +4233,7 @@ impl Window {
                     absolute_offset,
                     prepaint_range,
                     a11y,
+                    inert,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
@@ -4236,6 +4248,7 @@ impl Window {
                         deferred_draw.absolute_offset,
                         deferred_draw.prepaint_range.clone(),
                         deferred_draw.a11y.take(),
+                        deferred_draw.inert,
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
@@ -4250,7 +4263,9 @@ impl Window {
                         self.with_rendered_view(current_view, |window| {
                             window.with_rem_size(Some(rem_size), |window| {
                                 window.with_absolute_element_offset(absolute_offset, |window| {
-                                    element.prepaint(window, cx);
+                                    window.with_inert_if(inert, |window| {
+                                        element.prepaint(window, cx);
+                                    });
                                 });
                             });
                         });
@@ -4307,12 +4322,15 @@ impl Window {
 
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
+            let inert = deferred_draw.inert;
             if let Some(element) = deferred_draw.element.as_mut() {
                 let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
                     self.with_rendered_view(deferred_draw.current_view, |window| {
                         window.with_content_mask(content_mask, |window| {
                             window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                                element.paint(window, cx);
+                                window.with_inert_if(inert, |window| {
+                                    element.paint(window, cx);
+                                });
                             });
                         })
                     })
@@ -4400,6 +4418,7 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                     accessed_entities: deferred_draw.accessed_entities.clone(),
                     a11y: deferred_draw.a11y.clone(),
+                    inert: deferred_draw.inert,
                 }),
         );
     }
@@ -4884,7 +4903,34 @@ impl Window {
             paint_range: PaintIndex::default()..PaintIndex::default(),
             accessed_entities: FxHashSet::default(),
             a11y: None,
+            inert: self.inert > 0,
         });
+    }
+
+    /// Draws what `f` draws inert: seen but not used. It inserts no hitboxes
+    /// and no tab stops, so the pointer passes through it to whatever is
+    /// beneath and the keyboard never tabs into it, and registers no focus,
+    /// key or action listeners and no input handlers, so an element in it
+    /// that holds focus takes no keys or text; what it defers is drawn inert
+    /// too. For something on its way out, such as a dialog fading
+    /// after it was dismissed.
+    ///
+    /// This method should be called around both the prepaint and the paint
+    /// of the elements it covers, as `Inert` does.
+    pub fn with_inert<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.inert += 1;
+        let result = f(self);
+        self.inert -= 1;
+        result
+    }
+
+    /// Whether elements are being drawn inert, inside `with_inert`.
+    pub fn is_inert(&self) -> bool {
+        self.inert > 0
+    }
+
+    fn with_inert_if<R>(&mut self, inert: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        if inert { self.with_inert(f) } else { f(self) }
     }
 
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch
@@ -5806,7 +5852,11 @@ impl Window {
             content_mask,
             behavior,
         };
-        self.next_frame.hitboxes.push(hitbox.clone());
+        // Inert, the hitbox is never hit: the element under it is not hovered,
+        // clicked or scrolled, and blocks nothing beneath it.
+        if self.inert == 0 {
+            self.next_frame.hitboxes.push(hitbox.clone());
+        }
         hitbox
     }
 
@@ -5833,6 +5883,11 @@ impl Window {
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn set_focus_handle(&mut self, focus_handle: &FocusHandle, _: &App) {
         self.invalidator.debug_assert_prepaint();
+        // Inert, a focused element takes no keys: its actions and listeners
+        // are not reached through it.
+        if self.inert > 0 {
+            return;
+        }
         if focus_handle.is_focused(self) {
             self.next_frame.focus = Some(focus_handle.id);
         }
@@ -5898,7 +5953,7 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        if focus_handle.is_focused(self) {
+        if focus_handle.is_focused(self) && self.inert == 0 {
             let cx = self.to_async(cx);
             self.next_frame.input_handlers.push(Some(
                 PlatformInputHandler::new(cx, Box::new(input_handler)).with_focus(focus_handle.id),
@@ -5981,6 +6036,9 @@ impl Window {
         listener: impl Fn(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
+        if self.inert > 0 {
+            return;
+        }
 
         self.next_frame.dispatch_tree.on_key_event(Rc::new(
             move |event: &dyn Any, phase, window: &mut Window, cx: &mut App| {
@@ -6002,6 +6060,9 @@ impl Window {
         listener: impl Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
+        if self.inert > 0 {
+            return;
+        }
 
         self.next_frame.dispatch_tree.on_modifiers_changed(Rc::new(
             move |event: &ModifiersChangedEvent, window: &mut Window, cx: &mut App| {
@@ -6374,6 +6435,50 @@ impl Window {
         }
     }
 
+    /// How far a held touch moves before it is more than a finger's wobble,
+    /// as the platform tunes it.
+    pub(crate) fn touch_slop(&self) -> Pixels {
+        self.touch_gestures.touch_slop()
+    }
+
+    /// A drag lifted by a long press follows the touch as it would the
+    /// pointer, and the touch's release drops it.
+    fn carry_touch_drag(&mut self, long_press: &crate::LongPressEvent, cx: &mut App) {
+        let position = long_press.position;
+        match long_press.phase {
+            crate::TouchPhase::Started => {}
+            crate::TouchPhase::Moved => {
+                self.mouse_position = position;
+                cx.propagate_event = true;
+                self.dispatch_mouse_event(
+                    &MouseMoveEvent {
+                        position,
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Modifiers::default(),
+                    },
+                    cx,
+                );
+            }
+            crate::TouchPhase::Ended => {
+                self.mouse_position = position;
+                cx.propagate_event = true;
+                self.dispatch_mouse_event(
+                    &MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                    },
+                    cx,
+                );
+            }
+            crate::TouchPhase::Cancelled => {
+                cx.active_drag = None;
+                self.refresh();
+            }
+        }
+    }
+
     fn dispatch_recognized_touch_gesture(&mut self, gesture: RecognizedTouchGesture, cx: &mut App) {
         match gesture {
             RecognizedTouchGesture::Scroll(scroll_wheel) => {
@@ -6412,7 +6517,16 @@ impl Window {
                     long_press.phase,
                     crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
                 );
+                if started {
+                    self.touch_lifted_drag = false;
+                }
                 self.dispatch_mouse_event(&long_press, cx);
+                if self.touch_lifted_drag && cx.active_drag.is_some() {
+                    self.carry_touch_drag(&long_press, cx);
+                }
+                if ended {
+                    self.touch_lifted_drag = false;
+                }
                 if started {
                     let claimed = self.default_prevented;
                     self.touch_gestures.resolve_long_press(claimed);
@@ -7434,6 +7548,9 @@ impl Window {
         listener: impl Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
+        if self.inert > 0 {
+            return;
+        }
 
         self.next_frame
             .dispatch_tree
@@ -10181,6 +10298,75 @@ mod tests {
                     .child(div().w(px(50.)).h_full().on_back_gesture(claim("inner"))),
             )
         }
+    }
+
+    struct LiftAndDrop {
+        dropped: Rc<RefCell<Vec<u32>>>,
+    }
+
+    impl Render for LiftAndDrop {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let dropped = self.dropped.clone();
+            div()
+                .flex()
+                .child(
+                    div()
+                        .id("source")
+                        .w(px(50.))
+                        .h(px(20.))
+                        .on_drag(7u32, |_, _, _, cx| cx.new(|_| Empty))
+                        // A tooltip claims a long press and stops it; the drag still lifts.
+                        .tooltip(|_, cx| cx.new(|_| Empty).into()),
+                )
+                .child(div().w(px(50.)).h(px(20.)))
+                .child(
+                    div()
+                        .id("target")
+                        .w(px(50.))
+                        .h(px(20.))
+                        .on_drop(move |value: &u32, _, _| dropped.borrow_mut().push(*value)),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn a_held_touch_that_moves_lifts_the_drag_and_its_release_drops_it(cx: &mut TestAppContext) {
+        let dropped = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let dropped = dropped.clone();
+            move |_, _| LiftAndDrop { dropped }
+        });
+        cx.run_until_parked();
+
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+        cx.executor().advance_clock(Duration::from_millis(501));
+        cx.executor().run_until_parked();
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 30.);
+        window
+            .update(cx, |_, _, cx| {
+                assert!(cx.has_active_drag(), "moving lifts the drag")
+            })
+            .unwrap();
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 120.);
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 120.);
+        cx.run_until_parked();
+        assert_eq!(*dropped.borrow(), [7]);
+        window
+            .update(cx, |_, _, cx| assert!(!cx.has_active_drag()))
+            .unwrap();
+
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Started, 10.);
+        cx.executor().advance_clock(Duration::from_millis(501));
+        cx.executor().run_until_parked();
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Moved, 12.);
+        window
+            .update(cx, |_, _, cx| {
+                assert!(!cx.has_active_drag(), "a held touch's wobble lifts nothing")
+            })
+            .unwrap();
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Ended, 12.);
+        cx.run_until_parked();
+        assert_eq!(*dropped.borrow(), [7]);
     }
 
     struct TouchDragListener {

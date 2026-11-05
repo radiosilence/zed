@@ -940,6 +940,11 @@ impl TouchGestureRecognizer {
         recognized
     }
 
+    /// How far a touch may travel and still be a tap or a long press.
+    pub(crate) fn touch_slop(&self) -> Pixels {
+        self.tuning.touch_slop
+    }
+
     pub(crate) fn pending_long_press(&self) -> Option<(TouchId, Duration)> {
         let TouchGestureState::Pending {
             touch,

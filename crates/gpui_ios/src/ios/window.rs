@@ -14,11 +14,12 @@ use super::text_input::TextInputView;
 use super::{CallbackSlot, IosDisplay, platform::IosPlatformState};
 use gpui::{
     AnyWindowHandle, BackGestureEvent, BackGesturePhase, Bounds, Capslock, Corners, DevicePixels,
-    DispatchEventResult, DisplayId, Edges, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, Scene, Size, TextInputConfiguration, TextInputStateChange,
-    TouchEvent, TouchId, TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowInsets, WindowParams, WindowVisibility, px, size,
+    DispatchEventResult, DisplayId, Edges, GpuSpecs, KeyDownEvent, KeyUpEvent, Keystroke,
+    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, Size,
+    TextInputConfiguration, TextInputStateChange, TouchEvent, TouchId, TouchPhase,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets,
+    WindowParams, WindowVisibility, px, size,
 };
 use gpui_apple::{
     main_thread_marker,
@@ -36,7 +37,8 @@ use objc2_foundation::{
 use objc2_quartz_core::CAMetalLayer;
 use objc2_ui_kit::{
     NSValueUIGeometryExtensions, UIKeyboardFrameEndUserInfoKey,
-    UIKeyboardWillChangeFrameNotification, UIKeyboardWillHideNotification, UIStatusBarStyle,
+    UIKeyboardWillChangeFrameNotification, UIKeyboardWillHideNotification, UIPress, UIPressesEvent,
+    UIResponder, UIStatusBarStyle,
 };
 use objc2_ui_kit::{
     UICornerConfiguration, UICornerRadius, UIEvent, UIGestureRecognizer,
@@ -105,8 +107,152 @@ define_class!(
             }
             self.ivars().with_window(IosWindowState::handle_layout_change);
         }
+
+        // The controller takes a hardware keyboard's presses when no text
+        // field holds the keyboard, and those a focused field passes on.
+        #[unsafe(method(canBecomeFirstResponder))]
+        fn can_become_first_responder(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(viewDidAppear:))]
+        fn view_did_appear(&self, animated: bool) {
+            unsafe {
+                let _: () = msg_send![super(self), viewDidAppear: animated];
+            }
+            let editing = self
+                .ivars()
+                .with_window(IosWindowState::text_input_is_first_responder)
+                .unwrap_or(false);
+            if !editing {
+                self.becomeFirstResponder();
+            }
+        }
+
+        #[unsafe(method(pressesBegan:withEvent:))]
+        fn presses_began(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            let main_thread = self.mtm();
+            let mut unhandled = Vec::new();
+            for press in presses {
+                let keystroke = press.key(main_thread).and_then(|key| {
+                    keystroke(
+                        key.keyCode(),
+                        &key.characters().to_string(),
+                        &key.charactersIgnoringModifiers().to_string(),
+                        key.modifierFlags(),
+                    )
+                });
+                let handled = keystroke.is_some_and(|keystroke| {
+                    let handled = self
+                        .ivars()
+                        .with_window(|window| window.key_down(keystroke.clone()))
+                        .unwrap_or(false);
+                    if handled {
+                        HELD.with_borrow_mut(|held| held.push((press.clone(), keystroke)));
+                    }
+                    handled
+                });
+                if !handled {
+                    unhandled.push(press.clone());
+                }
+            }
+            if !unhandled.is_empty() {
+                let unhandled = NSSet::from_retained_slice(&unhandled);
+                unsafe {
+                    let _: () = msg_send![super(self), pressesBegan: &*unhandled, withEvent: event];
+                }
+            }
+        }
+
+        #[unsafe(method(pressesChanged:withEvent:))]
+        fn presses_changed(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            let unhandled = not_held(presses, false, |_| {});
+            if !unhandled.is_empty() {
+                let unhandled = NSSet::from_retained_slice(&unhandled);
+                unsafe {
+                    let _: () =
+                        msg_send![super(self), pressesChanged: &*unhandled, withEvent: event];
+                }
+            }
+        }
+
+        #[unsafe(method(pressesEnded:withEvent:))]
+        fn presses_ended(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            let unhandled = not_held(presses, true, |keystroke| {
+                self.ivars().with_window(|window| window.key_up(keystroke));
+            });
+            if !unhandled.is_empty() {
+                let unhandled = NSSet::from_retained_slice(&unhandled);
+                unsafe {
+                    let _: () = msg_send![super(self), pressesEnded: &*unhandled, withEvent: event];
+                }
+            }
+        }
+
+        #[unsafe(method(pressesCancelled:withEvent:))]
+        fn presses_cancelled(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            let unhandled = not_held(presses, true, |keystroke| {
+                self.ivars().with_window(|window| window.key_up(keystroke));
+            });
+            if !unhandled.is_empty() {
+                let unhandled = NSSet::from_retained_slice(&unhandled);
+                unsafe {
+                    let _: () =
+                        msg_send![super(self), pressesCancelled: &*unhandled, withEvent: event];
+                }
+            }
+        }
     }
 );
+
+thread_local! {
+    /// Presses GPUI handled, with the keystroke each was, until released:
+    /// UIKit is told of a press's later phases only when it was told of its
+    /// beginning.
+    static HELD: std::cell::RefCell<Vec<(Retained<UIPress>, Keystroke)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The presses GPUI did not handle when they began. Those it did are released
+/// through `release` when `ending`, and forgotten.
+fn not_held(
+    presses: &NSSet<UIPress>,
+    ending: bool,
+    mut release: impl FnMut(Keystroke),
+) -> Vec<Retained<UIPress>> {
+    let mut unhandled = Vec::new();
+    for press in presses {
+        let held = HELD.with_borrow_mut(|held| {
+            let index = held
+                .iter()
+                .position(|(held, _)| Retained::as_ptr(held) == &*press as *const UIPress)?;
+            Some(if ending {
+                Some(held.remove(index).1)
+            } else {
+                None
+            })
+        });
+        match held {
+            Some(Some(keystroke)) => release(keystroke),
+            Some(None) => {}
+            None => unhandled.push(press.clone()),
+        }
+    }
+    unhandled
+}
+
+/// Hands the hardware keyboard back to the window's view controller once a
+/// text field GPUI no longer focuses has given it up.
+pub(super) fn reclaim_hardware_keys(from: &UIResponder) {
+    let mut responder = from.nextResponder();
+    while let Some(next) = responder {
+        if next.isKindOfClass(ViewController::class()) {
+            next.becomeFirstResponder();
+            return;
+        }
+        responder = next.nextResponder();
+    }
+}
 
 impl ViewController {
     fn new(main_thread: MainThreadMarker) -> Retained<Self> {
@@ -546,6 +692,56 @@ impl IosWindowState {
         self.handle_keyboard_dismiss_touch(&event);
         self.input_callback
             .with(|callback| callback(PlatformInput::Touch(event)));
+    }
+
+    /// Delivers a key press as GPUI's bindings see a key, and returns
+    /// whether a listener handled it.
+    pub(crate) fn key_down(&self, keystroke: Keystroke) -> bool {
+        self.modifiers.set(keystroke.modifiers);
+        let down = KeyDownEvent {
+            keystroke,
+            is_held: false,
+            prefer_character_input: false,
+        };
+        self.input_callback
+            .with(|callback| callback(PlatformInput::KeyDown(down)))
+            .is_some_and(|result| !result.propagate || result.default_prevented)
+    }
+
+    /// Delivers a key's release.
+    pub(crate) fn key_up(&self, keystroke: Keystroke) {
+        self.input_callback
+            .with(|callback| callback(PlatformInput::KeyUp(KeyUpEvent { keystroke })));
+    }
+
+    /// Delivers Return, with the modifiers a hardware keyboard last held, as
+    /// a press and release of enter, and returns whether it was handled.
+    pub(crate) fn dispatch_enter(&self) -> bool {
+        let enter = Keystroke {
+            modifiers: self.modifiers.get(),
+            key: "enter".into(),
+            key_char: None,
+        };
+        let handled = self.key_down(enter.clone());
+        self.key_up(enter);
+        handled
+    }
+
+    /// Notes the modifiers a hardware keyboard holds, from presses a text
+    /// field receives, for what UIKit delivers as text (Return).
+    pub(crate) fn note_press_modifiers(&self, presses: &NSSet<UIPress>) {
+        let Some(main_thread) = MainThreadMarker::new() else {
+            return;
+        };
+        for press in presses {
+            if let Some(key) = press.key(main_thread) {
+                self.modifiers.set(modifiers(key.modifierFlags()));
+            }
+        }
+    }
+
+    pub(crate) fn text_input_is_first_responder(&self) -> bool {
+        self.text_input_view.isFirstResponder()
     }
 
     /// Delivers one step of a trackpad or mouse-wheel scroll gesture.

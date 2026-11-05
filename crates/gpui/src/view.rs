@@ -343,6 +343,9 @@ struct ViewElementCacheKey {
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
     opacity: f32,
+    /// Drawn inert, its frame holds no hitboxes or tab stops, so it is reused
+    /// only by another inert draw.
+    inert: bool,
 }
 
 #[cfg(not(gpui_hot_reload))]
@@ -555,6 +558,7 @@ fn prepaint_view(
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
                 let opacity = window.element_opacity();
+                let inert = window.is_inert();
 
                 // Opacity is compared by bits so that a NaN opacity still matches itself
                 // and the view keeps using its cache.
@@ -563,6 +567,7 @@ fn prepaint_view(
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
                     && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
+                    && element_state.cache_key.inert == inert
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                     && element_state.prepaint_frame + 1 == window.frames_drawn
@@ -615,6 +620,7 @@ fn prepaint_view(
                             content_mask,
                             text_style,
                             opacity,
+                            inert,
                         },
                     },
                 )

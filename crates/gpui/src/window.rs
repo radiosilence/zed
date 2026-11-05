@@ -4909,8 +4909,10 @@ impl Window {
 
     /// Draws what `f` draws inert: seen but not used. It inserts no hitboxes
     /// and no tab stops, so the pointer passes through it to whatever is
-    /// beneath and the keyboard never tabs into it; what it defers is drawn
-    /// inert too. For something on its way out, such as a dialog fading
+    /// beneath and the keyboard never tabs into it, and registers no focus,
+    /// key or action listeners and no input handlers, so an element in it
+    /// that holds focus takes no keys or text; what it defers is drawn inert
+    /// too. For something on its way out, such as a dialog fading
     /// after it was dismissed.
     ///
     /// This method should be called around both the prepaint and the paint
@@ -5881,6 +5883,11 @@ impl Window {
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn set_focus_handle(&mut self, focus_handle: &FocusHandle, _: &App) {
         self.invalidator.debug_assert_prepaint();
+        // Inert, a focused element takes no keys: its actions and listeners
+        // are not reached through it.
+        if self.inert > 0 {
+            return;
+        }
         if focus_handle.is_focused(self) {
             self.next_frame.focus = Some(focus_handle.id);
         }
@@ -5946,7 +5953,7 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        if focus_handle.is_focused(self) {
+        if focus_handle.is_focused(self) && self.inert == 0 {
             let cx = self.to_async(cx);
             self.next_frame.input_handlers.push(Some(
                 PlatformInputHandler::new(cx, Box::new(input_handler)).with_focus(focus_handle.id),
@@ -6029,6 +6036,9 @@ impl Window {
         listener: impl Fn(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
+        if self.inert > 0 {
+            return;
+        }
 
         self.next_frame.dispatch_tree.on_key_event(Rc::new(
             move |event: &dyn Any, phase, window: &mut Window, cx: &mut App| {
@@ -6050,6 +6060,9 @@ impl Window {
         listener: impl Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
+        if self.inert > 0 {
+            return;
+        }
 
         self.next_frame.dispatch_tree.on_modifiers_changed(Rc::new(
             move |event: &ModifiersChangedEvent, window: &mut Window, cx: &mut App| {
@@ -7535,6 +7548,9 @@ impl Window {
         listener: impl Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
         self.invalidator.debug_assert_paint();
+        if self.inert > 0 {
+            return;
+        }
 
         self.next_frame
             .dispatch_tree

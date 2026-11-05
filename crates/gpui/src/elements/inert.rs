@@ -99,11 +99,13 @@ mod tests {
     impl Render for Covered {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let (under_clicks, over_clicks) = (self.clicks.clone(), self.clicks.clone());
+            let over_keys = self.clicks.clone();
             let overlay = div().id("overlay").absolute().inset_0().occlude().child(
                 div()
                     .id("over")
                     .size(px(50.))
                     .track_focus(&self.over)
+                    .on_key_down(move |_, _, _| over_keys.borrow_mut().push("key"))
                     .on_click(move |_, _, _| over_clicks.borrow_mut().push("over")),
             );
             let overlay = if self.inert {
@@ -182,6 +184,21 @@ mod tests {
         let (mut cx, _, under, over) = covered(true);
         assert!(!tabbed_to(&mut cx, &over), "tab entered the inert overlay");
         assert!(tabbed_to(&mut cx, &under), "tab skipped what is beneath");
+    }
+
+    /// Focus left in an overlay when it went inert takes no keys.
+    fn typed_into_over(inert: bool) -> Vec<&'static str> {
+        let (mut cx, clicks, _, over) = covered(inert);
+        cx.update(|window, cx| window.focus(&over, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a");
+        clicks.borrow().clone()
+    }
+
+    #[test]
+    fn a_focused_element_in_an_inert_overlay_takes_no_keys() {
+        assert_eq!(typed_into_over(true), Vec::<&str>::new());
+        assert_eq!(typed_into_over(false), vec!["key"]);
     }
 
     #[test]

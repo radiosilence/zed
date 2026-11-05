@@ -1341,6 +1341,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn presents_shaders(&self) -> bool {
         false
     }
+    /// Whether the platform draws the focused text input's caret, selection
+    /// and selection handles itself, from the input handler's geometry, as
+    /// iOS's text interaction does: the element then draws only its text.
+    fn draws_text_selection(&self) -> bool {
+        false
+    }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 

@@ -36,9 +36,9 @@ use objc2_foundation::{
 };
 use objc2_quartz_core::CAMetalLayer;
 use objc2_ui_kit::{
-    NSValueUIGeometryExtensions, UIKeyboardFrameEndUserInfoKey,
+    NSValueUIGeometryExtensions, UIColor, UIKeyboardFrameEndUserInfoKey,
     UIKeyboardWillChangeFrameNotification, UIKeyboardWillHideNotification, UIPress, UIPressesEvent,
-    UIResponder, UIStatusBarStyle,
+    UIResponder, UIStatusBarStyle, UITextInteraction, UITextInteractionMode,
 };
 use objc2_ui_kit::{
     UICornerConfiguration, UICornerRadius, UIEvent, UIGestureRecognizer,
@@ -558,8 +558,15 @@ impl IosWindow {
         // so iOS actually routes keyboard text to us.
         let text_input_frame = CGRect::new(CGPoint::ZERO, CGSize::new(1.0, 1.0));
         let text_input_view = TextInputView::new(text_input_frame, main_thread);
-        text_input_view.setAlpha(0.01);
+        // Clear rather than hidden: it lies over the focused field, where
+        // UIKit's text interaction draws the caret, the selection, its
+        // handles and the loupe, and takes the touches on the field.
+        text_input_view.setBackgroundColor(Some(&UIColor::clearColor()));
         text_input_view.setUserInteractionEnabled(true);
+        let interaction =
+            UITextInteraction::textInteractionForMode(UITextInteractionMode::Editable, main_thread);
+        unsafe { interaction.setTextInput(Some(&text_input_view)) };
+        text_input_view.addInteraction(ProtocolObject::from_ref(&*interaction));
         view.addSubview(&text_input_view);
 
         let state = IosWindowState {
@@ -1202,6 +1209,13 @@ impl PlatformWindow for IosWindow {
 
     fn draw(&self, scene: &Scene) {
         self.renderer.lock().draw(scene);
+        // The focused field may have moved (a scroll, a layout change): the
+        // text view follows it once the window has finished drawing.
+        self.text_input_view.refresh_keyboard();
+    }
+
+    fn draws_text_selection(&self) -> bool {
+        true
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

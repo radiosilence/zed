@@ -4,7 +4,7 @@ use gpui::{
     TextInputStateChange, px,
 };
 use objc2::rc::{Retained, Weak};
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
@@ -142,6 +142,58 @@ define_class!(
                 && self.ivars().keyboard_eligible.get()
         }
 
+        // The edit menu's actions, against the field's selection and the
+        // general pasteboard.
+        #[unsafe(method(canPerformAction:withSender:))]
+        fn can_perform_action(&self, action: Sel, sender: Option<&AnyObject>) -> Bool {
+            let editable = self.ivars().keyboard_eligible.get();
+            let answer = if action == sel!(copy:) {
+                Some(self.selected_text().is_some())
+            } else if action == sel!(cut:) {
+                Some(editable && self.selected_text().is_some())
+            } else if action == sel!(paste:) {
+                Some(editable && unsafe { UIPasteboard::generalPasteboard().hasStrings() })
+            } else if action == sel!(selectAll:) {
+                Some(self.document_range().is_some_and(|range| !range.is_empty()))
+            } else {
+                None
+            };
+            match answer {
+                Some(answer) => Bool::new(answer),
+                None => unsafe { msg_send![super(self), canPerformAction: action, withSender: sender] },
+            }
+        }
+
+        #[unsafe(method(copy:))]
+        fn copy_action(&self, _sender: Option<&AnyObject>) {
+            self.copy_selection();
+        }
+
+        #[unsafe(method(cut:))]
+        fn cut_action(&self, _sender: Option<&AnyObject>) {
+            if self.copy_selection() {
+                self.edit(|handler| handler.replace_text_in_range(None, ""));
+            }
+        }
+
+        #[unsafe(method(paste:))]
+        fn paste_action(&self, _sender: Option<&AnyObject>) {
+            let Some(text) = (unsafe { UIPasteboard::generalPasteboard().string() }) else {
+                return;
+            };
+            let text = text.to_string();
+            self.edit(|handler| handler.replace_text_in_range(None, &text));
+        }
+
+        #[unsafe(method(selectAll:))]
+        fn select_all_action(&self, _sender: Option<&AnyObject>) {
+            self.with_handler(|handler| {
+                if let Some(document) = document_range(handler) {
+                    handler.set_selected_text_range(document);
+                }
+            });
+        }
+
         #[unsafe(method(resignFirstResponder))]
         fn resign_first_responder(&self) -> bool {
             let was_first_responder = self.isFirstResponder();
@@ -196,6 +248,7 @@ define_class!(
             if self.ivars().configuration_changed.replace(false) && self.isFirstResponder() {
                 self.reloadInputViews();
             }
+            self.place();
             let content_changed = self.ivars().content_changed.replace(false);
             let selection_changed = self.ivars().selection_changed.replace(false);
             if content_changed || selection_changed {
@@ -441,13 +494,13 @@ define_class!(
         }
         #[unsafe(method(firstRectForRange:))]
         fn first_rect(&self, range: &UITextRange) -> CGRect {
-            self.validated_range(range).and_then(|range| self.bounds(range)).unwrap_or(CGRect::ZERO)
+            self.validated_range(range).and_then(|range| self.bounds(range)).map(|r| self.local(r)).unwrap_or(CGRect::ZERO)
         }
         #[unsafe(method(caretRectForPosition:))]
         fn caret_rect(&self, position: &UITextPosition) -> CGRect {
             self.validated_offset(position)
                 .and_then(|offset| self.bounds(offset..offset))
-                .map(nonempty_caret_rect)
+                .map(|r| nonempty_caret_rect(self.local(r)))
                 .unwrap_or(CGRect::ZERO)
         }
         #[unsafe(method_id(selectionRectsForRange:))]
@@ -461,7 +514,7 @@ define_class!(
             let count = bounds.len();
             let rectangles = bounds.into_iter().enumerate().map(|(index, bounds)| {
                     let this = SelectionRect::alloc(self.mtm()).set_ivars(SelectionRectIvars {
-                        rect: native_rect(bounds),
+                        rect: self.local(native_rect(bounds)),
                         contains_start: index == 0,
                         contains_end: index + 1 == count,
                     });
@@ -473,6 +526,8 @@ define_class!(
         }
         #[unsafe(method_id(closestPositionToPoint:))]
         fn closest_position(&self, point: CGPoint) -> Option<Retained<UITextPosition>> {
+            let origin = self.frame().origin;
+            let point = CGPoint::new(point.x + origin.x, point.y + origin.y);
             self.with_handler(|handler| {
                 let offset = handler.character_index_for_point(gpui::point(px(point.x as f32), px(point.y as f32)))?;
                 allowed_range(handler, &(offset..offset)).then_some(offset)
@@ -496,9 +551,10 @@ define_class!(
         }
         #[unsafe(method_id(textInputView))]
         fn text_input_view(&self) -> Retained<UIView> {
-            // GPUI's bounds and hit testing use the rendering view's coordinate space,
-            // not the hidden responder's one-point frame.
-            self.superview().unwrap_or_else(|| self.retain().into_super())
+            // The view lies over the focused field (`place`), so UIKit's text
+            // interaction draws the caret, the selection and its handles in
+            // it, and takes the touches on the field.
+            self.retain().into_super()
         }
     }
 
@@ -586,6 +642,57 @@ impl TextInputView {
 
     fn document_range(&self) -> Option<Range<usize>> {
         self.with_handler(document_range).flatten()
+    }
+
+    /// A rect in the window's coordinates, as GPUI gives them, in this view's.
+    fn local(&self, rect: CGRect) -> CGRect {
+        let origin = self.frame().origin;
+        CGRect::new(
+            CGPoint::new(rect.origin.x - origin.x, rect.origin.y - origin.y),
+            rect.size,
+        )
+    }
+
+    /// Lies over the focused field while it holds the keyboard, and is a
+    /// point in the corner otherwise, so touches anywhere but the field
+    /// reach the window.
+    fn place(&self) {
+        let field = self
+            .ivars()
+            .keyboard_eligible
+            .get()
+            .then(|| {
+                self.with_handler(|handler| handler.element_bounds())
+                    .flatten()
+            })
+            .flatten();
+        let frame = field
+            .map(native_rect)
+            .unwrap_or_else(|| CGRect::new(CGPoint::ZERO, CGSize::new(1.0, 1.0)));
+        if self.frame() != frame {
+            self.setFrame(frame);
+        }
+    }
+
+    /// Puts the selection on the general pasteboard; whether there was one.
+    fn copy_selection(&self) -> bool {
+        let Some(text) = self.selected_text() else {
+            return false;
+        };
+        unsafe { UIPasteboard::generalPasteboard().setString(Some(&NSString::from_str(&text))) };
+        true
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.with_handler(|handler| {
+            let selection = handler.selected_text_range(false)?.range;
+            if selection.is_empty() || !allowed_range(handler, &selection) {
+                return None;
+            }
+            let mut adjusted = None;
+            handler.text_for_range(selection, &mut adjusted)
+        })
+        .flatten()
     }
 
     fn bounds(&self, range: Range<usize>) -> Option<CGRect> {

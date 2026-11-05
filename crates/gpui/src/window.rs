@@ -3286,6 +3286,12 @@ impl Window {
         self.platform_window.hide_soft_keyboard();
     }
 
+    /// Whether the platform draws the focused text input's caret and
+    /// selection itself (iOS), so a text element draws only its text there.
+    pub fn platform_draws_text_selection(&self) -> bool {
+        self.platform_window.draws_text_selection()
+    }
+
     /// Returns whether this window is focused by the operating system (receiving key events).
     pub fn is_window_active(&self) -> bool {
         self.active.get()

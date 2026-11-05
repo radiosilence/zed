@@ -170,7 +170,9 @@ define_class!(
                 if !self.isFirstResponder() { self.becomeFirstResponder(); }
             } else if self.isFirstResponder() {
                 let previous = self.ivars().reconciling_responder.replace(true);
-                self.resignFirstResponder();
+                if self.resignFirstResponder() {
+                    super::window::reclaim_hardware_keys(self);
+                }
                 self.ivars().reconciling_responder.set(previous);
             }
             if self.ivars().configuration_changed.replace(false) && self.isFirstResponder() {

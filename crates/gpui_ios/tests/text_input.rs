@@ -35,6 +35,8 @@ mod window {
         }
     }
 
+    pub(crate) fn reclaim_hardware_keys(_from: &objc2_ui_kit::UIResponder) {}
+
     #[derive(Default)]
     pub(crate) struct WindowReference(pub(crate) RefCell<Weak<IosWindowState>>);
 

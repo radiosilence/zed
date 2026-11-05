@@ -37,7 +37,8 @@ use objc2_foundation::{
 use objc2_quartz_core::CAMetalLayer;
 use objc2_ui_kit::{
     NSValueUIGeometryExtensions, UIKeyboardFrameEndUserInfoKey,
-    UIKeyboardWillChangeFrameNotification, UIKeyboardWillHideNotification, UIStatusBarStyle,
+    UIKeyboardWillChangeFrameNotification, UIKeyboardWillHideNotification, UIPress, UIPressesEvent,
+    UIResponder, UIStatusBarStyle,
 };
 use objc2_ui_kit::{
     UICornerConfiguration, UICornerRadius, UIEvent, UIGestureRecognizer,
@@ -106,8 +107,67 @@ define_class!(
             }
             self.ivars().with_window(IosWindowState::handle_layout_change);
         }
+
+        // The controller takes a hardware keyboard's presses when no text
+        // field holds the keyboard, and those a focused field passes on.
+        #[unsafe(method(canBecomeFirstResponder))]
+        fn can_become_first_responder(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(viewDidAppear:))]
+        fn view_did_appear(&self, animated: bool) {
+            unsafe {
+                let _: () = msg_send![super(self), viewDidAppear: animated];
+            }
+            self.becomeFirstResponder();
+        }
+
+        #[unsafe(method(pressesBegan:withEvent:))]
+        fn presses_began(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            let main_thread = self.mtm();
+            let mut unhandled = false;
+            for press in presses {
+                let Some(key) = press.key(main_thread) else {
+                    unhandled = true;
+                    continue;
+                };
+                let Some(keystroke) = keystroke(
+                    key.keyCode(),
+                    &key.characters().to_string(),
+                    &key.charactersIgnoringModifiers().to_string(),
+                    key.modifierFlags(),
+                ) else {
+                    unhandled = true;
+                    continue;
+                };
+                let handled = self
+                    .ivars()
+                    .with_window(|window| window.dispatch_key(keystroke))
+                    .unwrap_or(false);
+                unhandled |= !handled;
+            }
+            if unhandled {
+                unsafe {
+                    let _: () = msg_send![super(self), pressesBegan: presses, withEvent: event];
+                }
+            }
+        }
     }
 );
+
+/// Hands the hardware keyboard back to the window's view controller once a
+/// text field GPUI no longer focuses has given it up.
+pub(super) fn reclaim_hardware_keys(from: &UIResponder) {
+    let mut responder = from.nextResponder();
+    while let Some(next) = responder {
+        if next.isKindOfClass(ViewController::class()) {
+            next.becomeFirstResponder();
+            return;
+        }
+        responder = next.nextResponder();
+    }
+}
 
 impl ViewController {
     fn new(main_thread: MainThreadMarker) -> Retained<Self> {

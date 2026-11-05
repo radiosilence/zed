@@ -3105,7 +3105,6 @@ impl Interactivity {
                         .clone();
                     window.on_mouse_event({
                         let hitbox = hitbox.clone();
-                        let drag_listener = drag_listener.clone();
                         move |event: &LongPressEvent, phase, window, cx| {
                             if phase != DispatchPhase::Bubble {
                                 return;

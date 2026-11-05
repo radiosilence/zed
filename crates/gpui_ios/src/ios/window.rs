@@ -688,6 +688,7 @@ impl IosWindowState {
             position,
             predicted_position: None,
             force: touch_force(touch),
+            timestamp: touch_timestamp(touch),
         };
         self.handle_keyboard_dismiss_touch(&event);
         self.input_callback

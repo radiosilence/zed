@@ -7471,6 +7471,7 @@ dependencies = [
  "gpui-koan",
  "gpui-koan-apple",
  "gpui-koan-platform",
+ "libc",
  "log",
  "objc2 0.6.3",
  "objc2-core-foundation",

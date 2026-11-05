@@ -274,6 +274,7 @@ impl WebWindowInner {
                     position,
                     predicted_position: None,
                     force: None,
+                    timestamp: None,
                 }));
                 // Keyboard and IME focus intentionally do not change here:
                 // whether this touch is a tap or a pan is only known at
@@ -347,6 +348,7 @@ impl WebWindowInner {
                     position,
                     predicted_position: None,
                     force: None,
+                    timestamp: None,
                 }));
 
                 // A keyboard opening or closing mid-gesture reflows the
@@ -459,6 +461,7 @@ impl WebWindowInner {
                     position: pointer_position_in_element(&event),
                     predicted_position: None,
                     force: None,
+                    timestamp: None,
                 }));
             } else {
                 this.pressed_button.set(None);
@@ -588,6 +591,7 @@ impl WebWindowInner {
                     position,
                     predicted_position: predicted_pointer_position(&event, position),
                     force: None,
+                    timestamp: None,
                 }));
                 return;
             }

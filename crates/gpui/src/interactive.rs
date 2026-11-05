@@ -134,6 +134,11 @@ pub struct TouchEvent {
     pub predicted_position: Option<Point<Pixels>>,
     /// Normalized touch force in `0.0..=1.0`, if the hardware reports it.
     pub force: Option<f32>,
+    /// When the hardware sampled the touch, if the platform reports it.
+    /// Velocity is estimated from these times: a busy main thread delivers
+    /// samples late and bunched, and timing them by delivery reads a fling's
+    /// release as the finger having stopped.
+    pub timestamp: Option<std::time::Instant>,
 }
 
 impl Sealed for TouchEvent {}

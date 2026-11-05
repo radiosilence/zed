@@ -252,3 +252,20 @@ mod key_tests {
         );
     }
 }
+
+/// When the hardware sampled `touch`, as an [`Instant`](std::time::Instant).
+/// UIKit times touches in seconds of system uptime, the clock `Instant`
+/// reads on Apple platforms (`CLOCK_UPTIME_RAW`).
+pub fn touch_timestamp(touch: &UITouch) -> Option<std::time::Instant> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid timespec for the call to write.
+    if unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut now) } != 0 {
+        return None;
+    }
+    let uptime = now.tv_sec as f64 + now.tv_nsec as f64 / 1e9;
+    let age = (uptime - touch.timestamp()).max(0.0);
+    std::time::Instant::now().checked_sub(std::time::Duration::from_secs_f64(age))
+}

@@ -10399,6 +10399,13 @@ mod tests {
         assert!(dispatch_back(cx, 80.));
         assert!(!dispatch_back(cx, 150.));
         assert_eq!(claims.borrow().as_slice(), ["inner", "outer"]);
+
+        // After a touch, when nothing is hovered unless held, the swipe still
+        // reaches what is under its start.
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 300.);
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 300.);
+        assert!(dispatch_back(cx, 10.));
+        assert_eq!(claims.borrow().as_slice(), ["inner", "outer", "inner"]);
     }
 
     struct BackListeners {
@@ -10654,6 +10661,7 @@ mod tests {
                                 position: point(px(50.), px(at)),
                                 predicted_position: None,
                                 force: None,
+                                timestamp: None,
                             }
                             .to_platform_input(),
                             cx,
@@ -11293,6 +11301,7 @@ mod tests {
                         position: point(px(x), px(0.)),
                         predicted_position: None,
                         force: None,
+                        timestamp: None,
                     }
                     .to_platform_input(),
                     cx,

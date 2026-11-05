@@ -50,9 +50,6 @@ type StackSafe<T> = stacksafe::StackSafe<T>;
 type StackSafe<T> = T;
 
 const DRAG_THRESHOLD: f64 = 2.;
-/// How far a held touch moves before it lifts the element's drag: past a
-/// finger's own wobble, so holding still opens what a long press opens.
-const TOUCH_LIFT_THRESHOLD: f64 = 8.;
 const DEFAULT_TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
 
@@ -3105,45 +3102,46 @@ impl Interactivity {
                         .clone();
                     window.on_mouse_event({
                         let hitbox = hitbox.clone();
-                        move |event: &LongPressEvent, phase, window, cx| {
-                            if phase != DispatchPhase::Bubble {
-                                return;
+                        move |event: &LongPressEvent, phase, window, cx| match (phase, event.phase)
+                        {
+                            // Seen on the way down, before a listener above (a tooltip)
+                            // can claim the press and stop it: the drag can still lift.
+                            (DispatchPhase::Capture, TouchPhase::Started) => {
+                                let over = hitbox.is_hovered(window) && !cx.has_active_drag();
+                                pending_lift.set(over.then_some(event.position));
                             }
-                            match event.phase {
-                                TouchPhase::Started => {
-                                    if hitbox.is_hovered(window) && !cx.has_active_drag() {
-                                        pending_lift.set(Some(event.start_position));
-                                        // Claimed, so the held touch moves as a long press
-                                        // rather than becoming a scroll. An element above
-                                        // may have claimed it already, as a context menu
-                                        // does, and the drag still lifts once it moves.
-                                        window.prevent_default();
-                                    }
+                            (DispatchPhase::Capture, TouchPhase::Ended | TouchPhase::Cancelled) => {
+                                pending_lift.set(None);
+                            }
+                            // Claimed if nothing above claimed it, so the held touch moves
+                            // as a long press rather than becoming a scroll.
+                            (DispatchPhase::Bubble, TouchPhase::Started) => {
+                                if pending_lift.get().is_some() && !window.default_prevented() {
+                                    window.prevent_default();
                                 }
-                                TouchPhase::Moved => {
-                                    if let Some(start) = pending_lift.get()
-                                        && !cx.has_active_drag()
-                                        && (event.position - start).magnitude()
-                                            > TOUCH_LIFT_THRESHOLD
-                                        && let Some(listener) = drag_listener.borrow_mut().take()
-                                    {
-                                        pending_lift.set(None);
-                                        let cursor_offset = start - hitbox.origin;
-                                        start_drag(
-                                            listener,
-                                            cursor_offset,
-                                            drag_cursor_style,
-                                            window,
-                                            cx,
-                                        );
-                                        window.refresh();
-                                        cx.stop_propagation();
-                                    }
-                                }
-                                TouchPhase::Ended | TouchPhase::Cancelled => {
+                            }
+                            (DispatchPhase::Bubble, TouchPhase::Moved) => {
+                                if let Some(held) = pending_lift.get()
+                                    && !cx.has_active_drag()
+                                    && (event.position - held).magnitude()
+                                        > f64::from(window.touch_slop())
+                                    && let Some(listener) = drag_listener.borrow_mut().take()
+                                {
                                     pending_lift.set(None);
+                                    let cursor_offset = event.start_position - hitbox.origin;
+                                    start_drag(
+                                        listener,
+                                        cursor_offset,
+                                        drag_cursor_style,
+                                        window,
+                                        cx,
+                                    );
+                                    window.touch_lifted_drag = true;
+                                    window.refresh();
+                                    cx.stop_propagation();
                                 }
                             }
+                            _ => {}
                         }
                     });
                 }

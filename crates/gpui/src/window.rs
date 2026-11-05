@@ -1313,6 +1313,9 @@ pub struct Window {
     touch_prediction_enabled: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
+    /// The active drag was lifted by the current long press, which carries
+    /// it until the touch ends.
+    pub(crate) touch_lifted_drag: bool,
     pub(crate) refreshing: bool,
     /// How many `with_inert` calls are drawing: while any is, hitboxes and
     /// tab stops are left out of the frame.
@@ -2471,6 +2474,7 @@ impl Window {
             touch_prediction_enabled: true,
             long_press_timer: None,
             long_press_capture: None,
+            touch_lifted_drag: false,
             refreshing: false,
             inert: 0,
             activation_observers: SingleSubscriberSet::new(),
@@ -6418,6 +6422,12 @@ impl Window {
         }
     }
 
+    /// How far a held touch moves before it is more than a finger's wobble,
+    /// as the platform tunes it.
+    pub(crate) fn touch_slop(&self) -> Pixels {
+        self.touch_gestures.touch_slop()
+    }
+
     /// A drag lifted by a long press follows the touch as it would the
     /// pointer, and the touch's release drops it.
     fn carry_touch_drag(&mut self, long_press: &crate::LongPressEvent, cx: &mut App) {
@@ -6494,9 +6504,15 @@ impl Window {
                     long_press.phase,
                     crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
                 );
+                if started {
+                    self.touch_lifted_drag = false;
+                }
                 self.dispatch_mouse_event(&long_press, cx);
-                if cx.active_drag.is_some() {
+                if self.touch_lifted_drag && cx.active_drag.is_some() {
                     self.carry_touch_drag(&long_press, cx);
+                }
+                if ended {
+                    self.touch_lifted_drag = false;
                 }
                 if started {
                     let claimed = self.default_prevented;
@@ -10282,7 +10298,9 @@ mod tests {
                         .id("source")
                         .w(px(50.))
                         .h(px(20.))
-                        .on_drag(7u32, |_, _, _, cx| cx.new(|_| Empty)),
+                        .on_drag(7u32, |_, _, _, cx| cx.new(|_| Empty))
+                        // A tooltip claims a long press and stops it; the drag still lifts.
+                        .tooltip(|_, cx| cx.new(|_| Empty).into()),
                 )
                 .child(div().w(px(50.)).h(px(20.)))
                 .child(

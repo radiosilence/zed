@@ -3488,22 +3488,19 @@ impl Interactivity {
                             .filter(&mut delta, event.touch_phase);
                     }
 
+                    // A wheel's one axis scrolls a container that scrolls only
+                    // the other; a finger moves in the plane, and its other
+                    // axis is the container around's to take.
+                    let touch = event.source == crate::ScrollSource::Touch;
+                    let cross_axis = !restrict_scroll_to_axis && !touch;
                     let mut delta_x = match overflow.x {
                         Overflow::Scroll if !delta.x.is_zero() => delta.x,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
-                        {
-                            delta.y
-                        }
+                        Overflow::Scroll if cross_axis && overflow.y != Overflow::Scroll => delta.y,
                         _ => Pixels::ZERO,
                     };
                     let mut delta_y = match overflow.y {
                         Overflow::Scroll if !delta.y.is_zero() => delta.y,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
-                        {
-                            delta.x
-                        }
+                        Overflow::Scroll if cross_axis && overflow.x != Overflow::Scroll => delta.x,
                         _ => Pixels::ZERO,
                     };
                     if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
@@ -3519,7 +3516,7 @@ impl Interactivity {
                     // that can still move that way, and only that one; one
                     // already at its end leaves the pan to the container
                     // around it.
-                    if event.source == crate::ScrollSource::Touch {
+                    if touch {
                         let max = scroll_max.get();
                         scroll_offset.x = scroll_offset.x.clamp(-max.x, px(0.));
                         scroll_offset.y = scroll_offset.y.clamp(-max.y, px(0.));

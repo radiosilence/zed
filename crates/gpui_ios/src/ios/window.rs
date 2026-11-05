@@ -36,9 +36,9 @@ use objc2_foundation::{
 };
 use objc2_quartz_core::CAMetalLayer;
 use objc2_ui_kit::{
-    NSValueUIGeometryExtensions, UIColor, UIKeyboardFrameEndUserInfoKey,
+    NSValueUIGeometryExtensions, UIKeyboardFrameEndUserInfoKey,
     UIKeyboardWillChangeFrameNotification, UIKeyboardWillHideNotification, UIPress, UIPressesEvent,
-    UIResponder, UIStatusBarStyle, UITextInteraction, UITextInteractionMode,
+    UIResponder, UIStatusBarStyle,
 };
 use objc2_ui_kit::{
     UICornerConfiguration, UICornerRadius, UIEvent, UIGestureRecognizer,
@@ -558,15 +558,8 @@ impl IosWindow {
         // so iOS actually routes keyboard text to us.
         let text_input_frame = CGRect::new(CGPoint::ZERO, CGSize::new(1.0, 1.0));
         let text_input_view = TextInputView::new(text_input_frame, main_thread);
-        // Clear rather than hidden: it lies over the focused field, where
-        // UIKit's text interaction draws the caret, the selection, its
-        // handles and the loupe, and takes the touches on the field.
-        text_input_view.setBackgroundColor(Some(&UIColor::clearColor()));
+        text_input_view.setAlpha(0.01);
         text_input_view.setUserInteractionEnabled(true);
-        let interaction =
-            UITextInteraction::textInteractionForMode(UITextInteractionMode::Editable, main_thread);
-        unsafe { interaction.setTextInput(Some(&text_input_view)) };
-        text_input_view.addInteraction(ProtocolObject::from_ref(&*interaction));
         view.addSubview(&text_input_view);
 
         let state = IosWindowState {
@@ -1209,13 +1202,15 @@ impl PlatformWindow for IosWindow {
 
     fn draw(&self, scene: &Scene) {
         self.renderer.lock().draw(scene);
-        // The focused field may have moved (a scroll, a layout change): the
-        // text view follows it once the window has finished drawing.
-        self.text_input_view.refresh_keyboard();
+        self.text_input_view.follow_field();
     }
 
     fn draws_text_selection(&self) -> bool {
-        true
+        self.text_input_view.draws_selection()
+    }
+
+    fn set_native_text_interaction(&self, on: bool) {
+        self.text_input_view.set_native(on);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

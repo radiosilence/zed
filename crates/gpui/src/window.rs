@@ -3287,9 +3287,21 @@ impl Window {
     }
 
     /// Whether the platform draws the focused text input's caret and
-    /// selection itself (iOS), so a text element draws only its text there.
+    /// selection itself, so a text element draws only its text there: on
+    /// iOS once [`set_native_text_interaction`](Self::set_native_text_interaction)
+    /// has turned it on.
     pub fn platform_draws_text_selection(&self) -> bool {
         self.platform_window.draws_text_selection()
+    }
+
+    /// Asks the platform for its own text editing over the focused input:
+    /// on iOS, UIKit's caret, selection handles, loupe and edit menu. An app
+    /// whose text elements check
+    /// [`platform_draws_text_selection`](Self::platform_draws_text_selection)
+    /// turns it on.
+    pub fn set_native_text_interaction(&mut self, on: bool) {
+        self.platform_window.set_native_text_interaction(on);
+        self.refresh();
     }
 
     /// Returns whether this window is focused by the operating system (receiving key events).
@@ -6467,12 +6479,19 @@ impl Window {
         if pressing == self.touch_press {
             return;
         }
+        let was_pressing = self.touch_press.is_some();
         self.touch_press = pressing;
+        let mut moved_over = true;
         if let Some(position) = pressing {
             self.mouse_position = position;
-            self.mouse_hit_test = self.rendered_frame.hit_test(position);
+            let hit_test = self.rendered_frame.hit_test(position);
+            moved_over = hit_test != self.mouse_hit_test;
+            self.mouse_hit_test = hit_test;
         }
-        self.refresh();
+        // A press held and moving over the same hitboxes hovers nothing new.
+        if moved_over || was_pressing != pressing.is_some() {
+            self.refresh();
+        }
     }
 
     /// Called while a [`TouchDragEvent`](crate::TouchDragEvent) is
@@ -6535,6 +6554,10 @@ impl Window {
         let position = touch_drag.position;
         self.mouse_position = position;
         cx.propagate_event = true;
+        // The claim prevented the touch drag's default; the pointer's events
+        // carried for it are new events, whose defaults (a press taking the
+        // focus, the active style) are their own.
+        self.default_prevented = false;
         match touch_drag.phase {
             crate::TouchPhase::Started => {
                 self.mouse_position = touch_drag.start_position;

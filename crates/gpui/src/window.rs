@@ -801,6 +801,9 @@ impl HitboxId {
         if window.last_input_was_keyboard() {
             return false;
         }
+        if window.last_input_was_touch() && window.touch_press.is_none() {
+            return false;
+        }
         self.hit_test(window)
     }
 
@@ -1316,6 +1319,14 @@ pub struct Window {
     /// The active drag was lifted by the current long press, which carries
     /// it until the touch ends.
     pub(crate) touch_lifted_drag: bool,
+    /// Where a touch that can still become a tap is held. Touch has no
+    /// hover: under touch, only what is under such a touch is hovered, so a
+    /// control shows its pressed look while held and nothing stays hovered
+    /// once the finger lifts, scrolls or holds.
+    touch_press: Option<Point<Pixels>>,
+    /// The touch drag claimed in progress is carried as a pointer drag
+    /// (`carry_touch_drag_as_pointer`).
+    touch_drag_pointer: bool,
     pub(crate) refreshing: bool,
     /// How many `with_inert` calls are drawing: while any is, hitboxes and
     /// tab stops are left out of the frame.
@@ -2475,6 +2486,8 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             touch_lifted_drag: false,
+            touch_press: None,
+            touch_drag_pointer: false,
             refreshing: false,
             inert: 0,
             activation_observers: SingleSubscriberSet::new(),
@@ -6402,6 +6415,9 @@ impl Window {
             event.predicted_position = None;
         }
         let recognized_gestures = self.touch_gestures.handle_event(&event);
+        if event.phase == crate::TouchPhase::Started {
+            self.update_touch_press();
+        }
         if event.phase == crate::TouchPhase::Started
             && let Some(touch_drag) = self.touch_gestures.offer_touch_drag(event.id)
         {
@@ -6430,9 +6446,37 @@ impl Window {
         if tapped && self.invalidator.is_dirty() {
             self.draw(cx).clear(cx);
         }
+        // After the tap's press and release, which are dispatched to what
+        // the touch hovers.
+        self.update_touch_press();
         if self.touch_gestures.has_momentum() {
             self.schedule_touch_momentum_tick();
         }
+    }
+
+    /// Hovers what a held touch is over, while it can still be a tap or is
+    /// being dragged, and nothing once it is neither.
+    fn update_touch_press(&mut self) {
+        let pressing = self.touch_gestures.pressing();
+        if pressing == self.touch_press {
+            return;
+        }
+        self.touch_press = pressing;
+        if let Some(position) = pressing {
+            self.mouse_position = position;
+            self.mouse_hit_test = self.rendered_frame.hit_test(position);
+        }
+        self.refresh();
+    }
+
+    /// Called while a [`TouchDragEvent`](crate::TouchDragEvent) is
+    /// dispatched in its `Started` phase, with the drag claimed by
+    /// [`prevent_default`](Self::prevent_default): the drag is delivered
+    /// from then on as a left-button press where it started, pointer moves
+    /// with the button held, and a release, so an element that drags with
+    /// the pointer (a slider, a handle) drags with the finger unchanged.
+    pub fn carry_touch_drag_as_pointer(&mut self) {
+        self.touch_drag_pointer = true;
     }
 
     /// How far a held touch moves before it is more than a finger's wobble,
@@ -6479,6 +6523,49 @@ impl Window {
         }
     }
 
+    /// A claimed touch drag as the pointer drag `carry_touch_drag_as_pointer`
+    /// asked for.
+    fn carry_touch_drag_pointer(&mut self, touch_drag: &crate::TouchDragEvent, cx: &mut App) {
+        let position = touch_drag.position;
+        self.mouse_position = position;
+        cx.propagate_event = true;
+        match touch_drag.phase {
+            crate::TouchPhase::Started => {
+                self.mouse_position = touch_drag.start_position;
+                self.dispatch_mouse_event(
+                &MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: touch_drag.start_position,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                },
+                cx,
+                )
+            }
+            crate::TouchPhase::Moved => self.dispatch_mouse_event(
+                &MouseMoveEvent {
+                    position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                },
+                cx,
+            ),
+            crate::TouchPhase::Ended | crate::TouchPhase::Cancelled => {
+                self.touch_drag_pointer = false;
+                self.dispatch_mouse_event(
+                    &MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                    },
+                    cx,
+                );
+            }
+        }
+    }
+
     fn dispatch_recognized_touch_gesture(&mut self, gesture: RecognizedTouchGesture, cx: &mut App) {
         match gesture {
             RecognizedTouchGesture::Scroll(scroll_wheel) => {
@@ -6498,10 +6585,17 @@ impl Window {
                 cx.propagate_event = true;
                 self.default_prevented = false;
                 let started = touch_drag.phase == crate::TouchPhase::Started;
+                if started {
+                    self.touch_drag_pointer = false;
+                }
                 self.dispatch_mouse_event(&touch_drag, cx);
                 if started {
-                    self.touch_gestures
-                        .resolve_touch_drag(self.default_prevented);
+                    let claimed = self.default_prevented;
+                    self.touch_gestures.resolve_touch_drag(claimed);
+                    self.touch_drag_pointer &= claimed;
+                }
+                if self.touch_drag_pointer {
+                    self.carry_touch_drag_pointer(&touch_drag, cx);
                 }
             }
             RecognizedTouchGesture::LongPress(long_press) => {
@@ -10367,6 +10461,111 @@ mod tests {
         dispatch_touch(window, cx, TouchId(2), TouchPhase::Ended, 12.);
         cx.run_until_parked();
         assert_eq!(*dropped.borrow(), [7]);
+    }
+
+    struct Pressable {
+        hovers: Rc<RefCell<Vec<bool>>>,
+        clicks: Rc<RefCell<usize>>,
+    }
+
+    impl Render for Pressable {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let (hovers, clicks) = (self.hovers.clone(), self.clicks.clone());
+            div()
+                .id("button")
+                .w(px(50.))
+                .h(px(20.))
+                .on_hover(move |hovered, _, _| hovers.borrow_mut().push(*hovered))
+                .on_click(move |_, _, _| *clicks.borrow_mut() += 1)
+        }
+    }
+
+    #[gpui::test]
+    fn a_held_touch_hovers_what_it_is_over_until_it_lifts_or_scrolls(cx: &mut TestAppContext) {
+        let hovers = Rc::new(RefCell::new(Vec::new()));
+        let clicks = Rc::new(RefCell::new(0));
+        let window = cx.add_window({
+            let (hovers, clicks) = (hovers.clone(), clicks.clone());
+            move |_, _| Pressable { hovers, clicks }
+        });
+        cx.run_until_parked();
+
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+        cx.run_until_parked();
+        assert_eq!(*hovers.borrow(), [true], "held, it shows as pressed");
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 10.);
+        cx.run_until_parked();
+        assert_eq!(*clicks.borrow(), 1, "the tap still clicks what it hovered");
+        assert_eq!(*hovers.borrow(), [true, false], "lifted, nothing stays hovered");
+
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Started, 10.);
+        cx.run_until_parked();
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Moved, 40.);
+        cx.run_until_parked();
+        assert_eq!(*hovers.borrow(), [true, false, true, false], "a scroll is no press");
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Ended, 40.);
+        cx.run_until_parked();
+        assert_eq!(*clicks.borrow(), 1);
+    }
+
+    struct PointerDragged {
+        events: Rc<RefCell<Vec<(&'static str, Pixels)>>>,
+    }
+
+    impl Render for PointerDragged {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let events = self.events.clone();
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    window.on_mouse_event(|event: &TouchDragEvent, phase, window, _| {
+                        if phase == DispatchPhase::Bubble && event.phase == TouchPhase::Started {
+                            window.prevent_default();
+                            window.carry_touch_drag_as_pointer();
+                        }
+                    });
+                    let down = events.clone();
+                    window.on_mouse_event(move |event: &MouseDownEvent, phase, _, _| {
+                        if phase == DispatchPhase::Bubble {
+                            down.borrow_mut().push(("down", event.position.x));
+                        }
+                    });
+                    let moved = events.clone();
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, _| {
+                        if phase == DispatchPhase::Bubble && event.dragging() {
+                            moved.borrow_mut().push(("move", event.position.x));
+                        }
+                    });
+                    let up = events.clone();
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, _| {
+                        if phase == DispatchPhase::Bubble {
+                            up.borrow_mut().push(("up", event.position.x));
+                        }
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn a_touch_drag_carried_as_a_pointer_drag_presses_moves_and_releases(
+        cx: &mut TestAppContext,
+    ) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let events = events.clone();
+            move |_, _| PointerDragged { events }
+        });
+        cx.run_until_parked();
+
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 30.);
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 30.);
+        assert_eq!(
+            *events.borrow(),
+            [("down", px(10.)), ("move", px(30.)), ("up", px(30.))]
+        );
     }
 
     struct TouchDragListener {

@@ -945,6 +945,16 @@ impl TouchGestureRecognizer {
         self.tuning.touch_slop
     }
 
+    /// Where a touch is pressing: one that can still become a tap, where it
+    /// went down, or one being dragged, where it is.
+    pub(crate) fn pressing(&self) -> Option<Point<Pixels>> {
+        match &self.state {
+            TouchGestureState::Pending { touch, .. } => Some(touch.start_position),
+            TouchGestureState::TouchDragging(touch) => Some(touch.last_position),
+            _ => None,
+        }
+    }
+
     pub(crate) fn pending_long_press(&self) -> Option<(TouchId, Duration)> {
         let TouchGestureState::Pending {
             touch,

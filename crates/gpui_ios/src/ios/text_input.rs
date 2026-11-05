@@ -725,6 +725,11 @@ impl TextInputView {
                 UITextInteractionMode::Editable,
                 self.mtm(),
             );
+            // Held before it is attached: UIKit asks `textInputView` where
+            // to put the interaction's gestures as it attaches, and this
+            // view must answer itself, not the window's view, whose every
+            // tap the interaction's tap recognizer would cancel.
+            *self.ivars().interaction.borrow_mut() = Some(interaction.clone());
             unsafe { interaction.setTextInput(Some(self)) };
             self.addInteraction(ProtocolObject::from_ref(&*interaction));
             if let Some(recognizers) = self.gestureRecognizers() {
@@ -735,7 +740,6 @@ impl TextInputView {
             }
             self.setBackgroundColor(Some(&UIColor::clearColor()));
             self.setAlpha(1.0);
-            *self.ivars().interaction.borrow_mut() = Some(interaction);
             self.follow_field();
         } else {
             if let Some(interaction) = self.ivars().interaction.borrow_mut().take() {

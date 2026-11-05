@@ -42,6 +42,7 @@ objc2-ui-kit = { workspace = true, features = ["UIConversationContext"] }
 slotmap.workspace = true
 
 [target.'cfg(target_os = "ios")'.dependencies]
+libc.workspace = true
 anyhow.workspace = true
 block2.workspace = true
 futures.workspace = true

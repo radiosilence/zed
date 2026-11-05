@@ -427,7 +427,9 @@ impl Interactivity {
     ) {
         self.back_gesture_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                // Under the gesture's start, not hovered: under touch only a
+                // held touch hovers, and a swipe is one that moved.
+                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     (listener)(event, window, cx);
                     window.prevent_default();
                     cx.stop_propagation();
@@ -5102,6 +5104,7 @@ mod tests {
                         position: touch_position,
                         predicted_position: None,
                         force: None,
+                        timestamp: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5128,6 +5131,7 @@ mod tests {
                         position: moved_position,
                         predicted_position: None,
                         force: None,
+                        timestamp: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5149,6 +5153,7 @@ mod tests {
                         position: moved_position,
                         predicted_position: None,
                         force: None,
+                        timestamp: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5434,6 +5439,7 @@ mod tests {
                     position: point(px(75.), px(75.)),
                     force: None,
                     predicted_position: None,
+                    timestamp: None,
                 };
                 window.dispatch_event(started.clone().to_platform_input(), cx);
                 assert_eq!(*mouse_down_out_count.borrow(), 0);
@@ -5492,6 +5498,7 @@ mod tests {
                             position: point(px(75.), px(vertical_position)),
                             predicted_position: None,
                             force: None,
+                            timestamp: None,
                         }
                         .to_platform_input(),
                         cx,

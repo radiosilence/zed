@@ -1,11 +1,11 @@
-use super::{CallbackSlot, platform::IosPlatformState, window::IosWindowState};
+use super::{CallbackSlot, forwarding, platform::IosPlatformState, window::IosWindowState};
 use gpui::{AppLifecyclePhase, WindowVisibility};
 use gpui_apple::main_thread_marker;
 use objc2::{
     ClassType, DefinedClass, MainThreadOnly, Message, define_class, extern_class, extern_methods,
     msg_send,
     rc::{Allocated, Retained},
-    runtime::AnyObject,
+    runtime::{AnyObject, Sel},
     sel,
 };
 use objc2_foundation::{
@@ -219,16 +219,34 @@ define_class!(
             let this = this.set_ivars(platform);
             unsafe { msg_send![super(this), init] }
         }
+
+        // The application's forwarded delegate answers for what this one
+        // does not implement; see `forward_application_delegate`.
+        #[unsafe(method(respondsToSelector:))]
+        fn responds_to_selector(&self, selector: Sel) -> bool {
+            let own: bool = unsafe { msg_send![super(self), respondsToSelector: selector] };
+            own || forwarding::forwarded_for(selector).is_some()
+        }
+
+        #[unsafe(method(forwardingTargetForSelector:))]
+        fn forwarding_target_for_selector(&self, selector: Sel) -> *mut AnyObject {
+            forwarding::forwarding_target(selector)
+        }
     }
 
     unsafe impl UIApplicationDelegate for AppDelegate {
         #[unsafe(method(application:didFinishLaunchingWithOptions:))]
         unsafe fn did_finish_launching(
             &self,
-            _application: &UIApplication,
-            _options: Option<&NSDictionary<UIApplicationLaunchOptionsKey, AnyObject>>,
+            application: &UIApplication,
+            options: Option<&NSDictionary<UIApplicationLaunchOptionsKey, AnyObject>>,
         ) -> bool {
             // GPUI's launch callback runs when a scene is ready to host its window.
+            if let Some(delegate) =
+                forwarding::forwarded_for(sel!(application:didFinishLaunchingWithOptions:))
+            {
+                unsafe { delegate.application_didFinishLaunchingWithOptions(application, options) };
+            }
             true
         }
 

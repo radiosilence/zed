@@ -3,6 +3,7 @@
 mod application;
 mod display;
 mod events;
+mod forwarding;
 mod platform;
 mod text_input;
 mod window;
@@ -48,6 +49,7 @@ impl<T> CallbackSlot<T> {
 }
 
 pub(crate) use display::*;
+pub use forwarding::forward_application_delegate;
 pub use platform::*;
 pub use window::set_status_bar_style;
 pub(crate) use window::*;

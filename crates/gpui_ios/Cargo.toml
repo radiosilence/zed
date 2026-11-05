@@ -25,6 +25,11 @@ name = "text_input"
 path = "tests/text_input.rs"
 harness = false
 
+[[test]]
+name = "app_delegate"
+path = "tests/app_delegate.rs"
+harness = false
+
 [features]
 runtime_shaders = ["gpui_apple/runtime_shaders"]
 

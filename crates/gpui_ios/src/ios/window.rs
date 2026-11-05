@@ -14,11 +14,12 @@ use super::text_input::TextInputView;
 use super::{CallbackSlot, IosDisplay, platform::IosPlatformState};
 use gpui::{
     AnyWindowHandle, BackGestureEvent, BackGesturePhase, Bounds, Capslock, Corners, DevicePixels,
-    DispatchEventResult, DisplayId, Edges, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, Scene, Size, TextInputConfiguration, TextInputStateChange,
-    TouchEvent, TouchId, TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowInsets, WindowParams, WindowVisibility, px, size,
+    DispatchEventResult, DisplayId, Edges, GpuSpecs, KeyDownEvent, KeyUpEvent, Keystroke,
+    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, Size,
+    TextInputConfiguration, TextInputStateChange, TouchEvent, TouchId, TouchPhase,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets,
+    WindowParams, WindowVisibility, px, size,
 };
 use gpui_apple::{
     main_thread_marker,
@@ -546,6 +547,23 @@ impl IosWindowState {
         self.handle_keyboard_dismiss_touch(&event);
         self.input_callback
             .with(|callback| callback(PlatformInput::Touch(event)));
+    }
+
+    /// Delivers a key press and its release, as GPUI's bindings see a key,
+    /// and returns whether a listener handled the press.
+    pub(crate) fn dispatch_key(&self, keystroke: Keystroke) -> bool {
+        let down = KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        let handled = self
+            .input_callback
+            .with(|callback| callback(PlatformInput::KeyDown(down)))
+            .is_some_and(|result| !result.propagate || result.default_prevented);
+        self.input_callback
+            .with(|callback| callback(PlatformInput::KeyUp(KeyUpEvent { keystroke })));
+        handled
     }
 
     /// Delivers one step of a trackpad or mouse-wheel scroll gesture.

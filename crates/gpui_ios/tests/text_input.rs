@@ -29,6 +29,10 @@ mod window {
         ) -> Option<R> {
             None
         }
+
+        pub(crate) fn dispatch_key(&self, _keystroke: gpui::Keystroke) -> bool {
+            false
+        }
     }
 
     #[derive(Default)]

@@ -1,7 +1,7 @@
 use super::window::{IosWindowState, WindowReference};
 use gpui::{
-    Autocapitalize, PlatformInputHandler, TextInputAction, TextInputConfiguration,
-    TextInputStateChange, px,
+    Autocapitalize, Keystroke, Modifiers, PlatformInputHandler, TextInputAction,
+    TextInputConfiguration, TextInputStateChange, px,
 };
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -200,7 +200,14 @@ define_class!(
         }
         #[unsafe(method(insertText:))]
         fn insert_text(&self, text: &NSString) {
-            self.edit(|handler| handler.replace_text_in_range(None, &text.to_string()));
+            let text = text.to_string();
+            // The software keyboard's Return arrives as a newline. It is the
+            // enter key to GPUI's bindings first, as a hardware Return is,
+            // and typed only where nothing handles it.
+            if text == "\n" && self.return_key_handled() {
+                return;
+            }
+            self.edit(|handler| handler.replace_text_in_range(None, &text));
         }
         #[unsafe(method(deleteBackward))]
         fn delete_backward(&self) {
@@ -533,6 +540,18 @@ impl TextInputView {
             .window
             .with_window(|window| window.with_input_handler(callback))
             .flatten()
+    }
+
+    fn return_key_handled(&self) -> bool {
+        let enter = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "enter".into(),
+            key_char: None,
+        };
+        self.ivars()
+            .window
+            .with_window(|window| window.dispatch_key(enter))
+            .unwrap_or(false)
     }
 
     fn edit(&self, callback: impl FnOnce(&mut PlatformInputHandler)) {

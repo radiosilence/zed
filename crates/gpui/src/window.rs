@@ -6533,14 +6533,14 @@ impl Window {
             crate::TouchPhase::Started => {
                 self.mouse_position = touch_drag.start_position;
                 self.dispatch_mouse_event(
-                &MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: touch_drag.start_position,
-                    modifiers: Modifiers::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                },
-                cx,
+                    &crate::MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: touch_drag.start_position,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    },
+                    cx,
                 )
             }
             crate::TouchPhase::Moved => self.dispatch_mouse_event(
@@ -10496,13 +10496,21 @@ mod tests {
         dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 10.);
         cx.run_until_parked();
         assert_eq!(*clicks.borrow(), 1, "the tap still clicks what it hovered");
-        assert_eq!(*hovers.borrow(), [true, false], "lifted, nothing stays hovered");
+        assert_eq!(
+            *hovers.borrow(),
+            [true, false],
+            "lifted, nothing stays hovered"
+        );
 
         dispatch_touch(window, cx, TouchId(2), TouchPhase::Started, 10.);
         cx.run_until_parked();
         dispatch_touch(window, cx, TouchId(2), TouchPhase::Moved, 40.);
         cx.run_until_parked();
-        assert_eq!(*hovers.borrow(), [true, false, true, false], "a scroll is no press");
+        assert_eq!(
+            *hovers.borrow(),
+            [true, false, true, false],
+            "a scroll is no press"
+        );
         dispatch_touch(window, cx, TouchId(2), TouchPhase::Ended, 40.);
         cx.run_until_parked();
         assert_eq!(*clicks.borrow(), 1);
@@ -10549,9 +10557,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_touch_drag_carried_as_a_pointer_drag_presses_moves_and_releases(
-        cx: &mut TestAppContext,
-    ) {
+    fn a_touch_drag_carried_as_a_pointer_drag_presses_moves_and_releases(cx: &mut TestAppContext) {
         let events = Rc::new(RefCell::new(Vec::new()));
         let window = cx.add_window({
             let events = events.clone();

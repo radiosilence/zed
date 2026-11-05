@@ -1,7 +1,7 @@
 use super::window::{IosWindowState, WindowReference};
 use gpui::{
-    Autocapitalize, Keystroke, Modifiers, PlatformInputHandler, TextInputAction,
-    TextInputConfiguration, TextInputStateChange, px,
+    Autocapitalize, PlatformInputHandler, TextInputAction, TextInputConfiguration,
+    TextInputStateChange, px,
 };
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -9,7 +9,7 @@ use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_clas
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
     NSArray, NSAttributedStringKey, NSComparisonResult, NSCopying, NSDictionary,
-    NSObjectNSDelayedPerforming, NSObjectProtocol, NSRange, NSString,
+    NSObjectNSDelayedPerforming, NSObjectProtocol, NSRange, NSSet, NSString,
 };
 use objc2_ui_kit::*;
 use std::{
@@ -153,6 +153,24 @@ define_class!(
                 self.ivars().keyboard_eligible.set(false);
             }
             resigned
+        }
+
+        // A hardware keyboard's modifiers, noted for what UIKit turns into
+        // text (Return), then the presses go on as UIKit would send them.
+        #[unsafe(method(pressesBegan:withEvent:))]
+        fn presses_began(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            self.ivars().window.with_window(|window| window.note_press_modifiers(presses));
+            unsafe {
+                let _: () = msg_send![super(self), pressesBegan: presses, withEvent: event];
+            }
+        }
+
+        #[unsafe(method(pressesEnded:withEvent:))]
+        fn presses_ended(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            self.ivars().window.with_window(|window| window.note_press_modifiers(presses));
+            unsafe {
+                let _: () = msg_send![super(self), pressesEnded: presses, withEvent: event];
+            }
         }
 
         #[unsafe(method(reconcileTextInput))]
@@ -545,14 +563,9 @@ impl TextInputView {
     }
 
     fn return_key_handled(&self) -> bool {
-        let enter = Keystroke {
-            modifiers: Modifiers::default(),
-            key: "enter".into(),
-            key_char: None,
-        };
         self.ivars()
             .window
-            .with_window(|window| window.dispatch_key(enter))
+            .with_window(|window| window.dispatch_enter())
             .unwrap_or(false)
     }
 

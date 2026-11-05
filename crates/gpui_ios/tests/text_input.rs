@@ -30,8 +30,14 @@ mod window {
             None
         }
 
-        pub(crate) fn dispatch_key(&self, _keystroke: gpui::Keystroke) -> bool {
+        pub(crate) fn dispatch_enter(&self) -> bool {
             false
+        }
+
+        pub(crate) fn note_press_modifiers(
+            &self,
+            _presses: &objc2_foundation::NSSet<objc2_ui_kit::UIPress>,
+        ) {
         }
     }
 

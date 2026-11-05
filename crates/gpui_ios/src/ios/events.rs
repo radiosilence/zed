@@ -109,7 +109,7 @@ pub fn scroll_event(recognizer: &UIPanGestureRecognizer, view: &UIView) -> Optio
     })
 }
 
-fn modifiers(flags: UIKeyModifierFlags) -> Modifiers {
+pub(crate) fn modifiers(flags: UIKeyModifierFlags) -> Modifiers {
     Modifiers {
         control: flags.contains(UIKeyModifierFlags::Control),
         alt: flags.contains(UIKeyModifierFlags::Alternate),
@@ -159,13 +159,27 @@ pub fn keystroke(
     let modifier_key = (UIKeyboardHIDUsage::KeyboardLeftControl.0
         ..=UIKeyboardHIDUsage::KeyboardRightGUI.0)
         .contains(&code.0);
-    let modifiers = modifiers(flags);
+    let mut modifiers = modifiers(flags);
     let key = if !named.is_empty() {
         named.to_string()
     } else if let Some(function) = function {
         function
     } else if modifier_key || characters_ignoring_modifiers.is_empty() {
         return None;
+    } else if modifiers.shift
+        && !characters_ignoring_modifiers
+            .chars()
+            .all(|c| c.is_ascii_alphabetic())
+    {
+        // As macOS reports it: a shifted symbol is the symbol, without shift
+        // (`?`, not `shift-/`), so bindings written as the symbol match.
+        modifiers.shift = false;
+        let shifted = if characters.is_empty() {
+            characters_ignoring_modifiers
+        } else {
+            characters
+        };
+        shifted.to_string()
     } else {
         characters_ignoring_modifiers.to_lowercase()
     };
@@ -212,6 +226,16 @@ mod key_tests {
         assert_eq!(shifted.key, "a");
         assert!(shifted.modifiers.shift);
         assert_eq!(shifted.key_char.as_deref(), Some("A"));
+
+        let question = keystroke(
+            UIKeyboardHIDUsage::KeyboardSlash,
+            "?",
+            "/",
+            UIKeyModifierFlags::Shift,
+        )
+        .expect("a key");
+        assert_eq!(question.key, "?", "a shifted symbol is the symbol");
+        assert!(!question.modifiers.shift);
 
         let f5 = keystroke(UIKeyboardHIDUsage::KeyboardF5, "", "", none).expect("a key");
         assert_eq!(f5.key, "f5");

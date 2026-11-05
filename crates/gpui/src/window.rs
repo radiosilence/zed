@@ -10574,6 +10574,75 @@ mod tests {
         );
     }
 
+    struct Nested {
+        outer: crate::ScrollHandle,
+        inner: crate::ScrollHandle,
+    }
+
+    impl Render for Nested {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("outer")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.outer)
+                .child(
+                    div()
+                        .id("inner")
+                        .w(px(100.))
+                        .h(px(100.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.inner)
+                        .child(div().h(px(150.))),
+                )
+                .child(div().h(px(2000.)))
+        }
+    }
+
+    #[gpui::test]
+    fn a_pan_moves_the_innermost_container_that_can_move_and_then_the_one_around_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (outer, inner) = (crate::ScrollHandle::new(), crate::ScrollHandle::new());
+        let window = cx.add_window({
+            let (outer, inner) = (outer.clone(), inner.clone());
+            move |_, _| Nested { outer, inner }
+        });
+        cx.run_until_parked();
+        let pan = |cx: &mut TestAppContext, y: f32| {
+            window
+                .update(cx, |_, window, cx| {
+                    for (phase, at) in [
+                        (TouchPhase::Started, 50.),
+                        (TouchPhase::Moved, 50. - y / 2.),
+                        (TouchPhase::Moved, 50. - y),
+                        (TouchPhase::Ended, 50. - y),
+                    ] {
+                        window.dispatch_event(
+                            TouchEvent {
+                                id: TouchId(1),
+                                phase,
+                                position: point(px(50.), px(at)),
+                                predicted_position: None,
+                                force: None,
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                    }
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        pan(cx, 30.);
+        assert!(inner.offset().y < px(0.), "the inner list scrolls");
+        assert_eq!(outer.offset().y, px(0.), "and the page does not");
+        pan(cx, 40.);
+        pan(cx, 40.);
+        assert_eq!(inner.offset().y, px(-50.), "the inner list reaches its end");
+        assert!(outer.offset().y < px(0.), "then the page takes the pan");
+    }
+
     struct TouchDragListener {
         events: Rc<RefCell<Vec<(TouchPhase, Pixels)>>>,
     }

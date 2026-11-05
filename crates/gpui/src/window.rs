@@ -6418,6 +6418,44 @@ impl Window {
         }
     }
 
+    /// A drag lifted by a long press follows the touch as it would the
+    /// pointer, and the touch's release drops it.
+    fn carry_touch_drag(&mut self, long_press: &crate::LongPressEvent, cx: &mut App) {
+        let position = long_press.position;
+        match long_press.phase {
+            crate::TouchPhase::Started => {}
+            crate::TouchPhase::Moved => {
+                self.mouse_position = position;
+                cx.propagate_event = true;
+                self.dispatch_mouse_event(
+                    &MouseMoveEvent {
+                        position,
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Modifiers::default(),
+                    },
+                    cx,
+                );
+            }
+            crate::TouchPhase::Ended => {
+                self.mouse_position = position;
+                cx.propagate_event = true;
+                self.dispatch_mouse_event(
+                    &MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                    },
+                    cx,
+                );
+            }
+            crate::TouchPhase::Cancelled => {
+                cx.active_drag = None;
+                self.refresh();
+            }
+        }
+    }
+
     fn dispatch_recognized_touch_gesture(&mut self, gesture: RecognizedTouchGesture, cx: &mut App) {
         match gesture {
             RecognizedTouchGesture::Scroll(scroll_wheel) => {
@@ -6457,6 +6495,9 @@ impl Window {
                     crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
                 );
                 self.dispatch_mouse_event(&long_press, cx);
+                if cx.active_drag.is_some() {
+                    self.carry_touch_drag(&long_press, cx);
+                }
                 if started {
                     let claimed = self.default_prevented;
                     self.touch_gestures.resolve_long_press(claimed);
@@ -10225,6 +10266,73 @@ mod tests {
                     .child(div().w(px(50.)).h_full().on_back_gesture(claim("inner"))),
             )
         }
+    }
+
+    struct LiftAndDrop {
+        dropped: Rc<RefCell<Vec<u32>>>,
+    }
+
+    impl Render for LiftAndDrop {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let dropped = self.dropped.clone();
+            div()
+                .flex()
+                .child(
+                    div()
+                        .id("source")
+                        .w(px(50.))
+                        .h(px(20.))
+                        .on_drag(7u32, |_, _, _, cx| cx.new(|_| Empty)),
+                )
+                .child(div().w(px(50.)).h(px(20.)))
+                .child(
+                    div()
+                        .id("target")
+                        .w(px(50.))
+                        .h(px(20.))
+                        .on_drop(move |value: &u32, _, _| dropped.borrow_mut().push(*value)),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn a_held_touch_that_moves_lifts_the_drag_and_its_release_drops_it(cx: &mut TestAppContext) {
+        let dropped = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let dropped = dropped.clone();
+            move |_, _| LiftAndDrop { dropped }
+        });
+        cx.run_until_parked();
+
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+        cx.executor().advance_clock(Duration::from_millis(501));
+        cx.executor().run_until_parked();
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 30.);
+        window
+            .update(cx, |_, _, cx| {
+                assert!(cx.has_active_drag(), "moving lifts the drag")
+            })
+            .unwrap();
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 120.);
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 120.);
+        cx.run_until_parked();
+        assert_eq!(*dropped.borrow(), [7]);
+        window
+            .update(cx, |_, _, cx| assert!(!cx.has_active_drag()))
+            .unwrap();
+
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Started, 10.);
+        cx.executor().advance_clock(Duration::from_millis(501));
+        cx.executor().run_until_parked();
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Moved, 12.);
+        window
+            .update(cx, |_, _, cx| {
+                assert!(!cx.has_active_drag(), "a held touch's wobble lifts nothing")
+            })
+            .unwrap();
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Ended, 12.);
+        cx.run_until_parked();
+        assert_eq!(*dropped.borrow(), [7]);
     }
 
     struct TouchDragListener {

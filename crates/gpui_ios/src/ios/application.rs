@@ -307,9 +307,12 @@ define_class!(
         }
 
         #[unsafe(method(renderFrame:))]
-        fn render_frame(&self, _display_link: &CADisplayLink) {
+        fn render_frame(&self, display_link: &CADisplayLink) {
             if let Some(platform) = self.ivars().upgrade() {
-                platform.application.with_windows(IosWindowState::request_frame);
+                let present_at = super::events::instant_from_uptime(display_link.targetTimestamp());
+                platform
+                    .application
+                    .with_windows(|window| window.request_frame(present_at));
             }
         }
     }

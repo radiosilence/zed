@@ -18,9 +18,10 @@ use futures::{
 };
 use gpui::{
     Action, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem, CursorStyle,
-    DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, PowerMode, Result, Task, ThermalState, WindowAppearance, WindowParams,
+    DummyKeyboardMapper, ForegroundExecutor, GestureTuning, Keymap, Menu, MenuItem,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformGestures, PlatformKeyboardLayout,
+    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, PowerMode, Result, Task,
+    ThermalState, WindowAppearance, WindowParams,
 };
 use gpui_apple::{
     AppleDispatcher, keychain, main_thread_marker,
@@ -42,9 +43,29 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 
 pub struct IosPlatform(Rc<IosPlatformState>);
+
+/// Gesture feel for UIKit, whose touch delivery is not locked to the frames
+/// GPUI draws: pans are resampled to each frame, as Android's input system
+/// resamples them, a refresh interval and five milliseconds behind the frame's
+/// presentation, which is about as old as the newest touch sample is when the
+/// frame is made.
+struct IosGestures;
+
+impl PlatformGestures for IosGestures {
+    fn tuning(&self) -> GestureTuning {
+        let refresh_interval = IosDisplay::main()
+            .refresh_interval()
+            .unwrap_or(Duration::from_micros(16_667));
+        GestureTuning {
+            touch_resampling: Some(refresh_interval + Duration::from_millis(5)),
+            ..GestureTuning::default()
+        }
+    }
+}
 
 pub(crate) struct IosPlatformState {
     pub(super) application: IosApplicationState,
@@ -534,6 +555,10 @@ impl Platform for IosPlatform {
     fn on_power_mode_change(&self, callback: Box<dyn FnMut()>) {
         let observer = process_info::observe_power_mode(&self.0.foreground_executor, callback);
         self.0.power_mode_observer.replace(Some(observer));
+    }
+
+    fn gestures(&self) -> Option<Rc<dyn PlatformGestures>> {
+        Some(Rc::new(IosGestures))
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {

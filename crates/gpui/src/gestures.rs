@@ -514,6 +514,10 @@ const VELOCITY_ASSUME_STOPPED_GAP: Duration = Duration::from_millis(40);
 
 const VELOCITY_MAX_SAMPLES: usize = 20;
 
+/// How soon after catching a fling a flick the same way adds the fling's
+/// speed to its own.
+const FLING_CARRY_WINDOW: Duration = Duration::from_millis(600);
+
 /// The portable recognizer behind raw touch input: it watches the
 /// [`TouchEvent`] stream for one touch at a time and resolves it into either
 /// a tap or a pan, following the competition model described in the module
@@ -530,6 +534,10 @@ pub(crate) struct TouchGestureRecognizer {
     tuning: GestureTuning,
     state: TouchGestureState,
     momentum: Option<Momentum>,
+    /// The velocity a fling had when a touch caught it, and when: a fling
+    /// released the same way soon after adds it, so repeated flicks speed a
+    /// long list along, as UIKit's scroll views do.
+    carried: Option<(Point<f32>, Instant)>,
     last_tap: Option<CompletedTap>,
 }
 
@@ -619,6 +627,7 @@ impl TouchGestureRecognizer {
             tuning,
             state: TouchGestureState::Idle,
             momentum: None,
+            carried: None,
             last_tap: None,
         }
     }
@@ -638,7 +647,20 @@ impl TouchGestureRecognizer {
         let mut recognized = SmallVec::new();
         match event.phase {
             TouchPhase::Started => {
+                self.carried = None;
                 let caught_fling = if let Some(momentum) = self.momentum.take() {
+                    let elapsed = now.saturating_duration_since(momentum.started_at);
+                    let physics = self.tuning.scroll_physics;
+                    let step = Duration::from_millis(1);
+                    let speed = (physics.fling_distance(momentum.speed, elapsed + step)
+                        - physics.fling_distance(momentum.speed, elapsed))
+                        * 1000.;
+                    if speed > 0. {
+                        self.carried = Some((
+                            point(momentum.direction.x * speed, momentum.direction.y * speed),
+                            now,
+                        ));
+                    }
                     recognized.push(RecognizedTouchGesture::Scroll(scroll_event(
                         momentum.position,
                         Point::default(),
@@ -847,6 +869,15 @@ impl TouchGestureRecognizer {
                     } else {
                         touch.velocity_tracker.velocity()
                     };
+                    // A flick that caught a fling and goes on the same way
+                    // adds what the fling still had.
+                    if let Some((carried, at)) = self.carried.take()
+                        && !finger_stopped
+                        && now.saturating_duration_since(at) < FLING_CARRY_WINDOW
+                        && carried.x * velocity.x + carried.y * velocity.y > 0.
+                    {
+                        velocity = point(velocity.x + carried.x, velocity.y + carried.y);
+                    }
                     match axis {
                         Axis::Vertical => velocity.x = 0.,
                         Axis::Horizontal => velocity.y = 0.,
@@ -1790,6 +1821,35 @@ mod tests {
         assert!(closing.delta.pixel_delta(px(16.)).is_zero());
         assert_eq!(opening.touch_phase, TouchPhase::Started);
         assert!(opening.delta.pixel_delta(px(16.)).is_zero());
+    }
+
+    #[test]
+    fn a_second_flick_the_same_way_adds_the_first_flings_speed() {
+        let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
+        let touch = TouchId(1);
+        let mut now = Instant::now();
+        let flick = |recognizer: &mut TouchGestureRecognizer, now: &mut Instant| {
+            recognizer.handle_event_at(&touch_event(touch, TouchPhase::Started, 100., 500.), *now);
+            for step in 1..=5 {
+                *now += Duration::from_millis(16);
+                recognizer.handle_event_at(
+                    &touch_event(touch, TouchPhase::Moved, 100., 500. - step as f32 * 20.),
+                    *now,
+                );
+            }
+            *now += Duration::from_millis(16);
+            recognizer.handle_event_at(&touch_event(touch, TouchPhase::Ended, 100., 400.), *now);
+            recognizer
+                .momentum
+                .as_ref()
+                .map(|m| m.speed)
+                .unwrap_or_default()
+        };
+        let first = flick(&mut recognizer, &mut now);
+        now += Duration::from_millis(100);
+        let second = flick(&mut recognizer, &mut now);
+        assert!(first > 0.);
+        assert!(second > first * 1.5, "{second} after {first}");
     }
 
     #[test]

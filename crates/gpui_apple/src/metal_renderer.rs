@@ -2937,8 +2937,9 @@ struct BlurGeometry {
     target: [f32; 2],
 }
 
-/// The largest reduction: past it the box filter starts to show as blocks.
-const MAX_BLUR_FACTOR: usize = 16;
+/// The largest reduction. Past it the box filter's reads stride so far
+/// apart that reducing costs more than the wider Gaussian it saves.
+const MAX_BLUR_FACTOR: usize = 8;
 
 impl BlurGeometry {
     /// `None` for a blur that draws nothing in a target of `viewport`.
@@ -2969,7 +2970,7 @@ impl BlurGeometry {
         if x1 <= x0 || y1 <= y0 {
             return None;
         }
-        // Reduced so the Gaussian left spans two to four texels, which the
+        // Reduced so the Gaussian left spans at least two texels, which the
         // filtered draw back smooths over.
         let mut factor = 1;
         while factor < MAX_BLUR_FACTOR && sigma / (factor as f32 * 2.0) >= 2.0 {
@@ -4502,17 +4503,17 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         assert!(close(&whole, &moved));
     }
 
-    // A navigation bar's blur at 3x: reduced sixteen times, read three
+    // A navigation bar's blur at 3x: reduced eight times, read three
     // standard deviations past its bounds, clipped to the target.
     #[test]
     fn a_wide_blur_is_reduced_and_reads_past_its_bounds() {
         let bar = backdrop_blur(blur_rect(0., 0., 1170., 300.), 60., 0.);
         let geometry =
             BlurGeometry::new(&bar, size(DevicePixels(1170), DevicePixels(2532))).expect("drawn");
-        assert_eq!(geometry.factor, 16);
+        assert_eq!(geometry.factor, 8);
         assert_eq!(geometry.region, [0, 0, 1170, 480]);
-        assert_eq!(geometry.extent, (74, 30));
-        assert_eq!(geometry.half_width, 12);
+        assert_eq!(geometry.extent, (147, 60));
+        assert_eq!(geometry.half_width, 23);
 
         let fine = backdrop_blur(blur_rect(10., 10., 20., 20.), 1., 0.);
         let geometry =
@@ -4522,5 +4523,74 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
             BlurGeometry::new(&fine, size(DevicePixels(8), DevicePixels(8))).is_none(),
             "off the target"
         );
+    }
+
+    // What one navigation bar's blur, 390 by 100 points at 3x, adds to a
+    // frame filling a phone's screen, in GPU time: `cargo test -p
+    // gpui-koan-apple --lib backdrop_blur_gpu_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn backdrop_blur_gpu_time() {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        let viewport = size(DevicePixels(1170), DevicePixels(2532));
+        let target = renderer.layer_texture(1170, 2532).unwrap();
+        renderer
+            .update_path_intermediate_textures(viewport)
+            .unwrap();
+        let frame = |blur: Option<f32>| {
+            let mut scene = Scene::default();
+            stripes(&mut scene, 1170., 2532.);
+            if let Some(sigma) = blur {
+                scene.insert_primitive(backdrop_blur(blur_rect(0., 0., 1170., 300.), sigma, 0.));
+                scene.insert_primitive(solid(
+                    blur_rect(0., 0., 1170., 300.),
+                    gpui::hsla(0., 0., 1., 0.7),
+                ));
+            }
+            scene.finish();
+            scene
+        };
+        let mut time = |scene: &Scene| {
+            let mut times = Vec::new();
+            for _ in 0..15 {
+                // Frames queued back to back, as a display link draws them,
+                // so the GPU is not timed waking up.
+                let buffers: Vec<_> = (0..20)
+                    .map(|_| {
+                        let buffer = renderer
+                            .render_frame(scene, &target, viewport, false)
+                            .unwrap();
+                        buffer.commit();
+                        buffer
+                    })
+                    .collect();
+                // The span from the first frame's start to the last's end,
+                // a frame at a time: frames overlap on the GPU.
+                let span = |buffer: &Retained<ProtocolObject<dyn MTLCommandBuffer>>| -> (f64, f64) {
+                    buffer.waitUntilCompleted();
+                    unsafe {
+                        (
+                            objc2::msg_send![&**buffer, GPUStartTime],
+                            objc2::msg_send![&**buffer, GPUEndTime],
+                        )
+                    }
+                };
+                let last = span(buffers.last().unwrap());
+                let first = span(&buffers[0]);
+                times.push((last.1 - first.0) / buffers.len() as f64);
+            }
+            times.sort_by(f64::total_cmp);
+            times[times.len() / 2] * 1e6
+        };
+        let plain = time(&frame(None));
+        println!("frame without a blur: {plain:.0} us");
+        for sigma in [30., 60., 90.] {
+            let with = time(&frame(Some(sigma)));
+            println!(
+                "sigma {sigma} px: frame {with:.0} us, the blur {:.0} us",
+                with - plain
+            );
+        }
     }
 }

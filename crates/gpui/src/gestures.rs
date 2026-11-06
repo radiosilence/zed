@@ -647,7 +647,10 @@ impl TouchGestureRecognizer {
         let mut recognized = SmallVec::new();
         match event.phase {
             TouchPhase::Started => {
-                self.carried = None;
+                // A second finger landing mid-pan leaves the first's carry.
+                if matches!(self.state, TouchGestureState::Idle) {
+                    self.carried = None;
+                }
                 let caught_fling = if let Some(momentum) = self.momentum.take() {
                     let elapsed = now.saturating_duration_since(momentum.started_at);
                     let physics = self.tuning.scroll_physics;
@@ -869,18 +872,25 @@ impl TouchGestureRecognizer {
                     } else {
                         touch.velocity_tracker.velocity()
                     };
-                    // A flick that caught a fling and goes on the same way
-                    // adds what the fling still had.
-                    if let Some((carried, at)) = self.carried.take()
-                        && !finger_stopped
-                        && now.saturating_duration_since(at) < FLING_CARRY_WINDOW
-                        && carried.x * velocity.x + carried.y * velocity.y > 0.
-                    {
-                        velocity = point(velocity.x + carried.x, velocity.y + carried.y);
-                    }
-                    match axis {
+                    let lock = |velocity: &mut Point<f32>| match axis {
                         Axis::Vertical => velocity.x = 0.,
                         Axis::Horizontal => velocity.y = 0.,
+                    };
+                    lock(&mut velocity);
+                    // A flick that caught a fling and goes on the same way
+                    // adds what the fling still had. Only a flick: a slow
+                    // drag after a catch stops the content, whatever the
+                    // fling still had.
+                    if let Some((mut carried, at)) = self.carried.take()
+                        && !finger_stopped
+                        && now.saturating_duration_since(at) < FLING_CARRY_WINDOW
+                        && (velocity.x.powi(2) + velocity.y.powi(2)).sqrt()
+                            >= self.tuning.min_fling_velocity
+                    {
+                        lock(&mut carried);
+                        if carried.x * velocity.x + carried.y * velocity.y > 0. {
+                            velocity = point(velocity.x + carried.x, velocity.y + carried.y);
+                        }
                     }
                     let speed = (velocity.x.powi(2) + velocity.y.powi(2)).sqrt();
                     let mut release_delta = event.position - touch.emitted_position;
@@ -1850,6 +1860,58 @@ mod tests {
         let second = flick(&mut recognizer, &mut now);
         assert!(first > 0.);
         assert!(second > first * 1.5, "{second} after {first}");
+    }
+
+    #[test]
+    fn a_slow_drag_after_catching_a_fling_does_not_fling() {
+        let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
+        let mut now = Instant::now();
+        recognizer.handle_event_at(
+            &touch_event(TouchId(1), TouchPhase::Started, 100., 500.),
+            now,
+        );
+        for step in 1..=5 {
+            now += Duration::from_millis(16);
+            recognizer.handle_event_at(
+                &touch_event(
+                    TouchId(1),
+                    TouchPhase::Moved,
+                    100.,
+                    500. - step as f32 * 20.,
+                ),
+                now,
+            );
+        }
+        now += Duration::from_millis(16);
+        recognizer.handle_event_at(&touch_event(TouchId(1), TouchPhase::Ended, 100., 400.), now);
+        assert!(recognizer.has_momentum());
+
+        now += Duration::from_millis(50);
+        recognizer.handle_event_at(
+            &touch_event(TouchId(2), TouchPhase::Started, 100., 300.),
+            now,
+        );
+        for step in 1..=3 {
+            now += Duration::from_millis(16);
+            recognizer.handle_event_at(
+                &touch_event(
+                    TouchId(2),
+                    TouchPhase::Moved,
+                    100.,
+                    300. - step as f32 * 0.5,
+                ),
+                now,
+            );
+        }
+        now += Duration::from_millis(16);
+        recognizer.handle_event_at(
+            &touch_event(TouchId(2), TouchPhase::Ended, 100., 298.5),
+            now,
+        );
+        assert!(
+            !recognizer.has_momentum(),
+            "a creep after a catch stops the content"
+        );
     }
 
     #[test]

@@ -578,9 +578,7 @@ define_class!(
                 self.superview().unwrap_or_else(|| self.retain().into_super())
             }
         }
-
     }
-
 );
 
 impl TextInputView {

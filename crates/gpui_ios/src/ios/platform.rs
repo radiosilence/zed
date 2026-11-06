@@ -427,33 +427,57 @@ impl Platform for IosPlatform {
             UIImpactFeedbackGenerator, UIImpactFeedbackStyle, UINotificationFeedbackGenerator,
             UINotificationFeedbackType, UISelectionFeedbackGenerator,
         };
+        /// One generator per kind, kept prepared after each use: an
+        /// unprepared generator can lag or miss while the Taptic Engine idles.
+        struct Haptics {
+            selection: Retained<UISelectionFeedbackGenerator>,
+            light: Retained<UIImpactFeedbackGenerator>,
+            medium: Retained<UIImpactFeedbackGenerator>,
+            notification: Retained<UINotificationFeedbackGenerator>,
+        }
+        thread_local! {
+            static HAPTICS: std::cell::OnceCell<Haptics> = const { std::cell::OnceCell::new() };
+        }
         let Some(main_thread) = objc2::MainThreadMarker::new() else {
             return;
         };
-        match feedback {
-            gpui::HapticFeedback::Selection => {
-                UISelectionFeedbackGenerator::new(main_thread).selectionChanged();
+        // The view-less initializer: an app-level haptic has no view to tie
+        // the generator to.
+        #[allow(deprecated)]
+        let impact = |style| {
+            UIImpactFeedbackGenerator::initWithStyle(
+                UIImpactFeedbackGenerator::alloc(main_thread),
+                style,
+            )
+        };
+        HAPTICS.with(|haptics| {
+            let haptics = haptics.get_or_init(|| Haptics {
+                selection: UISelectionFeedbackGenerator::new(main_thread),
+                light: impact(UIImpactFeedbackStyle::Light),
+                medium: impact(UIImpactFeedbackStyle::Medium),
+                notification: UINotificationFeedbackGenerator::new(main_thread),
+            });
+            match feedback {
+                gpui::HapticFeedback::Selection => {
+                    haptics.selection.selectionChanged();
+                    haptics.selection.prepare();
+                }
+                gpui::HapticFeedback::Light => {
+                    haptics.light.impactOccurred();
+                    haptics.light.prepare();
+                }
+                gpui::HapticFeedback::Medium => {
+                    haptics.medium.impactOccurred();
+                    haptics.medium.prepare();
+                }
+                gpui::HapticFeedback::Success => {
+                    haptics
+                        .notification
+                        .notificationOccurred(UINotificationFeedbackType::Success);
+                    haptics.notification.prepare();
+                }
             }
-            gpui::HapticFeedback::Light | gpui::HapticFeedback::Medium => {
-                let style = if feedback == gpui::HapticFeedback::Light {
-                    UIImpactFeedbackStyle::Light
-                } else {
-                    UIImpactFeedbackStyle::Medium
-                };
-                // The view-less initializer: an app-level haptic has no view
-                // to tie the generator to.
-                #[allow(deprecated)]
-                UIImpactFeedbackGenerator::initWithStyle(
-                    UIImpactFeedbackGenerator::alloc(main_thread),
-                    style,
-                )
-                .impactOccurred();
-            }
-            gpui::HapticFeedback::Success => {
-                UINotificationFeedbackGenerator::new(main_thread)
-                    .notificationOccurred(UINotificationFeedbackType::Success);
-            }
-        }
+        });
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {

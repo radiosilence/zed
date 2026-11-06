@@ -533,8 +533,10 @@ const VELOCITY_MAX_SAMPLES: usize = 20;
 const FLING_CARRY_WINDOW: Duration = Duration::from_millis(600);
 
 /// How far past its newest sample a resampled touch may be predicted, when
-/// samples arrive later than the resampling latency allows for (Android's
-/// `RESAMPLE_MAX_PREDICTION`).
+/// samples arrive later than the resampling latency allows for, and never
+/// more than half the interval between its newest two samples (Android's
+/// `RESAMPLE_MAX_PREDICTION` and rule). A finger slows before it stops, so
+/// what prediction overshoots when it does is a pixel or so.
 const RESAMPLE_MAX_PREDICTION: Duration = Duration::from_millis(8);
 
 /// The portable recognizer behind raw touch input: it watches the
@@ -1344,7 +1346,8 @@ impl VelocityTracker {
 
     /// Where the touch was at `time`: interpolated between the samples either
     /// side of it, or predicted from the newest two, at most
-    /// [`RESAMPLE_MAX_PREDICTION`] ahead, when it is newer than all of them.
+    /// [`RESAMPLE_MAX_PREDICTION`] and half their interval ahead, when it is
+    /// newer than all of them.
     fn position_at(&self, time: Instant) -> Option<Point<Pixels>> {
         let (newest_time, newest) = *self.samples.back()?;
         let lerp = |from: Point<Pixels>, to: Point<Pixels>, fraction: f32| {
@@ -1363,7 +1366,8 @@ impl VelocityTracker {
             }
             let ahead = time
                 .duration_since(newest_time)
-                .min(RESAMPLE_MAX_PREDICTION);
+                .min(RESAMPLE_MAX_PREDICTION)
+                .min(span / 2);
             return Some(lerp(
                 previous,
                 newest,
@@ -2806,12 +2810,12 @@ mod tests {
 
     #[test]
     fn resampled_pans_move_evenly_at_the_display_rate_with_coarse_touches() {
-        // One sample per frame, delivered at a phase that wanders against
-        // the frames' callbacks.
+        // One sample per frame, taken one to five milliseconds before each
+        // frame's callback, the moment wandering within that.
         let mut samples = vec![(Duration::ZERO, TouchPhase::Started, 600.)];
         for index in 1..120 {
-            let wander = 4. * (index as f64 / 7.).sin();
-            let at = index as f64 * 16.667 + wander;
+            let wander = 2. * (index as f64 * 2.3).sin();
+            let at = index as f64 * 16.667 - 3. + wander;
             samples.push((
                 milliseconds(at),
                 TouchPhase::Moved,
@@ -2819,9 +2823,22 @@ mod tests {
             ));
         }
         let steady = -900. * FRAME.as_secs_f32();
+        let origin = Instant::now();
+        let immediate = movement_per_frame(
+            &mut TouchGestureRecognizer::new(GestureTuning::default()),
+            origin,
+            &samples,
+            110,
+        );
+        assert!(
+            immediate[10..100]
+                .iter()
+                .any(|moved| (moved - steady).abs() > 2.),
+            "applied as they arrive, samples move frames as unevenly as they were taken"
+        );
         let resampled = movement_per_frame(
             &mut TouchGestureRecognizer::new(resampling()),
-            Instant::now(),
+            origin,
             &samples,
             110,
         );
@@ -2840,14 +2857,19 @@ mod tests {
         let moved = movement_per_frame(&mut recognizer, Instant::now(), &samples, 30);
         let steady = -1500. * FRAME.as_secs_f32();
 
-        // Up to the release, the content travels exactly as far as the
-        // finger did; after it, the fling goes on at the finger's speed.
-        let release_frame = moved.iter().position(|_| false).unwrap_or(0);
-        let _ = release_frame;
-        for (frame, moved) in moved[3..30].iter().enumerate() {
+        // Up to the release, which reaches the screen in the 19th frame, the
+        // content moves with the finger; after it, the fling goes on at the
+        // finger's speed.
+        for (frame, moved) in moved.iter().enumerate().take(18).skip(3) {
             assert!(
-                (moved - steady).abs() < steady.abs() * 0.1,
-                "frame {frame} moved {moved}, expected about {steady}"
+                (moved - steady).abs() < 0.05,
+                "frame {frame} moved {moved}, expected {steady}"
+            );
+        }
+        for (frame, moved) in moved.iter().enumerate().take(21).skip(18) {
+            assert!(
+                (0.9..1.01).contains(&(moved / steady)),
+                "frame {frame} moved {moved} around the release, expected about {steady}"
             );
         }
         assert!(recognizer.has_momentum(), "the release flings");
@@ -2890,16 +2912,26 @@ mod tests {
         assert_eq!(started.touch_phase, TouchPhase::Started);
         assert_eq!(started.delta.pixel_delta(px(16.)), Point::default());
 
-        // Frames catch up with the finger, on the pan's axis only.
+        // Frames catch up with the finger, on the pan's axis only, and the
+        // release leaves the content where the finger lifted.
         let mut moved = Point::<Pixels>::default();
-        for frame in 3..12 {
+        for frame in 2..12 {
+            if frame == 6 {
+                // Long enough after the last movement that nothing flings.
+                recognizer.handle_event_at(
+                    &touch_event(touch, TouchPhase::Ended, 103., 280.),
+                    now + FRAME * 2 + Duration::from_millis(50),
+                );
+            }
             for gesture in recognizer.tick_frame(now + FRAME * frame + Duration::from_millis(30)) {
                 if let RecognizedTouchGesture::Scroll(scroll) = gesture {
                     moved += scroll.delta.pixel_delta(px(16.));
                 }
             }
         }
-        assert_eq!(moved, point(px(0.), px(-20.)));
+        assert_eq!(moved.x, px(0.));
+        assert!((moved.y - px(-20.)).abs() < px(0.001), "moved {moved:?}");
+        assert!(!recognizer.wants_frames());
     }
 
     #[test]
@@ -2940,22 +2972,30 @@ mod tests {
         let mut path = VelocityTracker::default();
         path.push(start, point(px(0.), px(0.)));
         path.push(start + Duration::from_millis(10), point(px(0.), px(100.)));
-        assert_eq!(
-            path.position_at(start + Duration::from_millis(4)),
-            Some(point(px(0.), px(40.)))
+        let vertical_at = |path: &VelocityTracker, time: Instant| {
+            f32::from(path.position_at(time).expect("a position").y)
+        };
+        let close = |left: f32, right: f32| (left - right).abs() < 0.001;
+        assert!(close(
+            vertical_at(&path, start + Duration::from_millis(4)),
+            40.
+        ));
+        assert!(close(
+            vertical_at(&path, start - Duration::from_millis(4)),
+            0.
+        ));
+        assert!(close(
+            vertical_at(&path, start + Duration::from_millis(13)),
+            130.
+        ));
+        assert!(
+            close(vertical_at(&path, start + Duration::from_millis(40)), 150.),
+            "prediction stops at half the samples' interval"
         );
-        assert_eq!(
-            path.position_at(start - Duration::from_millis(4)),
-            Some(point(px(0.), px(0.)))
-        );
-        assert_eq!(
-            path.position_at(start + Duration::from_millis(15)),
-            Some(point(px(0.), px(150.)))
-        );
-        assert_eq!(
-            path.position_at(start + Duration::from_millis(40)),
-            Some(point(px(0.), px(180.))),
-            "prediction stops at RESAMPLE_MAX_PREDICTION"
+        path.push(start + Duration::from_millis(60), point(px(0.), px(600.)));
+        assert!(
+            close(vertical_at(&path, start + Duration::from_millis(80)), 600.),
+            "a touch that paused before its newest sample is not predicted"
         );
     }
 

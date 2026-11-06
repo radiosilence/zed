@@ -141,6 +141,15 @@ define_class!(
     unsafe impl NSObjectProtocol for TextInputView {}
 
     impl TextInputView {
+        // The deferred `place` that `follow_field` asks for. The class's
+        // own selector, not `UITextInput`'s: a protocol block may declare
+        // only the protocol's methods.
+        #[unsafe(method(placeTextInput))]
+        fn place_text_input(&self) {
+            self.ivars().place_pending.set(false);
+            self.place();
+        }
+
         #[unsafe(method(canBecomeFirstResponder))]
         fn can_become_first_responder(&self) -> bool {
             self.ivars().keyboard_desired.get()
@@ -570,11 +579,6 @@ define_class!(
             }
         }
 
-        #[unsafe(method(placeTextInput))]
-        fn place_text_input(&self) {
-            self.ivars().place_pending.set(false);
-            self.place();
-        }
     }
 
 );

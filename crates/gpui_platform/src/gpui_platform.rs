@@ -6,6 +6,11 @@ pub use gpui::Platform;
 #[cfg(target_family = "wasm")]
 pub use gpui_web::WebBackendPreference;
 
+/// The status bar's content colour, which an app that draws its own
+/// appearance sets to match it.
+#[cfg(target_os = "ios")]
+pub use gpui_ios::{StatusBarContentStyle, ios::set_status_bar_style};
+
 use std::rc::Rc;
 
 /// Returns a background executor for the current platform.

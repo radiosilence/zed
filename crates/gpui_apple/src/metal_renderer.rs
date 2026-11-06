@@ -27,7 +27,7 @@ use objc2_metal::{
     MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
-use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
+use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLResource, MTLSize};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::Mutex;
 
@@ -2088,6 +2088,11 @@ fn new_command_encoder_for_texture(
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 fn read_texture_to_image(texture: &ProtocolObject<dyn MTLTexture>) -> Result<RgbaImage> {
+    // The CPU cannot read a private texture; some devices fault if asked to.
+    anyhow::ensure!(
+        texture.storageMode() != MTLStorageMode::Private,
+        "a private texture cannot be read back"
+    );
     let width = texture.width() as u32;
     let height = texture.height() as u32;
     let bytes_per_row = width as usize * 4;
@@ -2981,6 +2986,50 @@ mod tests {
     /// Held by each test that sets the app-wide colour source.
     static COLOUR_SOURCE: Mutex<()> = Mutex::new(());
 
+    /// Presents `plan` into a texture the CPU can read, and reads it back.
+    fn present_to_image(
+        renderer: &MetalRenderer,
+        plan: &PresentPlan,
+        width: usize,
+        height: usize,
+        at: std::time::Instant,
+    ) -> RgbaImage {
+        let descriptor = MTLTextureDescriptor::new();
+        unsafe {
+            descriptor.setWidth(width);
+            descriptor.setHeight(height);
+        }
+        descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let uses_shared_storage = cfg!(target_os = "ios") || renderer.is_apple_gpu;
+        descriptor.setStorageMode(if uses_shared_storage {
+            MTLStorageMode::Shared
+        } else {
+            MTLStorageMode::Managed
+        });
+        let texture = renderer
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .unwrap();
+        let command_buffer = plan.encode_taken(&texture, at).unwrap();
+        if !uses_shared_storage {
+            let blit = command_buffer.blitCommandEncoder().unwrap();
+            blit.synchronizeResource(ProtocolObject::from_ref(&*texture));
+            blit.endEncoding();
+        }
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+        read_texture_to_image(&texture).unwrap()
+    }
+
+    #[test]
+    fn a_private_texture_is_not_read_back() {
+        let renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        let texture = renderer.layer_texture(4, 4).unwrap();
+        assert!(read_texture_to_image(&texture).is_err());
+    }
+
     #[test]
     fn path_intermediate_textures_are_reused_until_resize() -> Result<()> {
         let mut renderer = MetalRenderer::new_headless(Default::default())?;
@@ -3352,13 +3401,7 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
             .expect("a composed frame leaves a plan");
         let at = std::time::Instant::now();
 
-        let present = |plan: &PresentPlan| {
-            let texture = renderer.layer_texture(64, 32).unwrap();
-            let command_buffer = plan.encode_taken(&texture, at).unwrap();
-            command_buffer.commit();
-            command_buffer.waitUntilCompleted();
-            read_texture_to_image(&texture).unwrap()
-        };
+        let present = |plan: &PresentPlan| present_to_image(&renderer, plan, 64, 32, at);
         assert_eq!(present(&plan).as_raw(), composed.as_raw());
 
         uniforms.set(0, 1.0);
@@ -3451,11 +3494,9 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         let plan = renderer.present_plan().expect("a plan");
         let present = |at| {
             assert!(plan.holds(16, 16, at));
-            let texture = renderer.layer_texture(16, 16).unwrap();
-            let command_buffer = plan.encode_taken(&texture, at).unwrap();
-            command_buffer.commit();
-            command_buffer.waitUntilCompleted();
-            read_texture_to_image(&texture).unwrap().get_pixel(8, 8).0
+            present_to_image(&renderer, &plan, 16, 16, at)
+                .get_pixel(8, 8)
+                .0
         };
         let before = present(turn - std::time::Duration::from_secs(1));
         assert!(before[0] > 200 && before[1] < 50, "red before the turn");

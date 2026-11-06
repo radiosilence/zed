@@ -5255,6 +5255,37 @@ impl Window {
         Ok(())
     }
 
+    /// Paints a blur of what was painted under `bounds` before it, clipped
+    /// to `bounds`, `corner_radii` and the content mask: a frosted backdrop,
+    /// painted before an element's translucent background. `radius` is the
+    /// blur's standard deviation, as CSS's `backdrop-filter: blur()` takes
+    /// it. The blur reads past `bounds` by three times `radius`.
+    ///
+    /// Only the Metal renderer (macOS and iOS) draws it; other renderers draw
+    /// nothing in its place, leaving the background painted over it alone.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        radius: Pixels,
+    ) {
+        self.invalidator.debug_assert_paint();
+        if radius <= Pixels::ZERO {
+            return;
+        }
+        let blur = crate::BackdropBlur {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(self.scale_factor()),
+            radius: radius.scale(self.scale_factor()),
+            opacity: self.element_opacity(),
+        };
+        self.next_frame.scene.insert_primitive(blur);
+    }
+
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
     /// see [`fill`], [`outline`], and [`quad`] to construct this type.

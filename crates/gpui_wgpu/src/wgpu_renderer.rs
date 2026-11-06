@@ -1901,6 +1901,9 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    // Not drawn here: the background painted over a backdrop
+                    // blur is drawn alone.
+                    PrimitiveBatch::BackdropBlurs(_) => {}
                     // None on the WebGL path.
                     PrimitiveBatch::Shaders {
                         program,

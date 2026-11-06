@@ -301,6 +301,10 @@ pub struct Style {
     /// The opacity of this element
     pub opacity: Option<f32>,
 
+    /// The standard deviation of the blur drawn of what is behind this
+    /// element, under its background. Drawn by the Metal renderer only.
+    pub backdrop_blur: Option<Pixels>,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -708,6 +712,10 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
+        if let Some(radius) = self.backdrop_blur {
+            window.paint_backdrop_blur(bounds, corner_radii, radius);
+        }
+
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
         let background_color = self.background.as_ref().and_then(Fill::color);
@@ -809,6 +817,7 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            backdrop_blur: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

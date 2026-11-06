@@ -640,7 +640,7 @@ impl Window {
         let context = &self.rendered_frame.retained.records[previous].context;
         !crate::fast::layers::paint::inside_layer(self)
             && context.bounds == bounds
-            && context.opacity == self.element_opacity
+            && context.opacity.to_bits() == self.element_opacity.to_bits()
             && context.content_mask == self.content_mask()
             && context.text_style == self.text_style()
             && context.inert == self.is_inert()
@@ -1967,6 +1967,10 @@ impl HitboxId {
             return true;
         }
         if crate::fast::layers::hover_freeze::hides_hover(window) {
+            return false;
+        }
+        // A finger hovers only while it is down.
+        if window.last_input_was_touch() && window.touch_press.is_none() {
             return false;
         }
         self.hit_test(window)

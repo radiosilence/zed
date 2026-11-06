@@ -3509,8 +3509,6 @@ impl Interactivity {
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
             let line_height = window.line_height();
-            let fast_scroll_max =
-                crate::fast::layers::wheel::scroll_max(self, hitbox.bounds, style, window);
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             let scroll_max = self.scroll_max.clone();
@@ -3556,7 +3554,7 @@ impl Interactivity {
                     if !crate::fast::layers::wheel::moves(
                         old_scroll_offset,
                         point(delta_x, delta_y),
-                        fast_scroll_max,
+                        scroll_max.get(),
                     ) {
                         return;
                     }

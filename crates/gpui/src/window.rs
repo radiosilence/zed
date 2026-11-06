@@ -796,17 +796,7 @@ impl HitboxId {
         if let Some(hovered) = crate::fast::retained::note_hover_read(window, self) {
             return hovered;
         }
-        // If this hitbox has captured the pointer, it's always considered hovered
-        if window.captured_hitbox == Some(self) {
-            return true;
-        }
-        if crate::fast::layers::hover_freeze::hides_hover(window) {
-            return false;
-        }
-        if window.last_input_was_touch() && window.touch_press.is_none() {
-            return false;
-        }
-        self.hit_test(window)
+        self.hovered_now(window)
     }
 
     /// Checks if the hitbox with this ID is currently hovered, regardless of the last
@@ -1342,7 +1332,7 @@ pub struct Window {
     /// hover: under touch, only what is under such a touch is hovered, so a
     /// control shows its pressed look while held and nothing stays hovered
     /// once the finger lifts, scrolls or holds.
-    touch_press: Option<Point<Pixels>>,
+    pub(crate) touch_press: Option<Point<Pixels>>,
     /// The touch drag claimed in progress is carried as a pointer drag
     /// (`carry_touch_drag_as_pointer`).
     touch_drag_pointer: bool,
@@ -11566,14 +11556,15 @@ mod tests {
             .expect("update root");
         assert_eq!(renders(cx), (1, 1), "the parent is reused whole");
 
-        // One leaf changes, so the parent renders again. The other leaf's ranges
-        // index the first frame, so it renders again rather than reusing them.
+        // One leaf changes, so the parent renders again. The other leaf is
+        // reused from the frame it was last drawn in, though the parent carried
+        // it through a frame without drawing it.
         leaves[0].update(cx, |_, cx| cx.notify());
-        assert_eq!(renders(cx), (2, 2));
+        assert_eq!(renders(cx), (2, 1));
 
-        // In the next frame the untouched leaf is reused.
+        // And again in the next frame.
         leaves[0].update(cx, |_, cx| cx.notify());
-        assert_eq!(renders(cx), (3, 2));
+        assert_eq!(renders(cx), (3, 1));
     }
 
     #[gpui::test]

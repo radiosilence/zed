@@ -32,10 +32,7 @@
 use collections::FxHashMap;
 
 use crate::fast::layers::COMPILED;
-use crate::{
-    App, Bounds, EntityId, Interactivity, IsZero, Pixels, PlatformInput, Point, Style, Window, px,
-    size,
-};
+use crate::{App, EntityId, IsZero, Pixels, PlatformInput, Point, Window, px};
 
 /// Where the counts stood when the wheel event being dispatched began to be.
 #[derive(Default)]
@@ -85,26 +82,6 @@ pub(crate) fn end_dispatch(window: &mut Window, cx: &App) {
             scroll_notifies.insert(view, scrolls + notified - scrolled);
         }
     }
-}
-
-/// How far the content of `interactivity`'s scroll container at `bounds`
-/// scrolls on each axis: the bound `Interactivity::clamp_scroll_position`
-/// clamps its offset to, computed the same way.
-pub(crate) fn scroll_max(
-    interactivity: &Interactivity,
-    bounds: Bounds<Pixels>,
-    style: &Style,
-    window: &Window,
-) -> Point<Pixels> {
-    let padding = style
-        .padding
-        .to_pixels(bounds.size.into(), window.rem_size())
-        .map(|edge| window.pixel_snap(*edge));
-    let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
-    let padded_content_size = interactivity.content_size + padding_size;
-    Point::from(padded_content_size - bounds.size)
-        .map(|pixels| (pixels * 100.).round() / 100.)
-        .max(&Default::default())
 }
 
 /// Whether a wheel moving a scroll container's `offset` by `delta` moves its

@@ -185,9 +185,6 @@ mod any_view {
             .view_type_names
             .insert(view.entity_id(), std::any::type_name::<V>());
         crate::fast::dependencies::render_next(&mut cx.entities, view.entity_id());
-        // Rendered now, it shows whatever a notify earlier in this draw
-        // changed: the next frame need not draw it for that.
-        cx.notified_while_drawing.remove(&view.entity_id());
         view.update(cx, |view, cx| view.render(window, cx).into_any_element())
     }
 }
@@ -324,13 +321,23 @@ impl<V: View> IntoElement for ViewElement<V> {
 #[cfg(not(gpui_hot_reload))]
 #[inline]
 pub(crate) fn render_view<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
+    settle_notified(&view, cx);
     view.render(window, cx).into_any_element()
+}
+
+/// Rendered now, the view shows whatever a notify earlier in this draw
+/// changed: the next frame need not draw it for that.
+fn settle_notified<V: View>(view: &V, cx: &mut App) {
+    if let Some(id) = view.entity_id() {
+        cx.notified_while_drawing.remove(&id);
+    }
 }
 
 /// Every view and component render passes through this hot-patchable boundary, so the
 /// patched code for that render and everything it calls runs on the next frame.
 #[cfg(gpui_hot_reload)]
 pub(crate) fn render_view<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
+    settle_notified(&view, cx);
     #[inline(never)]
     fn render_view_impl<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
         view.render(window, cx).into_any_element()

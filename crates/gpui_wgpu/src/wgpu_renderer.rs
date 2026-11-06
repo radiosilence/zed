@@ -1750,9 +1750,7 @@ impl WgpuRendererCore {
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         // The recorded frame draws no shader, blur, layer group or dynamic
-        // colour, so a scene holding one is drawn here. It is not used yet:
-        // it binds its own groups against the layouts this renderer extends
-        // for those, which nothing has run it against.
+        // colour, so a scene holding one is drawn here.
         if RECORDED_FRAMES
             && scene.shaders.is_empty()
             && scene.backdrop_blurs.is_empty()
@@ -2052,6 +2050,29 @@ impl WgpuRendererCore {
         }
 
         for texture_id in texture_ids {
+            // A dynamic texture is sampled from its own view, never the atlas;
+            // one this renderer's context does not hold draws nothing.
+            if let Some(id) = gpui::DynamicTextureId::from_atlas_texture_id(texture_id) {
+                match self.fast_dynamic_textures.view(id) {
+                    Some(view) => {
+                        let bind_group =
+                            self.create_texture_bind_group("dynamic_texture_bind_group", &view);
+                        self.resources_mut().atlas_texture_bind_groups.insert(
+                            texture_id,
+                            CachedTextureBindGroup {
+                                texture_generation: 0,
+                                bind_group,
+                            },
+                        );
+                    }
+                    None => {
+                        self.resources_mut()
+                            .atlas_texture_bind_groups
+                            .remove(&texture_id);
+                    }
+                }
+                continue;
+            }
             let Some(texture_info) = self.atlas.get_texture_info(texture_id) else {
                 self.resources_mut()
                     .atlas_texture_bind_groups

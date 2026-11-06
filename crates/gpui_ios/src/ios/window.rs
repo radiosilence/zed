@@ -543,6 +543,10 @@ impl IosWindow {
                 UIRectEdge::Left
             },
         );
+        // GPUI recognizes the touches itself: a release held back while
+        // this recognizer decides would read as the finger having stopped,
+        // and a fling would not coast.
+        back_recognizer.setDelaysTouchesEnded(false);
         back_recognizer.setDelegate(Some(ProtocolObject::from_ref(&*view)));
         view.addGestureRecognizer(&back_recognizer);
 

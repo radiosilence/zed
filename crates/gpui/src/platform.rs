@@ -584,6 +584,9 @@ pub trait Platform: 'static {
 
     fn should_auto_hide_scrollbars(&self) -> bool;
 
+    /// Plays `feedback` on the device's haptic engine, where it has one.
+    fn perform_haptic(&self, _feedback: HapticFeedback) {}
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn write_to_clipboard(&self, item: ClipboardItem);
 
@@ -3032,6 +3035,20 @@ impl From<&str> for PromptButton {
             _ => PromptButton::Other(SharedString::from(value.to_owned())),
         }
     }
+}
+
+/// A haptic the platform plays for something the person did, after the
+/// kinds iOS offers.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum HapticFeedback {
+    /// A value or a choice changed: a toggle, a picker's step.
+    Selection,
+    /// A small physical event: a swipe passing its threshold.
+    Light,
+    /// A moderate one: a held press opening a menu.
+    Medium,
+    /// Something finished well.
+    Success,
 }
 
 /// The style of the cursor (pointer)

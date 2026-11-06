@@ -2071,6 +2071,12 @@ impl App {
         self.platform.should_auto_hide_scrollbars()
     }
 
+    /// Plays `feedback` on the device's haptic engine; nothing where there
+    /// is none.
+    pub fn perform_haptic(&self, feedback: crate::HapticFeedback) {
+        self.platform.perform_haptic(feedback)
+    }
+
     /// Restarts the application.
     pub fn restart(&mut self) {
         self.restart_observers

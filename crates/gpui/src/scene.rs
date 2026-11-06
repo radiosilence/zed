@@ -56,6 +56,7 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub shaders: Vec<crate::PaintShader>,
+    pub backdrop_blurs: Vec<BackdropBlur>,
     /// Which drawn frame this scene holds, so a renderer can tell a
     /// re-present of the same frame from a new one.
     pub generation: u64,
@@ -86,12 +87,19 @@ pub struct Scene {
 /// `layers[1]`, and so on, `layers` one longer than `groups`. Each layer
 /// holds the scene's other primitives drawn between those shaders, with
 /// their orders, ready for a renderer to draw into a texture of its own.
+///
+/// A backdrop blur is a group of its own, with no shaders: what is composed
+/// by then is blurred under it at each present, so it follows the shaders
+/// drawn before it.
 #[derive(Default)]
 pub struct ShaderLayers {
     /// The primitives drawn before, between and after the groups.
     pub layers: Vec<Scene>,
     /// Each group's shaders, as a range of `Scene::shaders`.
     pub groups: Vec<Range<usize>>,
+    /// The backdrop blur each group is, as an index into
+    /// `Scene::backdrop_blurs`; `None` for a group of shaders.
+    pub blurs: Vec<Option<usize>>,
 }
 
 #[expect(missing_docs)]
@@ -109,6 +117,7 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.shaders.clear();
+        self.backdrop_blurs.clear();
         self.layer_groups.clear();
         self.layer_group_frames.clear();
         self.group_stack.clear();
@@ -230,6 +239,10 @@ impl Scene {
             by(&mut shader.bounds);
             by(&mut shader.content_mask.bounds);
         }
+        for blur in &mut self.backdrop_blurs {
+            by(&mut blur.bounds);
+            by(&mut blur.content_mask.bounds);
+        }
         for path in &mut self.paths {
             by(&mut path.bounds);
             by(&mut path.content_mask.bounds);
@@ -289,11 +302,17 @@ impl Scene {
             return;
         }
 
+        // A backdrop blur reads past its bounds, so it is drawn after
+        // whatever was painted before it under any of what it reads.
+        let ordered_bounds = match &primitive {
+            Primitive::BackdropBlur(blur) => blur.backdrop(),
+            _ => clipped_bounds,
+        };
         let order = self
             .layer_stack
             .last()
             .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            .unwrap_or_else(|| self.primitive_bounds.insert(ordered_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -331,6 +350,10 @@ impl Scene {
             Primitive::Shader(shader) => {
                 shader.order = order;
                 self.shaders.push(shader.clone());
+            }
+            Primitive::BackdropBlur(blur) => {
+                blur.order = order;
+                self.backdrop_blurs.push(*blur);
             }
         }
         self.paint_operations
@@ -407,6 +430,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.backdrop_blurs.sort_by_key(|blur| blur.order);
         // Kept together by program and image within an order.
         self.shaders.sort_by_key(|shader| {
             (
@@ -447,6 +471,7 @@ impl Scene {
             && self.polychrome_sprites.is_empty()
             && self.surfaces.is_empty()
             && self.shaders.is_empty()
+            && self.backdrop_blurs.is_empty()
     }
 
     // Splits the scene where its shaders are drawn.
@@ -469,22 +494,58 @@ impl Scene {
         let visible = |bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
             bounds.intersect(&mask.bounds)
         };
-        let shaders: Vec<_> = self
+        // What is drawn at each present, in draw order: the shaders, and the
+        // backdrop blurs, which read what is composed under them. A blur is
+        // drawn before what shares its order and a shader after it, as the
+        // batches draw them. Each holds whether it is a shader, and its
+        // shader index or blur index.
+        let mut presented: Vec<(DrawOrder, bool, usize, Bounds<ScaledPixels>)> = self
             .shaders
             .iter()
-            .map(|s| (s.order, visible(&s.bounds, &s.content_mask)))
+            .enumerate()
+            .map(|(i, s)| (s.order, true, i, visible(&s.bounds, &s.content_mask)))
+            .chain(
+                self.backdrop_blurs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, blur)| (blur.order, false, i, blur.backdrop())),
+            )
             .collect();
+        // Stable, so the shaders keep their place in `Scene::shaders`.
+        presented.sort_by_key(|(order, is_shader, _, _)| (*order, *is_shader));
         let mut groups = Vec::new();
-        let mut group_of = Vec::with_capacity(shaders.len());
-        let mut start = 0;
-        for (i, (_, bounds)) in shaders.iter().enumerate() {
-            if shaders[start..i].iter().any(|(_, b)| b.intersects(bounds)) {
-                groups.push(start..i);
-                start = i;
+        let mut blurs = Vec::new();
+        let mut group_of = Vec::with_capacity(presented.len());
+        // The open group of shaders: its first shader and what it covers.
+        let mut open: Option<usize> = None;
+        let mut members: Vec<Bounds<ScaledPixels>> = Vec::new();
+        let mut next_shader = 0;
+        for (_, is_shader, i, bounds) in &presented {
+            if *is_shader {
+                if open.is_some() && members.iter().any(|b| b.intersects(bounds)) {
+                    groups.push(open.take().unwrap_or(*i)..*i);
+                    blurs.push(None);
+                    members.clear();
+                }
+                open.get_or_insert(*i);
+                members.push(*bounds);
+                group_of.push(groups.len());
+                next_shader = i + 1;
+            } else {
+                if let Some(start) = open.take() {
+                    groups.push(start..next_shader);
+                    blurs.push(None);
+                    members.clear();
+                }
+                group_of.push(groups.len());
+                groups.push(next_shader..next_shader);
+                blurs.push(Some(*i));
             }
-            group_of.push(groups.len());
         }
-        groups.push(start..shaders.len());
+        if let Some(start) = open {
+            groups.push(start..next_shader);
+            blurs.push(None);
+        }
 
         // Each other primitive in the order the renderer draws them: by
         // order, then kind, then place in its list.
@@ -508,15 +569,15 @@ impl Scene {
         );
         drawn.sort_unstable_by_key(|(order, kind, i, _)| (*order, *kind, *i));
 
-        // From the shaders alone: the layer after the last group holding a
-        // shader drawn before it that it overlaps, and the first group
-        // holding one it overlaps that is drawn after it (a shader is drawn
-        // after what shares its order).
+        // From the shaders and blurs alone: the layer after the last group
+        // holding one drawn before it that it overlaps, and the first group
+        // holding one it overlaps that is drawn after it.
         let by_shaders = |order: DrawOrder, bounds: &Bounds<ScaledPixels>| {
             let (mut after, mut before) = (0, usize::MAX);
-            for (k, (o, s)) in shaders.iter().enumerate() {
+            for (k, (o, is_shader, _, s)) in presented.iter().enumerate() {
                 if s.intersects(bounds) {
-                    if *o < order {
+                    let drawn_before = if *is_shader { *o < order } else { *o <= order };
+                    if drawn_before {
                         after = after.max(group_of[k] + 1);
                     } else {
                         before = before.min(group_of[k]);
@@ -533,20 +594,22 @@ impl Scene {
         // another, which is the little drawn over a shader: those are kept.
         let floor = placed.iter().map(|(after, _)| *after).min().unwrap_or(0);
         let mut raised: Vec<(Bounds<ScaledPixels>, usize)> = Vec::new();
-        let mut layers_by_kind: Vec<Vec<usize>> = vec![Vec::new(); 8];
-        for kind in 0..8 {
-            let len = match kind {
-                0 => self.shadows.len(),
-                1 => self.quads.len(),
-                2 => self.paths.len(),
-                3 => self.underlines.len(),
-                4 => self.monochrome_sprites.len(),
-                5 => self.subpixel_sprites.len(),
-                6 => self.polychrome_sprites.len(),
-                _ => self.surfaces.len(),
-            };
-            layers_by_kind[kind] = vec![0; len];
+        let mut layers_by_kind: Vec<Vec<usize>> = vec![Vec::new(); PrimitiveKind::COUNT];
+        macro_rules! size_layers {
+            ($($list:ident => $kind:ident),*) => {$(
+                layers_by_kind[PrimitiveKind::$kind as usize] = vec![0; self.$list.len()];
+            )*};
         }
+        size_layers!(
+            shadows => Shadow,
+            quads => Quad,
+            paths => Path,
+            underlines => Underline,
+            monochrome_sprites => MonochromeSprite,
+            subpixel_sprites => SubpixelSprite,
+            polychrome_sprites => PolychromeSprite,
+            surfaces => Surface
+        );
         for ((_, kind, i, bounds), (after, before)) in drawn.iter().zip(&placed) {
             let mut layer = *after;
             for (b, l) in &raised {
@@ -593,7 +656,11 @@ impl Scene {
         for layer in &mut layers {
             layer.dynamic_colors = layer.collect_dynamic_colors();
         }
-        Some(ShaderLayers { layers, groups })
+        Some(ShaderLayers {
+            layers,
+            groups,
+            blurs,
+        })
     }
 
     #[cfg_attr(
@@ -623,6 +690,8 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
             shaders_start: 0,
             shaders_iter: self.shaders.iter().peekable(),
+            backdrop_blurs_start: 0,
+            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
         }
     }
 }
@@ -636,6 +705,8 @@ impl Scene {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
+    /// First, so a blur reads none of what shares its order.
+    BackdropBlur,
     Shadow,
     #[default]
     Quad,
@@ -646,6 +717,10 @@ pub(crate) enum PrimitiveKind {
     PolychromeSprite,
     Surface,
     Shader,
+}
+
+impl PrimitiveKind {
+    const COUNT: usize = PrimitiveKind::Shader as usize + 1;
 }
 
 pub(crate) enum PaintOperation {
@@ -670,6 +745,7 @@ pub enum Primitive {
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
     Shader(crate::PaintShader),
+    BackdropBlur(BackdropBlur),
 }
 
 #[expect(missing_docs)]
@@ -685,6 +761,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::Shader(shader) => &shader.bounds,
+            Primitive::BackdropBlur(blur) => &blur.bounds,
         }
     }
 
@@ -699,6 +776,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::Shader(shader) => &shader.content_mask,
+            Primitive::BackdropBlur(blur) => &blur.content_mask,
         }
     }
 }
@@ -729,6 +807,8 @@ struct BatchIterator<'a> {
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     shaders_start: usize,
     shaders_iter: Peekable<slice::Iter<'a, crate::PaintShader>>,
+    backdrop_blurs_start: usize,
+    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -766,6 +846,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.shaders_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shader,
             ),
+            (
+                self.backdrop_blurs_iter.peek().map(|b| b.order),
+                PrimitiveKind::BackdropBlur,
+            ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
 
@@ -778,6 +862,20 @@ impl<'a> Iterator for BatchIterator<'a> {
         };
 
         match batch_kind {
+            PrimitiveKind::BackdropBlur => {
+                let start = self.backdrop_blurs_start;
+                let mut end = start + 1;
+                self.backdrop_blurs_iter.next();
+                while self
+                    .backdrop_blurs_iter
+                    .next_if(|blur| (blur.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    end += 1;
+                }
+                self.backdrop_blurs_start = end;
+                Some(PrimitiveBatch::BackdropBlurs(start..end))
+            }
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
@@ -983,6 +1081,8 @@ pub enum PrimitiveBatch {
         group: Option<usize>,
         range: Range<usize>,
     },
+    /// Backdrop blurs, each drawn in turn over what was drawn before it.
+    BackdropBlurs(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -1018,7 +1118,51 @@ impl PrimitiveBatch {
             Self::Shaders { program, range, .. } => {
                 format!("shaders ({}) of {}", range.len(), program.name)
             }
+            Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
         }
+    }
+}
+
+/// A region drawn as a blur of what was drawn under it before it, clipped
+/// to its bounds, its rounded corners and its content mask: a frosted
+/// backdrop for a bar or panel, drawn under the element's own background.
+///
+/// The blur reads past its bounds by three times its radius, so content
+/// next to the region blurs into it. Inside a layer group it reads only what
+/// the group painted. Renderers without backdrop blurs draw nothing for it.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct BackdropBlur {
+    /// Where the blur is drawn among the scene's primitives.
+    pub order: DrawOrder,
+    /// The region drawn.
+    pub bounds: Bounds<ScaledPixels>,
+    /// What the region is clipped to.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// The region's corner radii.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// The blur's standard deviation, as CSS's `blur()` takes it.
+    pub radius: ScaledPixels,
+    /// How much of the blur is drawn over the backdrop, from 0 to 1.
+    pub opacity: f32,
+}
+
+impl BackdropBlur {
+    /// How far past its bounds the blur reads.
+    pub fn reach(&self) -> ScaledPixels {
+        ScaledPixels((self.radius.0.max(0.) * 3.0).ceil())
+    }
+
+    /// The region the blur reads: its visible part and its reach around it.
+    pub fn backdrop(&self) -> Bounds<ScaledPixels> {
+        self.bounds
+            .intersect(&self.content_mask.bounds)
+            .dilate(self.reach())
+    }
+}
+
+impl From<BackdropBlur> for Primitive {
+    fn from(blur: BackdropBlur) -> Self {
+        Primitive::BackdropBlur(blur)
     }
 }
 

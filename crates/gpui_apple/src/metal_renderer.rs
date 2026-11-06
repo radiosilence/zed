@@ -160,6 +160,12 @@ pub struct MetalRenderer {
     dynamic_colors: Vec<f32>,
     dynamic_changed: gpui::DynamicColorSet,
     compose_pipelines: Option<ComposePipelines>,
+    /// The backdrop blur's programs, compiled when a blur is first drawn,
+    /// and the textures every blur is reduced and blurred in, grown to the
+    /// largest a frame has needed. Blurs drawn one after another share them:
+    /// one queue runs their passes in order.
+    blur_pipelines: Option<BlurPipelines>,
+    blur_scratch: Option<BlurScratch>,
     /// The last frame drawn with shaders, as another thread can present it
     /// again; `None` after a frame without, or while not kept.
     present_plan: Option<Arc<PresentPlan>>,
@@ -236,10 +242,8 @@ impl MetalRenderer {
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.setOpaque(!transparent);
         layer.setMaximumDrawableCount(3);
-        // Allow texture reading for visual tests and UI automation screenshots
-        // (captures without ScreenCaptureKit). Only debug builds pay the
-        // presentation cost, even when `test-support` is compiled in.
-        #[cfg(all(feature = "test-support", debug_assertions))]
+        // A backdrop blur samples what the frame has drawn so far in its
+        // drawable, as visual tests and UI automation screenshots read it.
         layer.setFramebufferOnly(false);
         layer.setAllowsNextDrawableTimeout(false);
         layer.setNeedsDisplayOnBoundsChange(true);
@@ -463,6 +467,8 @@ impl MetalRenderer {
             dynamic_colors: Vec::new(),
             dynamic_changed: Default::default(),
             compose_pipelines: None,
+            blur_pipelines: None,
+            blur_scratch: None,
             present_plan: None,
             keeps_present_plan: false,
             blank_texture: None,
@@ -713,6 +719,7 @@ impl MetalRenderer {
         if self.path_intermediate_texture.is_none() {
             self.update_path_intermediate_textures(viewport_size)?;
         }
+        self.prepare_backdrop_blurs(&scene.backdrop_blurs, viewport_size);
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
@@ -1016,6 +1023,28 @@ impl MetalRenderer {
                         return Err(error);
                     }
                 }
+                PrimitiveBatch::BackdropBlurs(range) => {
+                    let (Some(pipelines), Some(scratch)) =
+                        (&self.blur_pipelines, &self.blur_scratch)
+                    else {
+                        continue;
+                    };
+                    for blur in &scene.backdrop_blurs[range] {
+                        let Some(geometry) = BlurGeometry::new(blur, viewport_size) else {
+                            continue;
+                        };
+                        // The passes read what this encoder drew.
+                        command_encoder.endEncoding();
+                        blur_backdrop(&command_buffer, pipelines, scratch, texture, &geometry)?;
+                        command_encoder = new_command_encoder_for_texture(
+                            &command_buffer,
+                            texture,
+                            viewport_size,
+                            None,
+                        )?;
+                        compose_backdrop(&command_encoder, pipelines, scratch, &geometry);
+                    }
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -1023,6 +1052,64 @@ impl MetalRenderer {
         command_encoder.endEncoding();
 
         Ok(command_buffer)
+    }
+
+    /// Compiles the blur's programs and grows the shared textures so each
+    /// of `blurs` fits, the first time they are needed. A failure is logged
+    /// and leaves the blurs undrawn.
+    fn prepare_backdrop_blurs(
+        &mut self,
+        blurs: &[gpui::BackdropBlur],
+        viewport: Size<DevicePixels>,
+    ) {
+        let mut needed = (0, 0);
+        for blur in blurs {
+            if let Some(geometry) = BlurGeometry::new(blur, viewport) {
+                needed.0 = needed.0.max(geometry.extent.0);
+                needed.1 = needed.1.max(geometry.extent.1);
+            }
+        }
+        if needed == (0, 0) {
+            return;
+        }
+        if self.blur_pipelines.is_none() {
+            match BlurPipelines::new(&self.device) {
+                Ok(pipelines) => self.blur_pipelines = Some(pipelines),
+                Err(error) => {
+                    log::error!("backdrop blur: {error:#}");
+                    return;
+                }
+            }
+        }
+        let fits = self
+            .blur_scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.width >= needed.0 && scratch.height >= needed.1);
+        if fits {
+            return;
+        }
+        // Rounded up, so a region growing by a pixel at a time does not
+        // allocate at each frame.
+        let (current_width, current_height) = self
+            .blur_scratch
+            .as_ref()
+            .map_or((0, 0), |scratch| (scratch.width, scratch.height));
+        let width = needed.0.max(current_width).next_multiple_of(64);
+        let height = needed.1.max(current_height).next_multiple_of(64);
+        match (
+            self.layer_texture(width, height),
+            self.layer_texture(width, height),
+        ) {
+            (Ok(a), Ok(b)) => {
+                self.blur_scratch = Some(BlurScratch {
+                    a,
+                    b,
+                    width,
+                    height,
+                })
+            }
+            (Err(error), _) | (_, Err(error)) => log::error!("backdrop blur: {error:#}"),
+        }
     }
 
     fn draw_paths_to_intermediate(
@@ -1316,6 +1403,7 @@ impl MetalRenderer {
                 }
             }
         }
+        self.prepare_backdrop_blurs(&scene.backdrop_blurs, viewport_size);
         let keep = self.keeps_present_plan;
         let present_plan = self.make_present_plan(scene, viewport_size, keep)?;
         let command_buffer = present_plan.encode(&scene.shaders, texture, at)?;
@@ -1375,8 +1463,15 @@ impl MetalRenderer {
                 }
                 start = end;
             }
+            let blur = plan
+                .blurs
+                .get(k)
+                .copied()
+                .flatten()
+                .and_then(|blur| BlurGeometry::new(&scene.backdrop_blurs[blur], viewport_size));
             groups.push(PlanGroup {
                 runs,
+                blur,
                 over: self.shader_layers.layers.get(k + 1).cloned().flatten(),
             });
         }
@@ -1396,6 +1491,7 @@ impl MetalRenderer {
             pool: self.instance_buffer_pool.clone(),
             pipelines,
             unit_vertices: self.unit_vertices.clone(),
+            blur: self.blur_pipelines.clone().zip(self.blur_scratch.clone()),
             first: self.shader_layers.layers.first().cloned().flatten(),
             groups,
             shaders: if keep {
@@ -2294,6 +2390,8 @@ pub struct PresentPlan {
     pool: Arc<Mutex<InstanceBufferPool>>,
     pipelines: ComposePipelines,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// What the frame's backdrop blurs are drawn with, if it has any.
+    blur: Option<(BlurPipelines, BlurScratch)>,
     first: Option<Texture>,
     groups: Vec<PlanGroup>,
     shaders: Vec<gpui::PaintShader>,
@@ -2318,6 +2416,8 @@ unsafe impl Sync for PresentPlan {}
 
 struct PlanGroup {
     runs: Vec<ShaderRun>,
+    /// The backdrop blur the group is, drawn over what is composed so far.
+    blur: Option<BlurGeometry>,
     /// The layer drawn over the group's shaders.
     over: Option<Texture>,
 }
@@ -2451,7 +2551,7 @@ impl PresentPlan {
                 alpha,
             });
         }
-        let encoder = command_buffer
+        let mut encoder = command_buffer
             .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
             .context("creating render command encoder")?;
         encoder.setViewport(MTLViewport {
@@ -2462,7 +2562,9 @@ impl PresentPlan {
             znear: 0.0,
             zfar: 1.0,
         });
-        let layer = |pipeline: &Pipeline, texture: &Texture| {
+        let layer = |encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+                     pipeline: &Pipeline,
+                     texture: &Texture| {
             encoder.setRenderPipelineState(pipeline);
             // SAFETY: the compose program reads texture 0 texel for texel and
             // draws one triangle covering the target.
@@ -2472,10 +2574,18 @@ impl PresentPlan {
             }
         };
         if let Some(first) = &self.first {
-            layer(&self.pipelines.copy, first);
+            layer(&encoder, &self.pipelines.copy, first);
         }
         let viewport = [width as f32, height as f32];
         for group in &self.groups {
+            if let (Some(geometry), Some((pipelines, scratch))) = (&group.blur, &self.blur) {
+                // The passes read what is composed so far.
+                encoder.endEncoding();
+                blur_backdrop(&command_buffer, pipelines, scratch, texture, geometry)?;
+                encoder =
+                    new_command_encoder_for_texture(&command_buffer, texture, self.viewport, None)?;
+                compose_backdrop(&encoder, pipelines, scratch, geometry);
+            }
             for run in &group.runs {
                 encoder.setRenderPipelineState(&run.pipeline);
                 // SAFETY: six unit vertices and the run's range match the
@@ -2508,7 +2618,7 @@ impl PresentPlan {
                 }
             }
             if let Some(over) = &group.over {
-                layer(&self.pipelines.over, over);
+                layer(&encoder, &self.pipelines.over, over);
             }
         }
         encoder.endEncoding();
@@ -2637,6 +2747,373 @@ impl ComposePipelines {
             copy: pipeline(false)?,
             over: pipeline(true)?,
         })
+    }
+}
+
+/// The backdrop blur's programs. The backdrop is reduced by `factor` with a
+/// box filter, blurred there by two one-dimensional Gaussian passes, and
+/// drawn back filtered over the blur's rounded bounds, so the cost follows
+/// the region's area over the factor's square rather than the radius.
+const BLUR_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Each in the target's pixels unless said otherwise.
+struct BlurParams {
+    float4 region;   // the backdrop read: origin, size
+    float4 bounds;   // the blur's bounds
+    float4 visible;  // its bounds within the content mask
+    float4 radii;    // top left, top right, bottom right, bottom left
+    float4 sizes;    // the target's size, then the scratch's in texels
+    float4 blur;     // the scratch used, in texels; factor; sigma in texels
+    float4 pass;     // the pass's direction; opacity; kernel half width
+};
+
+constexpr sampler pixels(filter::linear, address::clamp_to_edge, coord::pixel);
+
+vertex float4 blur_fill_vertex(uint id [[vertex_id]]) {
+    float2 p = float2((id << 1) & 2, id & 2);
+    return float4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+// The backdrop reduced by the factor: each texel the mean of a factor by
+// factor box, read two by two through the filter.
+fragment float4 blur_down(
+    float4 position [[position]],
+    constant BlurParams &p [[buffer(0)]],
+    texture2d<float> source [[texture(0)]]
+) {
+    float factor = p.blur.z;
+    float2 base = p.region.xy + floor(position.xy) * factor;
+    float2 lo = p.region.xy + 0.5;
+    float2 hi = p.region.xy + p.region.zw - 0.5;
+    int n = max(int(factor) / 2, 1);
+    float step = factor / float(n);
+    float4 sum = float4(0.0);
+    for (int y = 0; y < n; y++) {
+        for (int x = 0; x < n; x++) {
+            float2 at = base + (float2(x, y) + 0.5) * step;
+            sum += source.sample(pixels, clamp(at, lo, hi));
+        }
+    }
+    return sum / float(n * n);
+}
+
+// One direction of the Gaussian, two taps at a time through the filter.
+fragment float4 blur_pass(
+    float4 position [[position]],
+    constant BlurParams &p [[buffer(0)]],
+    texture2d<float> source [[texture(0)]]
+) {
+    float2 direction = p.pass.xy;
+    float sigma = p.blur.w;
+    int half_width = int(p.pass.w);
+    float2 lo = float2(0.5);
+    float2 hi = p.blur.xy - 0.5;
+    float k = -0.5 / (sigma * sigma);
+    float4 sum = source.sample(pixels, clamp(position.xy, lo, hi));
+    float total = 1.0;
+    for (int i = 1; i <= half_width; i += 2) {
+        float w0 = exp(k * float(i * i));
+        float w1 = exp(k * float((i + 1) * (i + 1)));
+        float w = w0 + w1;
+        float offset = (float(i) * w0 + float(i + 1) * w1) / w;
+        float2 d = direction * offset;
+        sum += (source.sample(pixels, clamp(position.xy + d, lo, hi))
+            + source.sample(pixels, clamp(position.xy - d, lo, hi))) * w;
+        total += 2.0 * w;
+    }
+    return sum / total;
+}
+
+vertex float4 blur_compose_vertex(
+    uint id [[vertex_id]],
+    constant BlurParams &p [[buffer(0)]]
+) {
+    float2 unit = float2(id == 1 || id == 4 || id == 5 ? 1.0 : 0.0, id == 2 || id == 3 || id == 5 ? 1.0 : 0.0);
+    float2 at = p.visible.xy + unit * p.visible.zw;
+    float2 ndc = at / p.sizes.xy * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    return float4(ndc, 0.0, 1.0);
+}
+
+// The blurred backdrop over the rounded bounds, premultiplied.
+fragment float4 blur_compose(
+    float4 position [[position]],
+    constant BlurParams &p [[buffer(0)]],
+    texture2d<float> blurred [[texture(0)]]
+) {
+    float2 at = (position.xy - p.region.xy) / p.blur.z;
+    float4 color = blurred.sample(pixels, clamp(at, float2(0.5), p.blur.xy - 0.5));
+    float2 half_size = p.bounds.zw * 0.5;
+    float2 d = position.xy - (p.bounds.xy + half_size);
+    float r = d.x < 0.0 ? (d.y < 0.0 ? p.radii.x : p.radii.w)
+                        : (d.y < 0.0 ? p.radii.y : p.radii.z);
+    r = min(r, min(half_size.x, half_size.y));
+    float2 q = abs(d) - half_size + r;
+    float distance = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+    float coverage = saturate(0.5 - distance) * p.pass.z;
+    return color * coverage;
+}
+"#;
+
+#[derive(Clone)]
+struct BlurPipelines {
+    down: Pipeline,
+    pass: Pipeline,
+    compose: Pipeline,
+}
+
+impl BlurPipelines {
+    fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self> {
+        let library = device
+            .newLibraryWithSource_options_error(
+                &NSString::from_str(BLUR_SOURCE),
+                Some(&objc2_metal::MTLCompileOptions::new()),
+            )
+            .map_err(|error| anyhow::anyhow!("blur shader: {}", error.localizedDescription()))?;
+        let function = |name: &str| {
+            library
+                .newFunctionWithName(&NSString::from_str(name))
+                .with_context(|| format!("locating {name}"))
+        };
+        let pipeline =
+            |label: &str, vertex: &str, fragment: &str, blended: bool| -> Result<Pipeline> {
+                let descriptor = MTLRenderPipelineDescriptor::new();
+                descriptor.setLabel(Some(&NSString::from_str(label)));
+                descriptor.setVertexFunction(Some(function(vertex)?.as_ref()));
+                descriptor.setFragmentFunction(Some(function(fragment)?.as_ref()));
+                // SAFETY: Index zero is within the pipeline's color attachment array.
+                let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+                color.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+                color.setBlendingEnabled(blended);
+                if blended {
+                    color.setRgbBlendOperation(MTLBlendOperation::Add);
+                    color.setAlphaBlendOperation(MTLBlendOperation::Add);
+                    color.setSourceRGBBlendFactor(MTLBlendFactor::One);
+                    color.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+                    color.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+                    color.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+                }
+                device
+                    .newRenderPipelineStateWithDescriptor_error(&descriptor)
+                    .map_err(|error| anyhow::anyhow!("{label}: {}", error.localizedDescription()))
+            };
+        Ok(Self {
+            down: pipeline("blur_down", "blur_fill_vertex", "blur_down", false)?,
+            pass: pipeline("blur_pass", "blur_fill_vertex", "blur_pass", false)?,
+            compose: pipeline("blur_compose", "blur_compose_vertex", "blur_compose", true)?,
+        })
+    }
+}
+
+/// The two textures a backdrop is reduced and blurred in, each blur using
+/// their top left corner.
+#[derive(Clone)]
+struct BlurScratch {
+    a: Texture,
+    b: Texture,
+    width: usize,
+    height: usize,
+}
+
+/// Where one backdrop blur reads and draws in a target, and how far it
+/// reduces the backdrop.
+#[derive(Clone, Debug, PartialEq)]
+struct BlurGeometry {
+    /// The backdrop read, in whole pixels: x, y, width, height.
+    region: [usize; 4],
+    /// The texels of the scratch it is reduced to.
+    extent: (usize, usize),
+    factor: usize,
+    /// The standard deviation, in scratch texels.
+    sigma: f32,
+    /// Taps either side of the centre in each pass.
+    half_width: usize,
+    bounds: [f32; 4],
+    visible: [f32; 4],
+    radii: [f32; 4],
+    opacity: f32,
+    /// The target's size.
+    target: [f32; 2],
+}
+
+/// The largest reduction: past it the box filter starts to show as blocks.
+const MAX_BLUR_FACTOR: usize = 16;
+
+impl BlurGeometry {
+    /// `None` for a blur that draws nothing in a target of `viewport`.
+    fn new(blur: &gpui::BackdropBlur, viewport: Size<DevicePixels>) -> Option<Self> {
+        let sigma = blur.radius.0;
+        if !(sigma > 0.0) || blur.opacity <= 0.0 {
+            return None;
+        }
+        let target = Bounds {
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+            size: size(
+                ScaledPixels(i32::from(viewport.width) as f32),
+                ScaledPixels(i32::from(viewport.height) as f32),
+            ),
+        };
+        let visible = blur
+            .bounds
+            .intersect(&blur.content_mask.bounds)
+            .intersect(&target);
+        if visible.is_empty() {
+            return None;
+        }
+        let read = blur.backdrop().intersect(&target);
+        let x0 = read.origin.x.0.floor().max(0.) as usize;
+        let y0 = read.origin.y.0.floor().max(0.) as usize;
+        let x1 = (read.origin.x.0 + read.size.width.0).ceil() as usize;
+        let y1 = (read.origin.y.0 + read.size.height.0).ceil() as usize;
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        // Reduced so the Gaussian left spans two to four texels, which the
+        // filtered draw back smooths over.
+        let mut factor = 1;
+        while factor < MAX_BLUR_FACTOR && sigma / (factor as f32 * 2.0) >= 2.0 {
+            factor *= 2;
+        }
+        let width = x1 - x0;
+        let height = y1 - y0;
+        let reduced = sigma / factor as f32;
+        let flat = |b: &Bounds<ScaledPixels>| {
+            [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0]
+        };
+        let radii = blur.corner_radii;
+        Some(Self {
+            region: [x0, y0, width, height],
+            extent: (width.div_ceil(factor), height.div_ceil(factor)),
+            factor,
+            sigma: reduced,
+            half_width: (reduced * 3.0).ceil().max(1.0) as usize,
+            bounds: flat(&blur.bounds),
+            visible: flat(&visible),
+            radii: [
+                radii.top_left.0,
+                radii.top_right.0,
+                radii.bottom_right.0,
+                radii.bottom_left.0,
+            ],
+            opacity: blur.opacity.min(1.0),
+            target: [target.size.width.0, target.size.height.0],
+        })
+    }
+
+    /// The programs' parameters, laid out as `BlurParams`, for a pass in
+    /// `direction`.
+    fn params(&self, scratch: &BlurScratch, direction: [f32; 2]) -> [[f32; 4]; 7] {
+        let [x, y, w, h] = self.region.map(|v| v as f32);
+        [
+            [x, y, w, h],
+            self.bounds,
+            self.visible,
+            self.radii,
+            [
+                self.target[0],
+                self.target[1],
+                scratch.width as f32,
+                scratch.height as f32,
+            ],
+            [
+                self.extent.0 as f32,
+                self.extent.1 as f32,
+                self.factor as f32,
+                self.sigma,
+            ],
+            [
+                direction[0],
+                direction[1],
+                self.opacity,
+                self.half_width as f32,
+            ],
+        ]
+    }
+}
+
+/// Reduces the backdrop `geometry` reads from `target` into the scratch and
+/// blurs it there, leaving it in `scratch.a`. `target` must not be the
+/// attachment of an encoder still open.
+fn blur_backdrop(
+    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    pipelines: &BlurPipelines,
+    scratch: &BlurScratch,
+    target: &ProtocolObject<dyn MTLTexture>,
+    geometry: &BlurGeometry,
+) -> Result<()> {
+    let passes: [(
+        &Pipeline,
+        &ProtocolObject<dyn MTLTexture>,
+        &Texture,
+        [f32; 2],
+    ); 3] = [
+        (&pipelines.down, target, &scratch.a, [0., 0.]),
+        (&pipelines.pass, &scratch.a, &scratch.b, [1., 0.]),
+        (&pipelines.pass, &scratch.b, &scratch.a, [0., 1.]),
+    ];
+    for (pipeline, source, destination, direction) in passes {
+        let descriptor = MTLRenderPassDescriptor::new();
+        // SAFETY: Index zero is within the render pass's color attachment array.
+        let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+        color.setTexture(Some(destination));
+        color.setLoadAction(MTLLoadAction::DontCare);
+        color.setStoreAction(MTLStoreAction::Store);
+        let encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&descriptor)
+            .context("creating a blur encoder")?;
+        // Only the texels the blur uses are drawn.
+        encoder.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: geometry.extent.0 as f64,
+            height: geometry.extent.1 as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        encoder.setRenderPipelineState(pipeline);
+        let params = geometry.params(scratch, direction);
+        // SAFETY: the parameters are copied and match `BlurParams`; one
+        // triangle covers the viewport.
+        unsafe {
+            encoder.setFragmentBytes_length_atIndex(
+                ptr::NonNull::from(&params).cast(),
+                mem::size_of_val(&params),
+                0,
+            );
+            encoder.setFragmentTexture_atIndex(Some(source), 0);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        encoder.endEncoding();
+    }
+    Ok(())
+}
+
+/// Draws the blurred backdrop `blur_backdrop` left in the scratch over the
+/// blur's rounded bounds, with `encoder` drawing into the target it read.
+fn compose_backdrop(
+    encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    pipelines: &BlurPipelines,
+    scratch: &BlurScratch,
+    geometry: &BlurGeometry,
+) {
+    encoder.setRenderPipelineState(&pipelines.compose);
+    let params = geometry.params(scratch, [0., 0.]);
+    // SAFETY: the parameters are copied and match `BlurParams`; six
+    // vertices make the visible bounds' two triangles.
+    unsafe {
+        encoder.setVertexBytes_length_atIndex(
+            ptr::NonNull::from(&params).cast(),
+            mem::size_of_val(&params),
+            0,
+        );
+        encoder.setFragmentBytes_length_atIndex(
+            ptr::NonNull::from(&params).cast(),
+            mem::size_of_val(&params),
+            0,
+        );
+        encoder.setFragmentTexture_atIndex(Some(&scratch.a), 0);
+        encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 6);
     }
 }
 
@@ -3843,6 +4320,207 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         assert!(
             after.get_pixel(28, 4).0[2] > 200,
             "the shader composed over it"
+        );
+    }
+
+    fn blur_rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point::new(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        }
+    }
+
+    fn solid(at: Bounds<ScaledPixels>, color: gpui::Hsla) -> gpui::Quad {
+        gpui::Quad {
+            bounds: at,
+            content_mask: ContentMask { bounds: at },
+            background: color.into(),
+            ..Default::default()
+        }
+    }
+
+    fn backdrop_blur(at: Bounds<ScaledPixels>, radius: f32, corner: f32) -> gpui::BackdropBlur {
+        gpui::BackdropBlur {
+            order: 0,
+            bounds: at,
+            content_mask: ContentMask { bounds: at },
+            corner_radii: gpui::Corners::all(ScaledPixels(corner)),
+            radius: ScaledPixels(radius),
+            opacity: 1.0,
+        }
+    }
+
+    /// Black, with white stripes two pixels wide every four.
+    fn stripes(scene: &mut Scene, width: f32, height: f32) {
+        scene.insert_primitive(solid(blur_rect(0., 0., width, height), gpui::black()));
+        let mut x = 0.;
+        while x < width {
+            scene.insert_primitive(solid(blur_rect(x, 0., 2., height), gpui::white()));
+            x += 4.;
+        }
+    }
+
+    fn luma(image: &RgbaImage, x: u32, y: u32) -> u8 {
+        image.get_pixel(x, y).0[1]
+    }
+
+    // A blur over stripes evens them out to their mean inside its rounded
+    // bounds, and leaves the corners outside the rounding and everything
+    // beyond its bounds as they were.
+    #[test]
+    fn a_backdrop_blur_evens_out_what_is_under_it() {
+        let viewport = size(DevicePixels(64), DevicePixels(32));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        let mut sharp = Scene::default();
+        stripes(&mut sharp, 64., 32.);
+        sharp.finish();
+        let mut blurred = Scene::default();
+        stripes(&mut blurred, 64., 32.);
+        blurred.insert_primitive(backdrop_blur(blur_rect(16., 8., 32., 16.), 4., 6.));
+        blurred.finish();
+        let sharp = renderer.render_scene_to_image(&sharp, viewport).unwrap();
+        let blurred = renderer.render_scene_to_image(&blurred, viewport).unwrap();
+
+        for y in 10..22 {
+            for x in 20..44 {
+                assert!(
+                    luma(&blurred, x, y).abs_diff(128) <= 16,
+                    "({x}, {y}) is {}, the stripes' mean is 128",
+                    luma(&blurred, x, y)
+                );
+            }
+        }
+        let row: Vec<u8> = (20..44).map(|x| luma(&sharp, x, 16)).collect();
+        assert!(
+            row.contains(&0) && row.contains(&255),
+            "the stripes are sharp"
+        );
+        assert_eq!(
+            blurred.get_pixel(16, 8),
+            sharp.get_pixel(16, 8),
+            "a rounded corner"
+        );
+        for (x, y) in [(4, 4), (10, 16), (60, 30), (30, 4)] {
+            assert_eq!(blurred.get_pixel(x, y), sharp.get_pixel(x, y), "({x}, {y})");
+        }
+    }
+
+    // What is painted after a blur is drawn over it, sharp; what was painted
+    // before it, under it, is blurred.
+    #[test]
+    fn a_backdrop_blur_blurs_only_what_was_painted_before_it() {
+        let viewport = size(DevicePixels(64), DevicePixels(32));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        let red = gpui::hsla(0., 1., 0.5, 1.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid(blur_rect(0., 0., 64., 32.), gpui::black()));
+        scene.insert_primitive(solid(blur_rect(18., 14., 4., 4.), gpui::white()));
+        scene.insert_primitive(backdrop_blur(blur_rect(8., 4., 48., 24.), 3., 0.));
+        scene.insert_primitive(solid(blur_rect(40., 14., 4., 4.), red));
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, viewport).unwrap();
+        let before = image.get_pixel(20, 16).0;
+        assert!(
+            before[1] > 20 && before[1] < 160,
+            "the white square under the blur is spread: {before:?}"
+        );
+        assert!(luma(&image, 24, 16) > 0, "into its neighbours");
+        assert_eq!(image.get_pixel(41, 15).0, [255, 0, 0, 255], "painted after");
+        assert_eq!(image.get_pixel(44, 16).0[0], 0, "and not spread");
+    }
+
+    // A blur over a shader is drawn at each present over what is composed
+    // under it, so it follows the shader as a whole render would draw it,
+    // presented again from its plan with no frame drawn.
+    #[test]
+    fn a_composed_backdrop_blur_follows_the_shader_under_it() {
+        static FILL: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-blur-fill",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return float4(u[0], 0.0, 0.0, 1.0);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let uniforms = Arc::new(gpui::ShaderUniforms::new());
+        uniforms.set(0, 1.0);
+        let mut scene = Scene::default();
+        stripes(&mut scene, 64., 32.);
+        let fill = blur_rect(0., 0., 32., 32.);
+        scene.insert_primitive(gpui::PaintShader {
+            order: 0,
+            bounds: fill,
+            content_mask: ContentMask { bounds: fill },
+            program: &FILL,
+            uniforms: uniforms.clone(),
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        });
+        scene.insert_primitive(backdrop_blur(blur_rect(16., 8., 32., 16.), 4., 4.));
+        let tint = blur_rect(16., 8., 32., 16.);
+        scene.insert_primitive(solid(tint, gpui::hsla(0.6, 1., 0.5, 0.25)));
+        scene.finish();
+        let plan = scene.shader_layers.as_deref().expect("a plan");
+        assert_eq!(plan.blurs, vec![None, Some(0)]);
+        assert!(
+            plan.layers[2].quads.len() == 1,
+            "the tint is drawn after the blur"
+        );
+
+        let viewport = size(DevicePixels(64), DevicePixels(32));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        renderer.set_keeps_present_plan(true);
+        let close = |a: &RgbaImage, b: &RgbaImage| {
+            a.as_raw()
+                .iter()
+                .zip(b.as_raw())
+                .all(|(x, y)| x.abs_diff(*y) <= 2)
+        };
+        let whole = renderer.render_scene_to_image(&scene, viewport).unwrap();
+        let composed = renderer
+            .compose_scene_to_image(&scene, viewport, 1)
+            .unwrap();
+        assert!(close(&whole, &composed));
+        let plan = renderer.present_plan().expect("a plan");
+
+        uniforms.set(0, 0.0);
+        let at = std::time::Instant::now();
+        let moved = present_to_image(&renderer, &plan, 64, 32, at);
+        assert!(
+            moved.get_pixel(24, 16).0[0] + 40 < composed.get_pixel(24, 16).0[0],
+            "the blur follows the shader: {:?} after {:?}",
+            moved.get_pixel(24, 16),
+            composed.get_pixel(24, 16)
+        );
+        let whole = renderer.render_scene_to_image(&scene, viewport).unwrap();
+        assert!(close(&whole, &moved));
+    }
+
+    // A navigation bar's blur at 3x: reduced sixteen times, read three
+    // standard deviations past its bounds, clipped to the target.
+    #[test]
+    fn a_wide_blur_is_reduced_and_reads_past_its_bounds() {
+        let bar = backdrop_blur(blur_rect(0., 0., 1170., 300.), 60., 0.);
+        let geometry =
+            BlurGeometry::new(&bar, size(DevicePixels(1170), DevicePixels(2532))).expect("drawn");
+        assert_eq!(geometry.factor, 16);
+        assert_eq!(geometry.region, [0, 0, 1170, 480]);
+        assert_eq!(geometry.extent, (74, 30));
+        assert_eq!(geometry.half_width, 12);
+
+        let fine = backdrop_blur(blur_rect(10., 10., 20., 20.), 1., 0.);
+        let geometry =
+            BlurGeometry::new(&fine, size(DevicePixels(64), DevicePixels(64))).expect("drawn");
+        assert_eq!((geometry.factor, geometry.region), (1, [7, 7, 26, 26]));
+        assert!(
+            BlurGeometry::new(&fine, size(DevicePixels(8), DevicePixels(8))).is_none(),
+            "off the target"
         );
     }
 }

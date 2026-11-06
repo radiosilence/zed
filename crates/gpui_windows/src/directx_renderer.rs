@@ -385,6 +385,9 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // Not drawn here: the background painted over a backdrop blur
+                // is drawn alone.
+                PrimitiveBatch::BackdropBlurs(_) => Ok(()),
             }
             .with_context(|| {
                 format!(

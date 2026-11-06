@@ -1319,6 +1319,8 @@ pub struct Window {
     /// The active drag was lifted by the current long press, which carries
     /// it until the touch ends.
     pub(crate) touch_lifted_drag: bool,
+    /// Whether the touch recognizer's next frame step is already scheduled.
+    touch_frame_scheduled: bool,
     /// Where a touch that can still become a tap is held. Touch has no
     /// hover: under touch, only what is under such a touch is hovered, so a
     /// control shows its pressed look while held and nothing stays hovered
@@ -2051,6 +2053,14 @@ impl Window {
                     return;
                 }
 
+                // Before the next-frame callbacks, so that what they move is
+                // moved to where it should be when this frame is shown.
+                let present_at = request_frame_options
+                    .present_at
+                    .unwrap_or_else(Instant::now);
+                handle
+                    .update(&mut cx, |_, window, _| window.present_at.set(present_at))
+                    .log_err();
                 let pending_next_frame_callbacks = next_frame_callbacks.take();
                 if !pending_next_frame_callbacks.is_empty() {
                     handle
@@ -2067,13 +2077,6 @@ impl Window {
                         })
                         .log_err();
                 }
-
-                let present_at = request_frame_options
-                    .present_at
-                    .unwrap_or_else(Instant::now);
-                handle
-                    .update(&mut cx, |_, window, _| window.present_at.set(present_at))
-                    .log_err();
 
                 let should_draw = invalidator.is_dirty() || force_render;
                 let needs_present = request_frame_options.require_presentation
@@ -2486,6 +2489,7 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             touch_lifted_drag: false,
+            touch_frame_scheduled: false,
             touch_press: None,
             touch_drag_pointer: false,
             refreshing: false,
@@ -6467,8 +6471,8 @@ impl Window {
         // After the tap's press and release, which are dispatched to what
         // the touch hovers.
         self.update_touch_press();
-        if self.touch_gestures.has_momentum() {
-            self.schedule_touch_momentum_tick();
+        if self.touch_gestures.wants_frames() {
+            self.schedule_touch_frame();
         }
     }
 
@@ -6687,13 +6691,22 @@ impl Window {
         }));
     }
 
-    fn schedule_touch_momentum_tick(&mut self) {
+    /// Advances what the touch recognizer moves by frames (a fling, a
+    /// resampled pan) once in the next frame, at the time that frame is
+    /// expected on screen.
+    fn schedule_touch_frame(&mut self) {
+        if self.touch_frame_scheduled {
+            return;
+        }
+        self.touch_frame_scheduled = true;
         self.on_next_frame(|window, cx| {
-            if let Some(gesture) = window.touch_gestures.tick_momentum() {
+            window.touch_frame_scheduled = false;
+            let present = window.present_time();
+            for gesture in window.touch_gestures.tick_frame(present) {
                 window.dispatch_recognized_touch_gesture(gesture, cx);
             }
-            if window.touch_gestures.has_momentum() {
-                window.schedule_touch_momentum_tick();
+            if window.touch_gestures.wants_frames() {
+                window.schedule_touch_frame();
             }
         });
     }

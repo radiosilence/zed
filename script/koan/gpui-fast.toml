@@ -19,6 +19,8 @@ zed_commit = "decd2399b180b64dea2a4182f9ac63545a45e7a3"
 # layer groups.
 #
 # Scroll layer tiles are composited on Metal only (`RENDERER_COMPOSITES_TILES`
-# in crates/gpui/src/fast/layers/paint.rs). The wgpu renderer draws a frame
-# holding shaders, blurs, layer groups or dynamic colours through its own
-# encoding, which has no tiles; a layer's content is drawn into those frames.
+# in crates/gpui/src/fast/layers/paint.rs). The wgpu renderer draws every
+# frame through its own encoding (`RECORDED_FRAMES` in
+# crates/gpui_wgpu/src/wgpu_renderer.rs), which has no tiles: gpui-fast's
+# recorded frame binds its own groups against layouts the fork extends, and
+# has not been run against them. A layer's content is drawn into the frame.

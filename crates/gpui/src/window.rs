@@ -5947,9 +5947,8 @@ impl Window {
         // clicked or scrolled, and blocks nothing beneath it.
         if self.inert == 0 {
             self.next_frame.hitboxes.push(hitbox.clone());
+            crate::fast::composition::record_input(self, id);
         }
-        self.next_frame.hitboxes.push(hitbox.clone());
-        crate::fast::composition::record_input(self, id);
         hitbox
     }
 

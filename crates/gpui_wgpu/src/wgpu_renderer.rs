@@ -1750,8 +1750,11 @@ impl WgpuRendererCore {
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         // The recorded frame draws no shader, blur, layer group or dynamic
-        // colour, so a scene holding one is drawn here.
-        if scene.shaders.is_empty()
+        // colour, so a scene holding one is drawn here. It is not used yet:
+        // it binds its own groups against the layouts this renderer extends
+        // for those, which nothing has run it against.
+        if RECORDED_FRAMES
+            && scene.shaders.is_empty()
             && scene.backdrop_blurs.is_empty()
             && scene.layer_groups.is_empty()
             && scene.dynamic_colors.is_empty()
@@ -3966,3 +3969,7 @@ fn shade(position: vec2<f32>, size: vec2<f32>, time: f32, u: array<vec4<f32>, 20
         Ok(())
     }
 }
+
+/// Whether frames without the fork's primitives are recorded by gpui-fast's
+/// batched frame (`fast::frame`) rather than by `record_frame` here.
+const RECORDED_FRAMES: bool = false;

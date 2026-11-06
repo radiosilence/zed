@@ -185,6 +185,9 @@ mod any_view {
             .view_type_names
             .insert(view.entity_id(), std::any::type_name::<V>());
         crate::fast::dependencies::render_next(&mut cx.entities, view.entity_id());
+        // Rendered now, it shows whatever a notify earlier in this draw
+        // changed: the next frame need not draw it for that.
+        cx.notified_while_drawing.remove(&view.entity_id());
         view.update(cx, |view, cx| view.render(window, cx).into_any_element())
     }
 }

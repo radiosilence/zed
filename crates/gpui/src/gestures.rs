@@ -1894,12 +1894,20 @@ mod tests {
         for step in 1..=3 {
             now += Duration::from_millis(16);
             recognizer.handle_event_at(
-                &touch_event(TouchId(2), TouchPhase::Moved, 100., 300. - step as f32),
+                &touch_event(
+                    TouchId(2),
+                    TouchPhase::Moved,
+                    100.,
+                    300. - step as f32 * 0.5,
+                ),
                 now,
             );
         }
         now += Duration::from_millis(16);
-        recognizer.handle_event_at(&touch_event(TouchId(2), TouchPhase::Ended, 100., 297.), now);
+        recognizer.handle_event_at(
+            &touch_event(TouchId(2), TouchPhase::Ended, 100., 298.5),
+            now,
+        );
         assert!(
             !recognizer.has_momentum(),
             "a creep after a catch stops the content"

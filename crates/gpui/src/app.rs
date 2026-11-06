@@ -954,6 +954,7 @@ pub struct App {
     // below is plain data, the drop order is insignificant here
     pub(crate) pending_notifications: FxHashSet<EntityId>,
     pub(crate) pending_global_notifications: TypeIdHashSet,
+    pub(crate) dependencies: crate::fast::dependencies::AppDependencies,
     pub(crate) restart_path: Option<PathBuf>,
     pub(crate) restart_arguments: Vec<OsString>,
     pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
@@ -1057,6 +1058,7 @@ impl App {
                 pending_effects: VecDeque::new(),
                 pending_notifications: FxHashSet::default(),
                 pending_global_notifications: Default::default(),
+                dependencies: crate::fast::dependencies::AppDependencies::default(),
                 observers: SubscriberSet::new(),
                 tracked_entities: FxHashMap::default(),
                 drawing_windows: 0,
@@ -1245,6 +1247,12 @@ impl App {
         self.entities.leak_detector_snapshot()
     }
 
+    /// Without leak detection compiled in, this records nothing.
+    #[cfg(all(feature = "test-support", not(any(test, gpui_leak_detection))))]
+    pub fn leak_detector_snapshot(&self) -> LeakDetectorSnapshot {
+        LeakDetectorSnapshot::default()
+    }
+
     /// Asserts that no entities created after `snapshot` still have alive handles.
     ///
     /// Entities that were already tracked at the time of the snapshot are ignored,
@@ -1259,12 +1267,6 @@ impl App {
     #[cfg(any(test, gpui_leak_detection))]
     pub fn assert_no_new_leaks(&self, snapshot: &LeakDetectorSnapshot) {
         self.entities.assert_no_new_leaks(snapshot)
-    }
-
-    /// Without leak detection compiled in, this records nothing.
-    #[cfg(all(feature = "test-support", not(any(test, gpui_leak_detection))))]
-    pub fn leak_detector_snapshot(&self) -> LeakDetectorSnapshot {
-        LeakDetectorSnapshot::default()
     }
 
     /// Without leak detection compiled in, this checks nothing. Set
@@ -2134,6 +2136,7 @@ impl App {
                 }
             }
             Effect::NotifyGlobalObservers { global_type } => {
+                crate::fast::dependencies::global_changed(self, *global_type);
                 if !self.pending_global_notifications.insert(*global_type) {
                     return;
                 }
@@ -2543,12 +2546,14 @@ impl App {
 
     /// Check whether a global of the given type has been assigned.
     pub fn has_global<G: Global>(&self) -> bool {
+        crate::fast::dependencies::note_global_presence_read::<G>(self);
         self.globals_by_type.contains_key(&TypeId::of::<G>())
     }
 
     /// Access the global of the given type. Panics if a global for that type has not been assigned.
     #[track_caller]
     pub fn global<G: Global>(&self) -> &G {
+        crate::fast::dependencies::note_global_read(self, TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
@@ -2557,6 +2562,7 @@ impl App {
 
     /// Access the global of the given type if a value has been assigned.
     pub fn try_global<G: Global>(&self) -> Option<&G> {
+        crate::fast::dependencies::note_global_read(self, TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
@@ -2578,6 +2584,7 @@ impl App {
     pub fn default_global<G: Global + Default>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
+        crate::fast::dependencies::note_global_inserted::<G>(self);
         self.globals_by_type
             .entry(global_type)
             .or_insert_with(|| Box::<G>::default())
@@ -2589,6 +2596,7 @@ impl App {
     pub fn set_global<G: Global>(&mut self, global: G) {
         let global_type = TypeId::of::<G>();
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
+        crate::fast::dependencies::note_global_inserted::<G>(self);
         self.globals_by_type.insert(global_type, Box::new(global));
     }
 
@@ -2600,6 +2608,7 @@ impl App {
 
     /// Remove the global of the given type from the app context. Does not notify global observers.
     pub fn remove_global<G: Global>(&mut self) -> G {
+        crate::fast::dependencies::note_global_removed::<G>(self);
         let global_type = TypeId::of::<G>();
         self.push_effect(Effect::NotifyGlobalObservers { global_type });
         *self
@@ -3182,6 +3191,7 @@ impl App {
         if self.drawing_windows > 0 {
             self.notified_while_drawing.insert(entity_id);
         }
+        crate::fast::dependencies::note_notify(&mut self.entities, entity_id);
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity
                 .entry(entity_id)

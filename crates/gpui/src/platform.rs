@@ -252,6 +252,11 @@ pub struct GraphicalEnvironment {
     pub session_id: Option<u32>,
 }
 
+/// The graphical session to connect to. Carries nothing yet on this platform.
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "windows")))]
+#[derive(Clone, Debug, Default)]
+pub struct GraphicalEnvironment;
+
 #[cfg(target_os = "windows")]
 impl GraphicalEnvironment {
     /// Returns the environment of this process's session.
@@ -273,11 +278,6 @@ impl GraphicalEnvironment {
     /// starts them.
     pub fn apply_to(&self, _command: &mut std::process::Command) {}
 }
-
-/// The graphical session to connect to. Carries nothing yet on this platform.
-#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "windows")))]
-#[derive(Clone, Debug, Default)]
-pub struct GraphicalEnvironment;
 
 #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "windows")))]
 impl GraphicalEnvironment {
@@ -1336,6 +1336,23 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    fn draw_composed(&self, scene: crate::fast::composition::ComposedScene<'_>) {
+        crate::fast::composition::draw_uncomposed(self, scene)
+    }
+    fn enable_window_composition(&self) -> Result<()> {
+        crate::fast::composition::unsupported("window composition")
+    }
+    fn create_native_surface(
+        &self,
+    ) -> Result<Rc<dyn crate::fast::composition::PlatformSurfaceAttachment>> {
+        crate::fast::composition::unsupported("native surface portals")
+    }
+    fn set_composition_order(
+        &self,
+        _fast_surfaces: &[crate::fast::composition::PlatformCompositionSurface],
+    ) -> Result<()> {
+        crate::fast::composition::unsupported("surface ordering")
+    }
     fn schedule_frame(&self) {}
     /// Whether the platform presents the last frame's moving shaders itself,
     /// off the window's thread, waking the window only for a frame it asks

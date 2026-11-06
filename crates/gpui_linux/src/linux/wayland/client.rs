@@ -244,6 +244,7 @@ pub struct Globals {
     pub qh: QueueHandle<WaylandClientStatePtr>,
     pub activation: Option<xdg_activation_v1::XdgActivationV1>,
     pub compositor: wl_compositor::WlCompositor,
+    pub fast_subcompositor: Option<wayland_client::protocol::wl_subcompositor::WlSubcompositor>,
     pub cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
     pub data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
     pub primary_selection_manager:
@@ -305,6 +306,7 @@ impl Globals {
                 .bind(&qh, 1..=6, ())
                 .context("Wayland compositor does not provide xdg_wm_base")?,
             viewporter: globals.bind(&qh, 1..=1, ()).ok(),
+            fast_subcompositor: globals.bind(&qh, 1..=1, ()).ok(),
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
@@ -377,6 +379,7 @@ pub(crate) struct WaylandClientState {
     last_ime_cursor_rectangle: Option<ImeCursorRectangle>,
     // Surface to Window mapping
     windows: HashMap<ObjectId, WaylandWindowStatePtr>,
+    pub(crate) fast_composition_input_surfaces: crate::fast::composition::wayland::InputSurfaces,
     // Output to scale mapping
     outputs: HashMap<ObjectId, Output>,
     // Kept after each `done`, since outputs only resend the properties that
@@ -806,6 +809,7 @@ impl WaylandClientStatePtr {
         let client = self.get_client();
         let mut state = client.borrow_mut();
         let closed_window = state.windows.remove(surface_id).unwrap();
+        crate::fast::composition::wayland::forget_input_surfaces(&mut state, &closed_window);
         if let Some(window) = state.mouse_focused_window.take()
             && !window.ptr_eq(&closed_window)
         {
@@ -1086,6 +1090,8 @@ impl WaylandConnection {
             output_globals,
             wl_outputs,
             windows: HashMap::default(),
+            fast_composition_input_surfaces:
+                crate::fast::composition::wayland::InputSurfaces::default(),
             common,
             keyboard_layout: LinuxKeyboardLayout::new(UNKNOWN_KEYBOARD_LAYOUT_NAME),
             keymap_state: None,
@@ -2412,11 +2418,18 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 ..
             } => {
                 let position = point(px(surface_x as f32), px(surface_y as f32));
+                let position = crate::fast::composition::wayland::pointer_position(
+                    &mut state,
+                    Some(&surface.id()),
+                    position,
+                );
                 state.serial_tracker.update(SerialKind::MouseEnter, serial);
                 state.mouse_location = Some(position);
                 state.button_pressed = None;
 
-                if let Some(window) = get_window(&mut state, &surface.id()) {
+                if let Some(window) =
+                    crate::fast::composition::wayland::get_pointer_window(&mut state, &surface.id())
+                {
                     state.mouse_focused_window = Some(window.clone());
 
                     if state.enter_token.is_some() {
@@ -2473,7 +2486,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 if state.mouse_focused_window.is_none() {
                     return;
                 }
-                state.mouse_location = Some(point(px(surface_x as f32), px(surface_y as f32)));
+                state.mouse_location = Some(crate::fast::composition::wayland::pointer_position(
+                    &mut state,
+                    None,
+                    point(px(surface_x as f32), px(surface_y as f32)),
+                ));
                 state.restore_cursor_after_hide();
 
                 if let Some(window) = state.mouse_focused_window.clone() {
@@ -2917,7 +2934,10 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
             } => {
                 state.serial_tracker.update(SerialKind::DataDevice, serial);
                 if let Some(data_offer) = data_offer {
-                    let Some(drag_window) = get_window(&mut state, &surface.id()) else {
+                    let Some(drag_window) = crate::fast::composition::wayland::get_input_window(
+                        &mut state,
+                        &surface.id(),
+                    ) else {
                         return;
                     };
                     let uri_read_generation = state.drag.begin_uri_read();

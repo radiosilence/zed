@@ -191,7 +191,7 @@ impl LineLayout {
         (left, right)
     }
 
-    fn compute_wrap_boundaries(
+    pub(crate) fn compute_wrap_boundaries(
         &self,
         text: &str,
         wrap_width: Pixels,
@@ -478,15 +478,16 @@ impl WrappedLineLayout {
 pub(crate) struct LineLayoutCache {
     state: RefCell<LineLayoutCacheState>,
     wrap_scratch: RefCell<WrapScratch>,
-    platform_text_system: Arc<dyn PlatformTextSystem>,
+    pub(crate) platform_text_system: Arc<dyn PlatformTextSystem>,
     /// Advances when [`TextSystem::add_fonts`] successfully changes the font database.
     font_generation: Arc<AtomicUsize>,
     /// Records the generation represented by both frame caches.
     cached_font_generation: AtomicUsize,
+    pub(crate) shaping: crate::fast::text::LineShaping,
 }
 
 #[derive(Default)]
-struct WrapScratch {
+pub(crate) struct WrapScratch {
     glyph_indices: FxHashSet<usize>,
     break_indices: Vec<usize>,
 }
@@ -498,18 +499,18 @@ struct LineLayoutCacheState {
 }
 
 #[derive(Default)]
-struct FrameCache {
-    lines: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
-    wrapped_lines: FxHashMap<Arc<CacheKey>, Arc<WrappedLineLayout>>,
-    used_lines: Vec<Arc<CacheKey>>,
-    used_wrapped_lines: Vec<Arc<CacheKey>>,
+pub(crate) struct FrameCache {
+    pub(crate) lines: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
+    pub(crate) wrapped_lines: FxHashMap<Arc<CacheKey>, Arc<WrappedLineLayout>>,
+    pub(crate) used_lines: Vec<Arc<CacheKey>>,
+    pub(crate) used_wrapped_lines: Vec<Arc<CacheKey>>,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct LineLayoutIndex {
-    font_generation: usize,
-    lines_index: usize,
-    wrapped_lines_index: usize,
+    pub(crate) font_generation: usize,
+    pub(crate) lines_index: usize,
+    pub(crate) wrapped_lines_index: usize,
 }
 
 impl LineLayoutCache {
@@ -524,6 +525,7 @@ impl LineLayoutCache {
             platform_text_system,
             font_generation,
             cached_font_generation: AtomicUsize::new(cached_font_generation),
+            shaping: crate::fast::text::LineShaping::default(),
         }
     }
 
@@ -587,11 +589,7 @@ impl LineLayoutCache {
             previous_frame,
             current_frame,
         } = &mut *self.state.borrow_mut();
-        std::mem::swap(previous_frame, current_frame);
-        current_frame.lines.clear();
-        current_frame.wrapped_lines.clear();
-        current_frame.used_lines.clear();
-        current_frame.used_wrapped_lines.clear();
+        crate::fast::text::carry_over_line_layouts(previous_frame, current_frame);
     }
 
     pub fn layout_wrapped_line<Text>(
@@ -705,9 +703,7 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
-            let mut layout = self
-                .platform_text_system
-                .layout_line(&text, font_size, runs);
+            let mut layout = crate::fast::text::shape_line(self, &text, font_size, runs);
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -788,7 +784,7 @@ trait AsCacheKeyRef {
 }
 
 #[derive(Clone, Debug, Eq)]
-struct CacheKey {
+pub(crate) struct CacheKey {
     text: SharedString,
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,

@@ -1,17 +1,13 @@
 use crate::{
-    AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
-    Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
-    StyleRefinement, TextStyle, WeakEntity, window::a11y::CapturedA11y,
+    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, Context, Element, ElementId, Entity,
+    EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Render,
+    RenderOnce, StyleRefinement, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
-use collections::FxHashSet;
-use refineable::Refineable;
 use std::{
     any::{TypeId, type_name},
     fmt,
-    ops::Range,
 };
 
 /// A dynamically-typed view handle that can be downcast to a specific `Entity<V>`.
@@ -23,7 +19,7 @@ use std::{
 pub struct AnyView {
     entity: AnyEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
-    view_type_name: &'static str,
+    pub(crate) view_type_name: &'static str,
 }
 
 impl<V: Render> From<Entity<V>> for AnyView {
@@ -112,7 +108,7 @@ impl<V: 'static + Render> IntoElement for Entity<V> {
     type Element = ViewElement<Entity<V>>;
 
     fn into_element(self) -> Self::Element {
-        ViewElement::with_type_name(self, type_name::<V>())
+        crate::fast::splice::rebuildable(self.clone(), self.into())
     }
 
     #[inline(never)]
@@ -125,8 +121,7 @@ impl IntoElement for AnyView {
     type Element = ViewElement<AnyView>;
 
     fn into_element(self) -> Self::Element {
-        let view_type_name = self.view_type_name;
-        ViewElement::with_type_name(self, view_type_name)
+        crate::fast::splice::rebuildable(self.clone(), self)
     }
 }
 
@@ -189,6 +184,7 @@ mod any_view {
             .a11y
             .view_type_names
             .insert(view.entity_id(), std::any::type_name::<V>());
+        crate::fast::dependencies::render_next(&mut cx.entities, view.entity_id());
         view.update(cx, |view, cx| view.render(window, cx).into_any_element())
     }
 }
@@ -239,6 +235,7 @@ impl<T: Render> View for Entity<T> {
 
     #[inline]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        crate::fast::dependencies::render_next(&mut cx.entities, self.entity_id());
         self.update(cx, |this, cx| {
             Render::render(this, window, cx).into_any_element()
         })
@@ -255,7 +252,7 @@ impl<T: Render> Entity<T> {
     /// uncached case.
     #[track_caller]
     pub fn cached(self, style: StyleRefinement) -> ViewElement<Entity<T>> {
-        ViewElement::with_type_name(self, type_name::<T>()).cached(style)
+        crate::fast::splice::cached(self.clone(), self.into(), style)
     }
 }
 
@@ -263,11 +260,12 @@ impl<T: Render> Entity<T> {
 /// into layout, prepaint, and paint. Constructed via [`ViewElement::new`].
 #[doc(hidden)]
 pub struct ViewElement<V: View> {
-    view: Option<V>,
-    entity_id: Option<EntityId>,
-    cached_style: Option<StyleRefinement>,
+    pub(crate) view: Option<V>,
+    pub(crate) entity_id: Option<EntityId>,
+    pub(crate) cached_style: Option<StyleRefinement>,
+    pub(crate) rebuild: crate::fast::splice::RebuildHandle,
     #[cfg(feature = "profiler")]
-    view_type_name: &'static str,
+    pub(crate) view_type_name: &'static str,
     #[cfg(debug_assertions)]
     source: &'static core::panic::Location<'static>,
 }
@@ -288,6 +286,7 @@ impl<V: View> ViewElement<V> {
         ViewElement {
             entity_id,
             cached_style: None,
+            rebuild: crate::fast::splice::RebuildHandle::default(),
             #[cfg(feature = "profiler")]
             view_type_name,
             view: Some(view),
@@ -319,45 +318,16 @@ impl<V: View> IntoElement for ViewElement<V> {
     }
 }
 
-struct ViewElementState {
-    prepaint_range: Range<PrepaintStateIndex>,
-    paint_range: Range<PaintIndex>,
-    /// The draws `prepaint_range` and `paint_range` were recorded in. A cached
-    /// ancestor reused whole carries this state into the next frame without
-    /// moving its ranges, which then index a frame that is gone.
-    prepaint_frame: u64,
-    paint_frame: u64,
-    cache_key: ViewElementCacheKey,
-    /// The entities the view accessed while it was last drawn, in any phase,
-    /// restored when its prepaint is reused so the window stays subscribed.
-    accessed_entities: FxHashSet<EntityId>,
-    /// The accessibility nodes the prepaint added, when it ran while the tree
-    /// was being built (the replay credited in window/a11y.rs). A frame that builds the tree can only reuse the view
-    /// if it has them: the tree starts empty in every frame and the reused
-    /// prepaint doesn't run.
-    a11y: Option<CapturedA11y>,
-}
-
-struct ViewElementCacheKey {
-    bounds: Bounds<Pixels>,
-    content_mask: ContentMask<Pixels>,
-    text_style: TextStyle,
-    opacity: f32,
-    /// Drawn inert, its frame holds no hitboxes or tab stops, so it is reused
-    /// only by another inert draw.
-    inert: bool,
-}
-
 #[cfg(not(gpui_hot_reload))]
 #[inline]
-fn render_view<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
+pub(crate) fn render_view<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
     view.render(window, cx).into_any_element()
 }
 
 /// Every view and component render passes through this hot-patchable boundary, so the
 /// patched code for that render and everything it calls runs on the next frame.
 #[cfg(gpui_hot_reload)]
-fn render_view<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
+pub(crate) fn render_view<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
     #[inline(never)]
     fn render_view_impl<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
         view.render(window, cx).into_any_element()
@@ -367,8 +337,8 @@ fn render_view<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElemen
 }
 
 impl<V: View> Element for ViewElement<V> {
-    type RequestLayoutState = Option<AnyElement>;
-    type PrepaintState = Option<AnyElement>;
+    type RequestLayoutState = crate::fast::retained::ViewLayoutState;
+    type PrepaintState = crate::fast::retained::ViewPrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         self.entity_id.map(ElementId::View)
@@ -389,31 +359,7 @@ impl<V: View> Element for ViewElement<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        if let Some(entity_id) = self.entity_id {
-            // Stateful path: create a reactive boundary.
-            #[cfg(feature = "profiler")]
-            let start = window.window_profiler.begin_view();
-            let view = &mut self.view;
-            let layout = request_layout_view(
-                entity_id,
-                self.cached_style.as_ref(),
-                window,
-                cx,
-                &mut |window, cx| render_view(view.take().unwrap(), window, cx),
-            );
-            #[cfg(feature = "profiler")]
-            window.window_profiler.end_view(
-                start,
-                self.view_type_name,
-                crate::profiler::ViewPhase::RequestLayout,
-            );
-            layout
-        } else {
-            // Stateless path: isolate subtree via type name (no entity identity).
-            request_layout_component(type_name::<V>(), window, cx, &mut |window, cx| {
-                render_view(self.view.take().unwrap(), window, cx)
-            })
-        }
+        crate::fast::retained::request_view_layout(self, _id, window, cx)
     }
 
     fn prepaint(
@@ -424,31 +370,8 @@ impl<V: View> Element for ViewElement<V> {
         element: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<AnyElement> {
-        if let Some(entity_id) = self.entity_id {
-            // Stateful path.
-            #[cfg(feature = "profiler")]
-            let start = window.window_profiler.begin_view();
-            let prepainted = prepaint_view(
-                entity_id,
-                global_id,
-                bounds,
-                element,
-                window,
-                cx,
-                &mut |window, cx| render_view(self.view.take().unwrap(), window, cx),
-            );
-            #[cfg(feature = "profiler")]
-            window.window_profiler.end_view(
-                start,
-                self.view_type_name,
-                crate::profiler::ViewPhase::Prepaint,
-            );
-            prepainted
-        } else {
-            // Stateless path: just prepaint the element.
-            prepaint_component(type_name::<V>(), element, window, cx)
-        }
+    ) -> Self::PrepaintState {
+        crate::fast::retained::prepaint_view(self, global_id, bounds, element, window, cx)
     }
 
     fn paint(
@@ -461,28 +384,7 @@ impl<V: View> Element for ViewElement<V> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(entity_id) = self.entity_id {
-            // Stateful path.
-            #[cfg(feature = "profiler")]
-            let start = window.window_profiler.begin_view();
-            paint_view(
-                entity_id,
-                self.cached_style.is_some(),
-                global_id,
-                element,
-                window,
-                cx,
-            );
-            #[cfg(feature = "profiler")]
-            window.window_profiler.end_view(
-                start,
-                self.view_type_name,
-                crate::profiler::ViewPhase::Paint,
-            );
-        } else {
-            // Stateless path: just paint the element.
-            paint_component(std::any::type_name::<V>(), element, window, cx);
-        }
+        crate::fast::retained::paint_view(self, global_id, element, window, cx)
     }
 }
 
@@ -493,220 +395,6 @@ impl Render for EmptyView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
-}
-
-#[inline(never)]
-fn request_layout_view(
-    entity_id: EntityId,
-    cached_style: Option<&StyleRefinement>,
-    window: &mut Window,
-    cx: &mut App,
-    render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
-) -> (LayoutId, Option<AnyElement>) {
-    window.with_rendered_view(entity_id, |window| {
-        let caching_disabled = window.is_inspector_picking(cx);
-        match cached_style {
-            Some(style) if !caching_disabled => {
-                let mut root_style = Style::default();
-                root_style.refine(style);
-                let layout_id = window.request_layout(root_style, None, cx);
-                (layout_id, None)
-            }
-            _ => {
-                let mut element = render(window, cx);
-                let layout_id = element.request_layout(window, cx);
-                (layout_id, Some(element))
-            }
-        }
-    })
-}
-
-#[inline(never)]
-fn request_layout_component(
-    name: &'static str,
-    window: &mut Window,
-    cx: &mut App,
-    render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
-) -> (LayoutId, Option<AnyElement>) {
-    window.with_id(ElementId::from(name), |window| {
-        let mut element = render(window, cx);
-        let layout_id = element.request_layout(window, cx);
-        (layout_id, Some(element))
-    })
-}
-
-#[inline(never)]
-fn prepaint_view(
-    entity_id: EntityId,
-    global_id: Option<&GlobalElementId>,
-    bounds: Bounds<Pixels>,
-    element: &mut Option<AnyElement>,
-    window: &mut Window,
-    cx: &mut App,
-    render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
-) -> Option<AnyElement> {
-    window.set_view_id(entity_id);
-    window.with_rendered_view(entity_id, |window| {
-        if let Some(mut element) = element.take() {
-            element.prepaint(window, cx);
-            return Some(element);
-        }
-
-        window.with_element_state::<ViewElementState, _>(
-            global_id.unwrap(),
-            |element_state, window| {
-                let content_mask = window.content_mask();
-                let text_style = window.text_style();
-                let opacity = window.element_opacity();
-                let inert = window.is_inert();
-
-                // Opacity is compared by bits so that a NaN opacity still matches itself
-                // and the view keeps using its cache.
-                if let Some(mut element_state) = element_state
-                    && element_state.cache_key.bounds == bounds
-                    && element_state.cache_key.content_mask == content_mask
-                    && element_state.cache_key.text_style == text_style
-                    && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
-                    && element_state.cache_key.inert == inert
-                    && !window.dirty_views.contains(&entity_id)
-                    && !window.refreshing
-                    && element_state.prepaint_frame + 1 == window.frames_drawn
-                    && element_state.paint_frame + 1 == window.frames_drawn
-                    && (element_state.a11y.is_some() || !window.a11y.is_active())
-                {
-                    let prepaint_start = window.prepaint_index();
-                    window.reuse_prepaint(element_state.prepaint_range.clone());
-                    if window.a11y.is_active()
-                        && let Some(a11y) = &element_state.a11y
-                    {
-                        let focus = window.focus;
-                        window.a11y.replay(a11y, focus);
-                    }
-                    cx.entities
-                        .extend_accessed(element_state.accessed_entities.iter().copied());
-                    let prepaint_end = window.prepaint_index();
-                    element_state.prepaint_range = prepaint_start..prepaint_end;
-                    element_state.prepaint_frame = window.frames_drawn;
-
-                    return (None, element_state);
-                }
-
-                // Cached views inside this one are left to their own cache keys:
-                // one that is neither dirty nor moved is reused. Only a refresh of
-                // the whole window renders everything again.
-                let prepaint_start = window.prepaint_index();
-                let a11y_mark = window.a11y.is_active().then(|| window.a11y.mark());
-                let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
-                    let mut element = render(window, cx);
-                    element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), window, cx);
-                    element.prepaint_at(bounds.origin, window, cx);
-                    element
-                });
-
-                let prepaint_end = window.prepaint_index();
-                let a11y = a11y_mark.map(|mark| window.a11y.capture(&mark));
-
-                (
-                    Some(element),
-                    ViewElementState {
-                        accessed_entities,
-                        a11y,
-                        prepaint_range: prepaint_start..prepaint_end,
-                        paint_range: PaintIndex::default()..PaintIndex::default(),
-                        prepaint_frame: window.frames_drawn,
-                        paint_frame: 0,
-                        cache_key: ViewElementCacheKey {
-                            bounds,
-                            content_mask,
-                            text_style,
-                            opacity,
-                            inert,
-                        },
-                    },
-                )
-            },
-        )
-    })
-}
-
-#[inline(never)]
-fn prepaint_component(
-    name: &'static str,
-    element: &mut Option<AnyElement>,
-    window: &mut Window,
-    cx: &mut App,
-) -> Option<AnyElement> {
-    window.with_id(ElementId::from(name), |window| {
-        element.as_mut().unwrap().prepaint(window, cx);
-    });
-    Some(element.take().unwrap())
-}
-
-#[inline(never)]
-fn paint_view(
-    entity_id: EntityId,
-    cached: bool,
-    global_id: Option<&GlobalElementId>,
-    element: &mut Option<AnyElement>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    window.with_rendered_view(entity_id, |window| {
-        let caching_disabled = window.is_inspector_picking(cx);
-        if cached && !caching_disabled {
-            window.with_element_state::<ViewElementState, _>(
-                global_id.unwrap(),
-                |element_state, window| {
-                    let mut element_state = element_state.unwrap();
-
-                    let paint_start = window.paint_index();
-                    let opacity = window.element_opacity();
-
-                    // Prepaint can only predict the opacity paint applies: an ancestor's
-                    // hover or drag-over style depends on this frame's hit test, which
-                    // isn't known until prepaint finishes. The key records what was
-                    // actually painted, and output replayed under a different opacity is
-                    // redrawn on the next frame.
-                    if let Some(element) = element {
-                        let ((), accessed_entities) =
-                            cx.detect_accessed_entities(|cx| element.paint(window, cx));
-                        element_state.accessed_entities.extend(accessed_entities);
-                        element_state.cache_key.opacity = opacity;
-                    } else {
-                        window.reuse_paint(element_state.paint_range.clone());
-                        if window.a11y.is_active()
-                            && let Some(a11y) = &element_state.a11y
-                        {
-                            window.a11y.reuse_action_listeners(a11y);
-                        }
-                        if element_state.cache_key.opacity.to_bits() != opacity.to_bits() {
-                            window.request_animation_frame();
-                        }
-                    }
-
-                    let paint_end = window.paint_index();
-                    element_state.paint_range = paint_start..paint_end;
-                    element_state.paint_frame = window.frames_drawn;
-
-                    ((), element_state)
-                },
-            )
-        } else {
-            element.as_mut().unwrap().paint(window, cx);
-        }
-    });
-}
-
-#[inline(never)]
-fn paint_component(
-    name: &'static str,
-    element: &mut Option<AnyElement>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    window.with_id(ElementId::Name(name.into()), |window| {
-        element.as_mut().unwrap().paint(window, cx);
-    });
 }
 
 #[cfg(test)]

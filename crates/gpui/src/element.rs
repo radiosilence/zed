@@ -218,8 +218,8 @@ pub trait ParentElement {
 /// so on a deep tree the hashing alone was a visible share of a frame.
 #[derive(Clone, Debug)]
 pub struct GlobalElementId {
-    ids: Arc<[ElementId]>,
-    hash: u64,
+    pub(crate) ids: Arc<[ElementId]>,
+    pub(crate) hash: u64,
 }
 
 /// The hash of an empty id path; every path hash is folded from it with
@@ -295,8 +295,10 @@ impl Display for GlobalElementId {
     }
 }
 
-trait ElementObject {
+pub(crate) trait ElementObject {
     fn inner_element(&mut self) -> &mut dyn Any;
+
+    fn fast_element_id(&self) -> Option<ElementId>;
 
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId;
 
@@ -325,12 +327,14 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
     Start,
     RequestLayout {
         layout_id: LayoutId,
+        fast_layout_key: u64,
         global_id: Option<GlobalElementId>,
         inspector_id: Option<InspectorElementId>,
         request_layout: RequestLayoutState,
     },
     LayoutComputed {
         layout_id: LayoutId,
+        fast_layout_key: u64,
         global_id: Option<GlobalElementId>,
         inspector_id: Option<InspectorElementId>,
         available_space: Size<AvailableSpace>,
@@ -359,10 +363,10 @@ impl<E: Element> Drawable<E> {
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Start => {
-                let global_id = self
-                    .element
-                    .id()
-                    .map(|element_id| prepare_element_id(element_id, window));
+                let element_id = self.element.id();
+                let fast_layout_key =
+                    crate::fast::layout_key::push_layout_key(window, element_id.as_ref());
+                let global_id = element_id.map(|element_id| prepare_element_id(element_id, window));
 
                 let inspector_id;
                 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -390,9 +394,11 @@ impl<E: Element> Drawable<E> {
                 if global_id.is_some() {
                     window.element_id_stack.pop();
                 }
+                crate::fast::layout_key::pop_layout_key(window);
 
                 self.phase = ElementDrawPhase::RequestLayout {
                     layout_id,
+                    fast_layout_key,
                     global_id,
                     inspector_id,
                     request_layout,
@@ -407,12 +413,14 @@ impl<E: Element> Drawable<E> {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::RequestLayout {
                 layout_id,
+                fast_layout_key,
                 global_id,
                 inspector_id,
                 mut request_layout,
             }
             | ElementDrawPhase::LayoutComputed {
                 layout_id,
+                fast_layout_key,
                 global_id,
                 inspector_id,
                 mut request_layout,
@@ -463,6 +471,7 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let node_id = window.next_frame.dispatch_tree.push_node();
+                let scope = crate::fast::layout_key::enter_prepaint_scope(window, fast_layout_key);
                 let mut prepaint = self.element.prepaint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
@@ -471,6 +480,7 @@ impl<E: Element> Drawable<E> {
                     window,
                     cx,
                 );
+                crate::fast::layout_key::exit_prepaint_scope(window, scope);
                 window.next_frame.dispatch_tree.pop_node();
 
                 if pushed_a11y_node {
@@ -571,6 +581,7 @@ impl<E: Element> Drawable<E> {
         let layout_id = match mem::take(&mut self.phase) {
             ElementDrawPhase::RequestLayout {
                 layout_id,
+                fast_layout_key,
                 global_id,
                 inspector_id,
                 request_layout,
@@ -578,6 +589,7 @@ impl<E: Element> Drawable<E> {
                 window.compute_layout(layout_id, available_space, cx);
                 self.phase = ElementDrawPhase::LayoutComputed {
                     layout_id,
+                    fast_layout_key,
                     global_id,
                     inspector_id,
                     available_space,
@@ -587,6 +599,7 @@ impl<E: Element> Drawable<E> {
             }
             ElementDrawPhase::LayoutComputed {
                 layout_id,
+                fast_layout_key,
                 global_id,
                 inspector_id,
                 available_space: prev_available_space,
@@ -597,6 +610,7 @@ impl<E: Element> Drawable<E> {
                 }
                 self.phase = ElementDrawPhase::LayoutComputed {
                     layout_id,
+                    fast_layout_key,
                     global_id,
                     inspector_id,
                     available_space,
@@ -618,6 +632,10 @@ where
 {
     fn inner_element(&mut self) -> &mut dyn Any {
         &mut self.element
+    }
+
+    fn fast_element_id(&self) -> Option<ElementId> {
+        self.element.id()
     }
 
     #[inline]
@@ -647,7 +665,7 @@ where
 }
 
 /// A dynamically typed element that can be used to store any element type.
-pub struct AnyElement(ArenaBox<dyn ElementObject>);
+pub struct AnyElement(pub(crate) ArenaBox<dyn ElementObject>);
 
 impl AnyElement {
     pub(crate) fn new<E>(element: E) -> Self
@@ -856,7 +874,7 @@ impl Element for Empty {
 #[inline(never)]
 fn prepare_element_id(element_id: ElementId, window: &mut Window) -> GlobalElementId {
     window.element_id_stack.push(element_id);
-    window.element_id_stack.global_id()
+    crate::fast::global_id::current(window)
 }
 
 #[cfg(any(feature = "inspector", debug_assertions))]

@@ -55,6 +55,7 @@ use std::{
     ptr::NonNull,
     rc::{Rc, Weak},
     sync::Arc,
+    time::Instant,
 };
 
 const KEYBOARD_DISMISS_DISTANCE: Pixels = px(24.);
@@ -675,10 +676,20 @@ impl IosWindowState {
     }
 
     /// Delivers a UIKit touch through GPUI's platform-neutral touch API.
-    pub fn handle_touch(&self, touch: &UITouch, _event: Option<&UIEvent>) {
-        // GPUI timestamps delivery itself. Replaying UIKit's historical coalesced
-        // samples here would make them appear simultaneous and distort fling velocity.
+    pub fn handle_touch(&self, touch: &UITouch, event: Option<&UIEvent>) {
         let id = touch_id(touch);
+        // UIKit delivers moves once per frame, but the hardware samples the
+        // touch more often than that; each sample carries its own timestamp,
+        // so delivering them all gives pans and fling velocity the full path.
+        if touch_phase(touch) == TouchPhase::Moved
+            && let Some(coalesced) = event.and_then(|event| event.coalescedTouchesForTouch(touch))
+            && !coalesced.is_empty()
+        {
+            for sample in coalesced {
+                self.handle_touch_sample(&sample, id);
+            }
+            return;
+        }
         self.handle_touch_sample(touch, id);
     }
 
@@ -838,11 +849,13 @@ impl IosWindowState {
         }
     }
 
-    pub(super) fn request_frame(&self) {
+    /// Asks for the frame the display link will show at `present_at`.
+    pub(super) fn request_frame(&self, present_at: Option<Instant>) {
         self.request_frame_callback.with(|callback| {
             let force_render = self.force_next_frame.replace(false);
             callback(RequestFrameOptions {
                 force_render,
+                present_at,
                 ..Default::default()
             });
         });

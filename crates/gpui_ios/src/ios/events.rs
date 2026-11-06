@@ -254,9 +254,14 @@ mod key_tests {
 }
 
 /// When the hardware sampled `touch`, as an [`Instant`](std::time::Instant).
-/// UIKit times touches in seconds of system uptime, the clock `Instant`
-/// reads on Apple platforms (`CLOCK_UPTIME_RAW`).
 pub fn touch_timestamp(touch: &UITouch) -> Option<std::time::Instant> {
+    instant_from_uptime(touch.timestamp())
+}
+
+/// A time in seconds of system uptime, the clock UIKit and Core Animation
+/// time events and frames in, as an [`Instant`](std::time::Instant), which
+/// reads the same clock on Apple platforms (`CLOCK_UPTIME_RAW`).
+pub fn instant_from_uptime(seconds: f64) -> Option<std::time::Instant> {
     let mut now = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -266,6 +271,14 @@ pub fn touch_timestamp(touch: &UITouch) -> Option<std::time::Instant> {
         return None;
     }
     let uptime = now.tv_sec as f64 + now.tv_nsec as f64 / 1e9;
-    let age = (uptime - touch.timestamp()).max(0.0);
-    std::time::Instant::now().checked_sub(std::time::Duration::from_secs_f64(age))
+    let offset = seconds - uptime;
+    if !offset.is_finite() {
+        return None;
+    }
+    let instant = std::time::Instant::now();
+    if offset >= 0.0 {
+        instant.checked_add(std::time::Duration::from_secs_f64(offset))
+    } else {
+        instant.checked_sub(std::time::Duration::from_secs_f64(-offset))
+    }
 }

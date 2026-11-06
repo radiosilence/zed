@@ -7,6 +7,7 @@
 
 mod dispatcher;
 pub mod display_link;
+mod fast;
 pub mod keychain;
 mod metal_atlas;
 pub mod metal_renderer;

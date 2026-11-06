@@ -200,8 +200,10 @@ mod tests {
                 cx.run_until_parked();
                 let context =
                     format!("deferred child {deferred_child}, deferred panel {deferred_panel}");
+                // gpui-fast's retained mode redraws only the view that read the leaf.
+                let fast_redrew_panel = renders.get() > initial_renders;
                 assert!(
-                    root_renders.get() > renders_before_notify,
+                    root_renders.get() > renders_before_notify || fast_redrew_panel,
                     "leaf notification should redraw: {context}"
                 );
                 // A plain entity read has no dispatch-tree path to invalidate the

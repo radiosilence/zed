@@ -180,10 +180,10 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GlobalParams {
-    viewport_size: [f32; 2],
-    premultiplied_alpha: u32,
-    pad: u32,
+pub(crate) struct GlobalParams {
+    pub(crate) viewport_size: [f32; 2],
+    pub(crate) premultiplied_alpha: u32,
+    pub(crate) pad: u32,
 }
 
 #[repr(C)]
@@ -211,27 +211,27 @@ struct SurfaceParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GammaParams {
-    gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
-    subpixel_enhanced_contrast: f32,
-    is_bgr: u32,
-    _pad: u32,
+pub(crate) struct GammaParams {
+    pub(crate) gamma_ratios: [f32; 4],
+    pub(crate) grayscale_enhanced_contrast: f32,
+    pub(crate) subpixel_enhanced_contrast: f32,
+    pub(crate) is_bgr: u32,
+    pub(crate) _pad: u32,
 }
 
 #[derive(Clone, Debug)]
 #[repr(C)]
-struct PathSprite {
-    bounds: Bounds<ScaledPixels>,
+pub(crate) struct PathSprite {
+    pub(crate) bounds: Bounds<ScaledPixels>,
 }
 
 #[derive(Clone, Debug)]
 #[repr(C)]
-struct PathRasterizationVertex {
-    xy_position: Point<ScaledPixels>,
-    st_position: Point<f32>,
-    color: Background,
-    bounds: Bounds<ScaledPixels>,
+pub(crate) struct PathRasterizationVertex {
+    pub(crate) xy_position: Point<ScaledPixels>,
+    pub(crate) st_position: Point<f32>,
+    pub(crate) color: Background,
+    pub(crate) bounds: Bounds<ScaledPixels>,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -246,15 +246,15 @@ pub struct WgpuSurfaceConfig {
     pub preferred_present_mode: Option<wgpu::PresentMode>,
 }
 
-struct WgpuPipelines {
-    quads: wgpu::RenderPipeline,
-    shadows: wgpu::RenderPipeline,
-    path_rasterization: wgpu::RenderPipeline,
-    paths: wgpu::RenderPipeline,
-    underlines: wgpu::RenderPipeline,
-    mono_sprites: wgpu::RenderPipeline,
-    subpixel_sprites: Option<wgpu::RenderPipeline>,
-    poly_sprites: wgpu::RenderPipeline,
+pub(crate) struct WgpuPipelines {
+    pub(crate) quads: wgpu::RenderPipeline,
+    pub(crate) shadows: wgpu::RenderPipeline,
+    pub(crate) path_rasterization: wgpu::RenderPipeline,
+    pub(crate) paths: wgpu::RenderPipeline,
+    pub(crate) underlines: wgpu::RenderPipeline,
+    pub(crate) mono_sprites: wgpu::RenderPipeline,
+    pub(crate) subpixel_sprites: Option<wgpu::RenderPipeline>,
+    pub(crate) poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
@@ -279,17 +279,18 @@ struct InstanceBindings {
     polychrome_sprites: InstanceBinding,
 }
 
-struct WgpuBindGroupLayouts {
-    globals: wgpu::BindGroupLayout,
-    instances: wgpu::BindGroupLayout,
-    texture: wgpu::BindGroupLayout,
+pub(crate) struct WgpuBindGroupLayouts {
+    pub(crate) fast_rounded_clip: crate::fast::rounded_clip::Bindings,
+    pub(crate) globals: wgpu::BindGroupLayout,
+    pub(crate) instances: wgpu::BindGroupLayout,
+    pub(crate) texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
 pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 
-enum InstanceData {
+pub(crate) enum InstanceData {
     Storage(wgpu::Buffer),
     // WebGL2 has no storage buffers. A uint texture keeps the records available to both shader
     // stages while preserving integer and floating-point bit patterns exactly.
@@ -302,26 +303,26 @@ enum InstanceData {
 }
 
 /// GPU resources that must be dropped together during device recovery.
-struct WgpuResources {
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
-    pipelines: WgpuPipelines,
-    bind_group_layouts: WgpuBindGroupLayouts,
-    atlas_sampler: wgpu::Sampler,
+pub(crate) struct WgpuResources {
+    pub(crate) device: Arc<wgpu::Device>,
+    pub(crate) queue: Arc<wgpu::Queue>,
+    pub(crate) pipelines: WgpuPipelines,
+    pub(crate) bind_group_layouts: WgpuBindGroupLayouts,
+    pub(crate) atlas_sampler: wgpu::Sampler,
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
-    globals_buffer: wgpu::Buffer,
-    globals_bind_group: wgpu::BindGroup,
-    path_globals_bind_group: wgpu::BindGroup,
+    pub(crate) globals_buffer: wgpu::Buffer,
+    pub(crate) globals_bind_group: wgpu::BindGroup,
+    pub(crate) path_globals_bind_group: wgpu::BindGroup,
     dynamic_colors_buffer: wgpu::Buffer,
     /// The dynamic colour table as the last present uploaded it, and the
     /// entries that changed at this present.
     dynamic_colors: Vec<f32>,
     dynamic_changed: gpui::DynamicColorSet,
-    instance_data: InstanceData,
+    pub(crate) instance_data: InstanceData,
     path_intermediate_texture: Option<wgpu::Texture>,
-    path_intermediate_view: Option<wgpu::TextureView>,
+    pub(crate) path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
-    path_msaa_view: Option<wgpu::TextureView>,
+    pub(crate) path_msaa_view: Option<wgpu::TextureView>,
     /// Each shader program's pipeline, by the program's address, compiled
     /// the first time it is drawn (`None` for one that failed, not tried
     /// again), the target they draw to, and what a quad with no image
@@ -366,21 +367,23 @@ impl WgpuResources {
     }
 }
 
-struct WgpuRendererCore {
-    resources: WgpuResources,
-    atlas: Arc<WgpuAtlas>,
-    path_globals_offset: u64,
-    gamma_offset: u64,
-    instance_data_capacity: u64,
+pub(crate) struct WgpuRendererCore {
+    pub(crate) fast_dynamic_textures: crate::fast::dynamic_textures::TextureStore,
+    pub(crate) resources: WgpuResources,
+    pub(crate) atlas: Arc<WgpuAtlas>,
+    pub(crate) path_globals_offset: u64,
+    pub(crate) gamma_offset: u64,
+    pub(crate) instance_data_capacity: u64,
     max_instance_data_size: u64,
-    instance_data_alignment: u64,
-    uses_webgl_instance_data: bool,
-    rendering_params: RenderingParameters,
+    pub(crate) instance_data_alignment: u64,
+    pub(crate) uses_webgl_instance_data: bool,
+    pub(crate) rendering_params: RenderingParameters,
     is_bgr: bool,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
-    target_format: wgpu::TextureFormat,
+    pub(crate) target_format: wgpu::TextureFormat,
     max_texture_size: u32,
+    pub(crate) fast_frame: crate::fast::frame::FrameState,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -402,17 +405,17 @@ enum RendererState {
 pub struct WgpuRenderer {
     /// Shared GPU context for device recovery coordination (unused on WASM).
     #[allow(dead_code)]
-    context: Option<GpuContext>,
+    pub(crate) context: Option<GpuContext>,
     /// Compositor GPU hint for adapter selection (unused on WASM).
     #[allow(dead_code)]
-    compositor_gpu: Option<CompositorGpuHint>,
+    pub(crate) compositor_gpu: Option<CompositorGpuHint>,
     state: RendererState,
     surface_config: wgpu::SurfaceConfiguration,
-    atlas: Arc<WgpuAtlas>,
+    pub(crate) atlas: Arc<WgpuAtlas>,
     transparent_alpha_mode: wgpu::CompositeAlphaMode,
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
     max_texture_size: u32,
-    is_bgr: bool,
+    pub(crate) is_bgr: bool,
     failed_frame_count: u32,
     device_errors: Arc<DeviceErrorState>,
     observed_error_generation: u64,
@@ -634,7 +637,7 @@ impl WgpuRenderer {
         Ok((surface_config, transparent_alpha_mode, opaque_alpha_mode))
     }
 
-    fn new_internal(
+    pub(crate) fn new_internal(
         gpu_context: Option<GpuContext>,
         context: &WgpuContext,
         surface: wgpu::Surface<'static>,
@@ -676,7 +679,7 @@ impl WgpuRenderer {
 }
 
 impl WgpuRendererCore {
-    fn create_bind_group_layouts(
+    pub(crate) fn create_bind_group_layouts(
         device: &wgpu::Device,
         uses_webgl_instance_data: bool,
     ) -> WgpuBindGroupLayouts {
@@ -814,6 +817,7 @@ impl WgpuRendererCore {
         });
 
         WgpuBindGroupLayouts {
+            fast_rounded_clip: crate::fast::rounded_clip::Bindings::new(device),
             globals,
             instances,
             texture,
@@ -821,7 +825,7 @@ impl WgpuRendererCore {
         }
     }
 
-    fn create_instance_texture(
+    pub(crate) fn create_instance_texture(
         device: &wgpu::Device,
         requested_capacity: u64,
         max_texture_dimension: u32,
@@ -859,7 +863,7 @@ impl WgpuRendererCore {
         )
     }
 
-    fn create_pipelines(
+    pub(crate) fn create_pipelines(
         device: &wgpu::Device,
         layouts: &WgpuBindGroupLayouts,
         surface_format: wgpu::TextureFormat,
@@ -898,13 +902,13 @@ impl WgpuRendererCore {
         };
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpui_shaders"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            source: crate::fast::rounded_clip::shader_source(shader_source),
         });
 
         let subpixel_shader_module = if dual_source_blending {
             Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("gpui_subpixel_shaders"),
-                source: wgpu::ShaderSource::Wgsl(SUBPIXEL_SHADERS.into()),
+                source: crate::fast::rounded_clip::shader_source(SUBPIXEL_SHADERS),
             }))
         } else {
             None
@@ -935,6 +939,7 @@ impl WgpuRendererCore {
                                module: &wgpu::ShaderModule| {
             let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
             bind_group_layouts.extend(texture_layout.map(Some));
+            crate::fast::rounded_clip::pipeline_layouts(&mut bind_group_layouts, layouts);
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{name}_layout")),
                 bind_group_layouts: &bind_group_layouts,
@@ -1135,7 +1140,7 @@ impl WgpuRendererCore {
         }
     }
 
-    fn create_path_intermediate(
+    pub(crate) fn create_path_intermediate(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         width: u32,
@@ -1159,7 +1164,7 @@ impl WgpuRendererCore {
         (texture, view)
     }
 
-    fn create_msaa_if_needed(
+    pub(crate) fn create_msaa_if_needed(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         width: u32,
@@ -1214,6 +1219,7 @@ impl WgpuRenderer {
         let Some(core) = self.core_mut() else {
             return;
         };
+        crate::fast::layers::TileCache::clear(&mut core.fast_frame.layers);
         let resources = &mut core.resources;
 
         // Wait for any in-flight GPU work to complete before destroying textures
@@ -1264,6 +1270,7 @@ impl WgpuRenderer {
         let Some(core) = self.core_mut() else {
             return;
         };
+        crate::fast::layers::TileCache::clear(&mut core.fast_frame.layers);
         let resources = &mut core.resources;
         resources.pipelines = WgpuRendererCore::create_pipelines(
             &resources.device,
@@ -1352,6 +1359,7 @@ impl WgpuRenderer {
             } else if self.failed_frame_count > 5 {
                 core.resources.invalidate_intermediate_textures();
                 self.atlas.clear();
+                crate::fast::layers::TileCache::clear(&mut core.fast_frame.layers);
                 self.needs_redraw = true;
                 self.failed_frame_count = 0;
                 return false;
@@ -1423,7 +1431,7 @@ impl WgpuRenderer {
 }
 
 impl WgpuRendererCore {
-    fn new(
+    pub(crate) fn new(
         context: &WgpuContext,
         atlas: Arc<WgpuAtlas>,
         target_format: wgpu::TextureFormat,
@@ -1633,10 +1641,14 @@ impl WgpuRendererCore {
             adapter_info: context.adapter.get_info(),
             target_format,
             max_texture_size,
+            fast_frame: crate::fast::frame::FrameState::default(),
+            fast_dynamic_textures: crate::fast::dynamic_textures::TextureStore::clone(
+                &context.fast_dynamic_textures,
+            ),
         }
     }
 
-    fn resources(&self) -> &WgpuResources {
+    pub(crate) fn resources(&self) -> &WgpuResources {
         &self.resources
     }
 
@@ -1680,7 +1692,7 @@ impl WgpuRendererCore {
         resources.path_msaa_view = path_msaa_view;
     }
 
-    fn render_frame(
+    pub(crate) fn render_frame(
         &mut self,
         scene: &Scene,
         target_view: &wgpu::TextureView,
@@ -1722,21 +1734,7 @@ impl WgpuRendererCore {
             premultiplied_alpha: 0,
             ..globals
         };
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            0,
-            bytemuck::bytes_of(&globals),
-        );
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            self.path_globals_offset,
-            bytemuck::bytes_of(&path_globals),
-        );
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            self.gamma_offset,
-            bytemuck::bytes_of(&gamma_params),
-        );
+        crate::fast::globals::write_globals(self, &globals, &path_globals, &gamma_params);
 
         self.record_frame(scene, target_view, clear_color)
             .inspect_err(|_| {
@@ -1751,6 +1749,18 @@ impl WgpuRendererCore {
         frame_view: &wgpu::TextureView,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
+        // The recorded frame draws no shader, blur, layer group or dynamic
+        // colour, so a scene holding one is drawn here.
+        if RECORDED_FRAMES
+            && scene.shaders.is_empty()
+            && scene.backdrop_blurs.is_empty()
+            && scene.layer_groups.is_empty()
+            && scene.dynamic_colors.is_empty()
+            && let Some(submission) =
+                crate::fast::frame::record_frame(self, scene, frame_view, clear_color)?
+        {
+            return Ok(submission);
+        }
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -2040,6 +2050,29 @@ impl WgpuRendererCore {
         }
 
         for texture_id in texture_ids {
+            // A dynamic texture is sampled from its own view, never the atlas;
+            // one this renderer's context does not hold draws nothing.
+            if let Some(id) = gpui::DynamicTextureId::from_atlas_texture_id(texture_id) {
+                match self.fast_dynamic_textures.view(id) {
+                    Some(view) => {
+                        let bind_group =
+                            self.create_texture_bind_group("dynamic_texture_bind_group", &view);
+                        self.resources_mut().atlas_texture_bind_groups.insert(
+                            texture_id,
+                            CachedTextureBindGroup {
+                                texture_generation: 0,
+                                bind_group,
+                            },
+                        );
+                    }
+                    None => {
+                        self.resources_mut()
+                            .atlas_texture_bind_groups
+                            .remove(&texture_id);
+                    }
+                }
+                continue;
+            }
             let Some(texture_info) = self.atlas.get_texture_info(texture_id) else {
                 self.resources_mut()
                     .atlas_texture_bind_groups
@@ -2109,6 +2142,7 @@ impl WgpuRendererCore {
             return;
         }
         pass.set_pipeline(pipeline);
+        crate::fast::rounded_clip::bind_unmasked(pass, self.resources());
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.draw(
@@ -2135,6 +2169,7 @@ impl WgpuRendererCore {
             return Ok(());
         };
         pass.set_pipeline(pipeline);
+        crate::fast::rounded_clip::bind_unmasked(pass, resources);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &sprite_instances.bind_group, &[]);
         pass.set_bind_group(2, &texture.bind_group, &[]);
@@ -2675,6 +2710,7 @@ impl WgpuRendererCore {
         );
         let resources = self.resources();
         pass.set_pipeline(&resources.pipelines.paths);
+        crate::fast::rounded_clip::bind_unmasked(pass, resources);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.set_bind_group(2, &texture, &[]);
@@ -2740,6 +2776,7 @@ impl WgpuRendererCore {
             });
 
             pass.set_pipeline(&resources.pipelines.path_rasterization);
+            crate::fast::rounded_clip::bind_unmasked(&mut pass, resources);
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
             // The path rasterization shader loads records by vertex index
@@ -2828,7 +2865,7 @@ impl WgpuRendererCore {
         })
     }
 
-    fn write_instance_texture(resources: &WgpuResources, offset: u64, data: &[u8]) {
+    pub(crate) fn write_instance_texture(resources: &WgpuResources, offset: u64, data: &[u8]) {
         let InstanceData::Texture {
             texture,
             width,
@@ -2913,7 +2950,7 @@ impl WgpuRendererCore {
         }
     }
 
-    fn grow_instance_data(&mut self, required: u64) -> Result<()> {
+    pub(crate) fn grow_instance_data(&mut self, required: u64) -> Result<()> {
         let capacity = (self.instance_data_capacity * 2)
             .max(required.next_power_of_two())
             .min(self.max_instance_data_size);
@@ -3166,7 +3203,7 @@ impl HeadlessRenderTarget {
 ))]
 pub struct WgpuHeadlessRenderer {
     context: WgpuContext,
-    core: WgpuRendererCore,
+    pub(crate) core: WgpuRendererCore,
     render_target: Option<HeadlessRenderTarget>,
     observed_error_generation: u64,
 }
@@ -3432,7 +3469,7 @@ fn instance_range(range: Range<usize>) -> Range<u32> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn create_surface(
+pub(crate) fn create_surface(
     instance: &wgpu::Instance,
     raw_window_handle: raw_window_handle::RawWindowHandle,
 ) -> anyhow::Result<wgpu::Surface<'static>> {
@@ -3447,15 +3484,15 @@ fn create_surface(
     }
 }
 
-struct RenderingParameters {
-    path_sample_count: u32,
-    gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
-    subpixel_enhanced_contrast: f32,
+pub(crate) struct RenderingParameters {
+    pub(crate) path_sample_count: u32,
+    pub(crate) gamma_ratios: [f32; 4],
+    pub(crate) grayscale_enhanced_contrast: f32,
+    pub(crate) subpixel_enhanced_contrast: f32,
 }
 
 impl RenderingParameters {
-    fn new(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) -> Self {
+    pub(crate) fn new(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) -> Self {
         use std::env;
 
         let format_features = adapter.get_texture_format_features(surface_format);
@@ -3953,3 +3990,7 @@ fn shade(position: vec2<f32>, size: vec2<f32>, time: f32, u: array<vec4<f32>, 20
         Ok(())
     }
 }
+
+/// Whether frames without the fork's primitives are recorded by gpui-fast's
+/// batched frame (`fast::frame`) rather than by `record_frame` here.
+const RECORDED_FRAMES: bool = false;

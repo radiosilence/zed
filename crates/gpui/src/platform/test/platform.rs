@@ -36,7 +36,7 @@ pub(crate) struct TestPlatform {
     pub(crate) active_window: RefCell<Option<TestWindow>>,
     displays: RefCell<Vec<TestDisplay>>,
     displays_changed_callback: RefCell<Option<Box<dyn FnMut()>>>,
-    active_cursor: Mutex<CursorStyle>,
+    pub(crate) active_cursor: Mutex<CursorStyle>,
     current_clipboard_item: Mutex<Option<ClipboardItem>>,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     current_primary_item: Mutex<Option<ClipboardItem>>,

@@ -30,12 +30,14 @@ mod app;
 mod arena;
 mod asset_cache;
 mod assets;
+#[path = "fast/bounds_tree.rs"]
 mod bounds_tree;
 mod color;
 mod dynamic_color;
 mod element;
 mod elements;
 mod executor;
+mod fast;
 mod geometry;
 mod gestures;
 mod global;
@@ -124,6 +126,20 @@ pub use dynamic_color::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
+pub use fast::composition::{
+    ComposedScene, ComposedSceneLayer, CompositionSurfaceId, CompositionSurfaceKind,
+    PlatformCompositionSurface, PlatformCompositionSurfaceContent, PlatformSurfaceAttachment,
+    WindowComposition, WindowCompositionSurface,
+};
+pub use fast::dynamic_textures::{
+    DynamicTexture, DynamicTextureId, DynamicTexturePlatform, set_dynamic_texture_platform,
+};
+pub use fast::layers::scene::{
+    LAYER_TILE_TEXTURE_BASE, LayerContent, LayerFrame, LayerKey, SceneLayers, TileCoord,
+    decode_layer_tile, layer_tile_id, layer_tile_texture_id,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use fast::stats::LayoutStats;
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;

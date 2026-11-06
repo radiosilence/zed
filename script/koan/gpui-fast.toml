@@ -1,0 +1,26 @@
+# The gpui-fast revision whose GPUI changes the fork carries: retained mode,
+# scroll layers, batched path rasterization and the rest of its `fast/`
+# modules with their hooks. They were taken as
+# `git diff <import_commit> <commit>` over the GPUI crates, where
+# `import_commit` is gpui-fast's unchanged import of the Zed revision it
+# tracks, which the fork already contains. Taking a newer revision is the same
+# diff from this `commit` on.
+repository = "https://github.com/longbridge/gpui-fast"
+commit = "046a85953fce1018b8566dc75e6c926f58ff5758"
+import_commit = "957e6599d0172ae699096437e3f416fbc03ca11e"
+zed_commit = "decd2399b180b64dea2a4182f9ac63545a45e7a3"
+
+# Left out: gpui_perf, gpui_windows and the Windows hooks, and the examples.
+# Window composition comes along with the core but is not used by koan.
+#
+# Rounded overflow clips are compiled in but off (`ROUNDED_CLIPS` in
+# crates/gpui/src/fast/rounded_clip.rs): a clip group is drawn from a scene of
+# its own, which the renderers draw without shader quads, backdrop blurs and
+# layer groups.
+#
+# Scroll layer tiles are composited on Metal only (`RENDERER_COMPOSITES_TILES`
+# in crates/gpui/src/fast/layers/paint.rs). The wgpu renderer draws every
+# frame through its own encoding (`RECORDED_FRAMES` in
+# crates/gpui_wgpu/src/wgpu_renderer.rs), which has no tiles: gpui-fast's
+# recorded frame binds its own groups against layouts the fork extends, and
+# has not been run against them. A layer's content is drawn into the frame.

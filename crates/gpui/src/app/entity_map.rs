@@ -57,7 +57,8 @@ impl Display for EntityId {
 pub(crate) struct EntityMap {
     entities: SecondaryMap<EntityId, Box<dyn Any>>,
     accessed_entities: RefCell<AccessedEntities>,
-    ref_counts: Arc<RwLock<EntityRefCounts>>,
+    pub(crate) access_log: crate::fast::dependencies::EntityAccessLog,
+    pub(crate) ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
 /// The entities accessed during the current draw. An access is recorded only
@@ -84,7 +85,7 @@ impl AccessedEntities {
 
 #[doc(hidden)]
 pub(crate) struct EntityRefCounts {
-    counts: SlotMap<EntityId, AtomicUsize>,
+    pub(crate) counts: SlotMap<EntityId, AtomicUsize>,
     dropped_entity_ids: Vec<EntityId>,
     #[cfg(any(test, gpui_leak_detection))]
     leak_detector: LeakDetector,
@@ -102,6 +103,7 @@ impl EntityMap {
                 frame: FxHashSet::default(),
                 scopes: Vec::new(),
             }),
+            access_log: crate::fast::dependencies::EntityAccessLog::default(),
             ref_counts: Arc::new(RwLock::new(EntityRefCounts {
                 counts: SlotMap::with_key(),
                 dropped_entity_ids: Vec::new(),
@@ -155,6 +157,7 @@ impl EntityMap {
             .get_mut()
             .innermost()
             .insert(slot.entity_id);
+        crate::fast::dependencies::note_access(self, slot.entity_id);
 
         let handle = slot.0;
         self.entities.insert(handle.entity_id, Box::new(entity));
@@ -187,6 +190,7 @@ impl EntityMap {
     #[track_caller]
     pub(super) fn lease_erased(&mut self, pointer: &AnyEntity, entity_type: &str) -> LeaseInner {
         self.assert_valid_context(pointer);
+        crate::fast::dependencies::note_update(self, pointer.entity_id);
         let entity = Some(
             self.lease_inner(pointer.entity_id)
                 .unwrap_or_else(|| double_lease_panic("update", entity_type)),
@@ -276,6 +280,7 @@ impl EntityMap {
                 for scope in &mut accessed_entities.scopes {
                     scope.remove(&entity_id);
                 }
+                crate::fast::dependencies::EntityAccessLog::forget(&mut self.access_log, entity_id);
                 // If the EntityId was allocated with `Context::reserve`,
                 // the entity may not have been inserted.
                 Some((entity_id, self.entities.remove(entity_id)?))
@@ -289,6 +294,7 @@ impl EntityMap {
             .borrow_mut()
             .innermost()
             .insert(entity_id);
+        crate::fast::dependencies::note_access(self, entity_id);
         self.entities.get(entity_id).map(Box::as_ref)
     }
 

@@ -45,7 +45,7 @@ impl From<bool> for PaddedBool32 {
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
-    primitive_bounds: BoundsTree<ScaledPixels>,
+    pub(crate) primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
@@ -80,6 +80,9 @@ pub struct Scene {
     /// groups' included, so a renderer draws again what holds one that
     /// changed.
     pub dynamic_colors: crate::DynamicColorSet,
+    pub(crate) sort_scratch: crate::fast::scene::SortScratch,
+    pub(crate) fast_rounded_clip: crate::fast::rounded_clip::SceneClips,
+    pub layers: crate::fast::layers::scene::SceneLayers,
 }
 
 /// A scene with shaders, split where they are drawn: `layers[0]` first, then
@@ -105,6 +108,7 @@ pub struct ShaderLayers {
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
+        crate::fast::rounded_clip::clear(self);
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
@@ -122,6 +126,7 @@ impl Scene {
         self.layer_group_frames.clear();
         self.group_stack.clear();
         self.dynamic_colors = Default::default();
+        crate::fast::layers::scene::SceneLayers::clear(&mut self.layers);
     }
 
     /// The dynamic colours the primitives are drawn in.
@@ -405,6 +410,7 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        crate::fast::layers::paint::replay_layers(self, range.clone(), prev_scene);
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
@@ -414,22 +420,15 @@ impl Scene {
                     self.push_group();
                 }
                 PaintOperation::EndGroup(shader) => self.pop_group(shader.clone()),
+                PaintOperation::FastRoundedClip(fast_clip) => {
+                    crate::fast::rounded_clip::record(self, *fast_clip)
+                }
             }
         }
     }
 
     pub fn finish(&mut self) {
-        self.shadows.sort_by_key(|shadow| shadow.order);
-        self.quads.sort_by_key(|quad| quad.order);
-        self.paths.sort_by_key(|path| path.order);
-        self.underlines.sort_by_key(|underline| underline.order);
-        self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-        self.subpixel_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-        self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-        self.surfaces.sort_by_key(|surface| surface.order);
+        crate::fast::scene::sort_in_drawing_order(self);
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
         // Kept together by program and image within an order.
         self.shaders.sort_by_key(|shader| {
@@ -452,6 +451,9 @@ impl Scene {
             }
             group.finish();
             group.shader_layers = None;
+            if !group.polychrome_sprites.is_empty() {
+                group.layers.frames.clone_from(&self.layers.frames);
+            }
         }
         self.dynamic_colors = self.collect_dynamic_colors();
         for group in &self.layer_groups {
@@ -655,6 +657,11 @@ impl Scene {
         }
         for layer in &mut layers {
             layer.dynamic_colors = layer.collect_dynamic_colors();
+            // The scroll layers whose tiles it composites, for the renderer
+            // to rasterize them from.
+            if !layer.polychrome_sprites.is_empty() {
+                layer.layers.frames.clone_from(&self.layers.frames);
+            }
         }
         Some(ShaderLayers {
             layers,
@@ -731,6 +738,7 @@ pub(crate) enum PaintOperation {
     StartGroup,
     /// A layer group's end, with the shader that composes it.
     EndGroup(crate::PaintShader),
+    FastRoundedClip(crate::fast::rounded_clip::ClipOperation),
 }
 
 #[derive(Clone)]

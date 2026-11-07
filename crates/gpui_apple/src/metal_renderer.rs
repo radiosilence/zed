@@ -161,11 +161,12 @@ pub struct MetalRenderer {
     dynamic_changed: gpui::DynamicColorSet,
     compose_pipelines: Option<ComposePipelines>,
     /// The backdrop blur's programs, compiled when a blur is first drawn,
-    /// and the textures every blur is reduced and blurred in, grown to the
-    /// largest a frame has needed. Blurs drawn one after another share them:
-    /// one queue runs their passes in order.
+    /// and the textures blurs are reduced and blurred in, one pair for each
+    /// blur of a batch (`blur_batches`), grown to the largest a frame has
+    /// needed. Batches drawn one after another share them: one queue runs
+    /// their passes in order.
     blur_pipelines: Option<BlurPipelines>,
-    blur_scratch: Option<BlurScratch>,
+    blur_scratch: Vec<BlurScratch>,
     /// The last frame drawn with shaders, as another thread can present it
     /// again; `None` after a frame without, or while not kept.
     present_plan: Option<Arc<PresentPlan>>,
@@ -468,7 +469,7 @@ impl MetalRenderer {
             dynamic_changed: Default::default(),
             compose_pipelines: None,
             blur_pipelines: None,
-            blur_scratch: None,
+            blur_scratch: Vec::new(),
             present_plan: None,
             keeps_present_plan: false,
             blank_texture: None,
@@ -1024,25 +1025,31 @@ impl MetalRenderer {
                     }
                 }
                 PrimitiveBatch::BackdropBlurs(range) => {
-                    let (Some(pipelines), Some(scratch)) =
-                        (&self.blur_pipelines, &self.blur_scratch)
-                    else {
+                    let Some(pipelines) = &self.blur_pipelines else {
                         continue;
                     };
-                    for blur in &scene.backdrop_blurs[range] {
-                        let Some(geometry) = BlurGeometry::new(blur, viewport_size) else {
-                            continue;
-                        };
-                        // The passes read what this encoder drew.
+                    let geometries: Vec<BlurGeometry> = scene.backdrop_blurs[range]
+                        .iter()
+                        .filter_map(|blur| BlurGeometry::new(blur, viewport_size))
+                        .collect();
+                    let visible: Vec<[f32; 4]> = geometries.iter().map(|g| g.visible).collect();
+                    for batch in blur_batches(&visible, self.blur_scratch.len()) {
+                        let batch = &geometries[batch];
+                        // The passes read what this encoder drew: the target
+                        // is stored and loaded once for the batch.
                         command_encoder.endEncoding();
-                        blur_backdrop(&command_buffer, pipelines, scratch, texture, &geometry)?;
+                        for (geometry, scratch) in batch.iter().zip(&self.blur_scratch) {
+                            blur_backdrop(&command_buffer, pipelines, scratch, texture, geometry)?;
+                        }
                         command_encoder = new_command_encoder_for_texture(
                             &command_buffer,
                             texture,
                             viewport_size,
                             None,
                         )?;
-                        compose_backdrop(&command_encoder, pipelines, scratch, &geometry);
+                        for (geometry, scratch) in batch.iter().zip(&self.blur_scratch) {
+                            compose_backdrop(&command_encoder, pipelines, scratch, geometry);
+                        }
                     }
                 }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
@@ -1063,12 +1070,21 @@ impl MetalRenderer {
         viewport: Size<DevicePixels>,
     ) {
         let mut needed = (0, 0);
+        let mut visible = Vec::new();
         for blur in blurs {
             if let Some(geometry) = BlurGeometry::new(blur, viewport) {
                 needed.0 = needed.0.max(geometry.extent.0);
                 needed.1 = needed.1.max(geometry.extent.1);
+                visible.push(geometry.visible);
             }
         }
+        // As many pairs as the longest batch the blurs could make: any run
+        // of them, laid side by side, as the frame draws them.
+        let count = blur_batches(&visible, usize::MAX)
+            .map(|batch| batch.len())
+            .max()
+            .unwrap_or(0)
+            .min(MAX_BLUR_BATCH);
         if needed == (0, 0) {
             return;
         }
@@ -1081,34 +1097,37 @@ impl MetalRenderer {
                 }
             }
         }
-        let fits = self
+        let (current_width, current_height) = self
             .blur_scratch
-            .as_ref()
-            .is_some_and(|scratch| scratch.width >= needed.0 && scratch.height >= needed.1);
-        if fits {
+            .first()
+            .map_or((0, 0), |scratch| (scratch.width, scratch.height));
+        let fits = current_width >= needed.0 && current_height >= needed.1;
+        if fits && self.blur_scratch.len() >= count {
             return;
         }
         // Rounded up, so a region growing by a pixel at a time does not
         // allocate at each frame.
-        let (current_width, current_height) = self
-            .blur_scratch
-            .as_ref()
-            .map_or((0, 0), |scratch| (scratch.width, scratch.height));
         let width = needed.0.max(current_width).next_multiple_of(64);
         let height = needed.1.max(current_height).next_multiple_of(64);
-        match (
-            self.layer_texture(width, height),
-            self.layer_texture(width, height),
-        ) {
-            (Ok(a), Ok(b)) => {
-                self.blur_scratch = Some(BlurScratch {
+        if !fits {
+            self.blur_scratch.clear();
+        }
+        while self.blur_scratch.len() < count {
+            match (
+                self.layer_texture(width, height),
+                self.layer_texture(width, height),
+            ) {
+                (Ok(a), Ok(b)) => self.blur_scratch.push(BlurScratch {
                     a,
                     b,
                     width,
                     height,
-                })
+                }),
+                (Err(error), _) | (_, Err(error)) => {
+                    log::error!("backdrop blur: {error:#}");
+                    return;
+                }
             }
-            (Err(error), _) | (_, Err(error)) => log::error!("backdrop blur: {error:#}"),
         }
     }
 
@@ -1491,7 +1510,11 @@ impl MetalRenderer {
             pool: self.instance_buffer_pool.clone(),
             pipelines,
             unit_vertices: self.unit_vertices.clone(),
-            blur: self.blur_pipelines.clone().zip(self.blur_scratch.clone()),
+            blur: self
+                .blur_pipelines
+                .clone()
+                .filter(|_| !self.blur_scratch.is_empty())
+                .map(|pipelines| (pipelines, self.blur_scratch.clone())),
             first: self.shader_layers.layers.first().cloned().flatten(),
             groups,
             shaders: if keep {
@@ -2391,7 +2414,7 @@ pub struct PresentPlan {
     pipelines: ComposePipelines,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// What the frame's backdrop blurs are drawn with, if it has any.
-    blur: Option<(BlurPipelines, BlurScratch)>,
+    blur: Option<(BlurPipelines, Vec<BlurScratch>)>,
     first: Option<Texture>,
     groups: Vec<PlanGroup>,
     shaders: Vec<gpui::PaintShader>,
@@ -2577,14 +2600,49 @@ impl PresentPlan {
             layer(&encoder, &self.pipelines.copy, first);
         }
         let viewport = [width as f32, height as f32];
-        for group in &self.groups {
-            if let (Some(geometry), Some((pipelines, scratch))) = (&group.blur, &self.blur) {
-                // The passes read what is composed so far.
+        // Blurs one after another with nothing composed between them, side
+        // by side, as `blur_batches` takes them: the passes of each batch
+        // read what is composed so far, stored and loaded once.
+        let blurred: Vec<[f32; 4]> = self
+            .groups
+            .iter()
+            .map(|group| group.blur.as_ref().map_or([0.; 4], |g| g.visible))
+            .collect();
+        let mut batched_until = 0;
+        for (k, group) in self.groups.iter().enumerate() {
+            if let (Some(_), Some((pipelines, scratch))) = (&group.blur, &self.blur)
+                && k >= batched_until
+            {
+                let mut end = k + 1;
+                while end < self.groups.len()
+                    && self.groups[end - 1].runs.is_empty()
+                    && self.groups[end - 1].over.is_none()
+                    && self.groups[end].blur.is_some()
+                {
+                    end += 1;
+                }
+                let batches = blur_batches(&blurred[k..end], scratch.len());
+                // Only the first batch from here: the next starts where it
+                // ends, after whatever its last group composes.
+                let first = batches.into_iter().next().map_or(k + 1, |b| k + b.end);
+                batched_until = first;
                 encoder.endEncoding();
-                blur_backdrop(&command_buffer, pipelines, scratch, texture, geometry)?;
+                for (geometry, scratch) in self.groups[k..first]
+                    .iter()
+                    .filter_map(|group| group.blur.as_ref())
+                    .zip(scratch)
+                {
+                    blur_backdrop(&command_buffer, pipelines, scratch, texture, geometry)?;
+                }
                 encoder =
                     new_command_encoder_for_texture(&command_buffer, texture, self.viewport, None)?;
-                compose_backdrop(&encoder, pipelines, scratch, geometry);
+                for (geometry, scratch) in self.groups[k..first]
+                    .iter()
+                    .filter_map(|group| group.blur.as_ref())
+                    .zip(scratch)
+                {
+                    compose_backdrop(&encoder, pipelines, scratch, geometry);
+                }
             }
             for run in &group.runs {
                 encoder.setRenderPipelineState(&run.pipeline);
@@ -2940,6 +2998,43 @@ struct BlurGeometry {
 /// The largest reduction. Past it the box filter's reads stride so far
 /// apart that reducing costs more than the wider Gaussian it saves.
 const MAX_BLUR_FACTOR: usize = 8;
+
+/// The most backdrop blurs one batch takes, and so the scratch pairs kept.
+const MAX_BLUR_BATCH: usize = 8;
+
+/// Splits backdrop blurs drawn one after another, given by their visible
+/// bounds (x, y, width, height), into batches that can share one read of
+/// the target: none in a batch draws where another in it does, so each
+/// reads the backdrop as it stood before the batch, its neighbours' blurs
+/// excepted at most within its reach. A batch holds at most `most`.
+///
+/// Each blur of a batch is reduced and blurred from one store of the
+/// target and composed into one load of it, where blurring them one at a
+/// time stores and loads the whole target for each: at a 6K drawable, some
+/// hundred megabytes a blur.
+fn blur_batches(visible: &[[f32; 4]], most: usize) -> impl Iterator<Item = Range<usize>> + '_ {
+    let overlap = |a: &[f32; 4], b: &[f32; 4]| {
+        a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+    };
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start >= visible.len() {
+            return None;
+        }
+        let mut end = start + 1;
+        while end < visible.len()
+            && end - start < most.max(1)
+            && !visible[start..end]
+                .iter()
+                .any(|drawn| overlap(drawn, &visible[end]))
+        {
+            end += 1;
+        }
+        let batch = start..end;
+        start = end;
+        Some(batch)
+    })
+}
 
 impl BlurGeometry {
     /// `None` for a blur that draws nothing in a target of `viewport`.
@@ -4514,6 +4609,61 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         );
         let whole = renderer.render_scene_to_image(&scene, viewport).unwrap();
         assert!(close(&whole, &moved));
+    }
+
+    // Blurs side by side share a batch; one drawing where another of the
+    // batch does starts the next, as does a full batch.
+    #[test]
+    fn blurs_side_by_side_are_batched() {
+        let strip = |y: f32| [0., y, 100., 10.];
+        let side_by_side = [strip(0.), strip(10.), strip(20.), [0., 90., 100., 10.]];
+        let batches: Vec<_> = blur_batches(&side_by_side, 8).collect();
+        assert_eq!(batches, vec![0..4]);
+        let over = [strip(0.), [50., 5., 10., 10.], strip(20.)];
+        let batches: Vec<_> = blur_batches(&over, 8).collect();
+        assert_eq!(batches, vec![0..1, 1..3]);
+        let batches: Vec<_> = blur_batches(&side_by_side, 3).collect();
+        assert_eq!(batches, vec![0..3, 3..4]);
+    }
+
+    // Blurs side by side, drawn in one batch, whole and composed, draw what
+    // each draws alone where their reach does not cross into the other.
+    #[test]
+    fn batched_blurs_draw_as_each_alone() {
+        let viewport = size(DevicePixels(64), DevicePixels(64));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        let top = blur_rect(8., 4., 48., 16.);
+        let foot = blur_rect(8., 44., 48., 16.);
+        let scene_of = |blurs: &[Bounds<ScaledPixels>]| {
+            let mut scene = Scene::default();
+            stripes(&mut scene, 64., 64.);
+            for at in blurs {
+                scene.insert_primitive(backdrop_blur(*at, 3., 0.));
+            }
+            scene.finish();
+            scene
+        };
+        let both = scene_of(&[top, foot]);
+        let both = renderer.render_scene_to_image(&both, viewport).unwrap();
+        let top_alone = scene_of(&[top]);
+        let top_alone = renderer
+            .render_scene_to_image(&top_alone, viewport)
+            .unwrap();
+        let foot_alone = scene_of(&[foot]);
+        let foot_alone = renderer
+            .render_scene_to_image(&foot_alone, viewport)
+            .unwrap();
+        for y in 0..64 {
+            for x in 0..64 {
+                let alone = if y < 32 { &top_alone } else { &foot_alone };
+                assert_eq!(both.get_pixel(x, y), alone.get_pixel(x, y), "({x}, {y})");
+            }
+        }
+        assert!(
+            luma(&both, 32, 12).abs_diff(128) <= 16 && luma(&both, 32, 52).abs_diff(128) <= 16,
+            "both blurred"
+        );
     }
 
     // A navigation bar's blur at 3x: reduced eight times, read three

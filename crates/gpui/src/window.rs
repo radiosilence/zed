@@ -3187,6 +3187,16 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
+    /// Renders the current frame's scene as the window presents it,
+    /// `presents` times, and returns the last as an RGBA image: with
+    /// shaders, the layers drawn once and each present composing them with
+    /// the shaders. What a present costs a window whose shaders move.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn compose_to_image(&self, presents: usize) -> anyhow::Result<image::RgbaImage> {
+        self.platform_window
+            .compose_to_image(&self.rendered_frame.scene, presents)
+    }
+
     /// Borrows the most recently rendered frame's scene, so benchmarks can validate their
     /// output and report batch counts without cloning it.
     #[cfg(feature = "bench-support")]

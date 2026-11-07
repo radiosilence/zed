@@ -170,6 +170,17 @@ impl HeadlessAppContext {
         app.update_window(window, |_, window, _| window.render_to_image())?
     }
 
+    /// Captures the window's frame as it is presented, `presents` times: see
+    /// [`Window::compose_to_image`].
+    pub fn capture_composed(
+        &mut self,
+        window: AnyWindowHandle,
+        presents: usize,
+    ) -> Result<RgbaImage> {
+        let mut app = self.app.borrow_mut();
+        app.update_window(window, |_, window, _| window.compose_to_image(presents))?
+    }
+
     /// Returns the text system.
     pub fn text_system(&self) -> &Arc<TextSystem> {
         &self.text_system

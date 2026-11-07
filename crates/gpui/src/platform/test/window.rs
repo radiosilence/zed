@@ -595,6 +595,19 @@ impl PlatformWindow for TestWindow {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn compose_to_image(&self, scene: &Scene, presents: usize) -> anyhow::Result<RgbaImage> {
+        let scale_factor = self.scale_factor();
+        let mut state = self.0.lock();
+        let size = state.bounds.size;
+        if let Some(renderer) = &mut state.renderer {
+            let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
+            renderer.compose_scene_to_image(scene, device_size, presents)
+        } else {
+            anyhow::bail!("compose_to_image not available: no HeadlessRenderer configured")
+        }
+    }
+
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         Some(self)
     }

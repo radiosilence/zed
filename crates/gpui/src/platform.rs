@@ -2579,6 +2579,8 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+    /// The kind of text expected, which software keyboards lay out for.
+    pub input_mode: TextInputMode,
 }
 
 /// Automatic capitalization applied by software keyboards.
@@ -2623,6 +2625,39 @@ pub enum TextInputAction {
     Search,
     /// Sending a message.
     Send,
+}
+
+/// The kind of text a focused region expects, for software keyboards to lay
+/// out for.
+///
+/// The variants are the HTML `inputmode` attribute's value set
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#input-modalities:-the-inputmode-attribute>),
+/// which maps onto iOS's `UIKeyboardType` and Android's input types, plus
+/// [`TextInputMode::SignedDecimal`]; [`TextInputMode::Unspecified`] means
+/// "emit no hint".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextInputMode {
+    /// Let the platform choose its default keyboard.
+    #[default]
+    Unspecified,
+    /// Text in the user's locale.
+    Text,
+    /// A number with a fractional part.
+    Decimal,
+    /// Digits alone.
+    Numeric,
+    /// A telephone number.
+    Tel,
+    /// A search query.
+    Search,
+    /// An email address.
+    Email,
+    /// A URL.
+    Url,
+    /// A number that may be negative or fractional. iOS's decimal pad has
+    /// no minus sign, so iOS shows numbers and punctuation; HTML has no
+    /// such mode, so the web asks for `decimal`.
+    SignedDecimal,
 }
 
 /// The variables that can be configured when creating a new window

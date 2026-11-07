@@ -1,6 +1,6 @@
 use super::window::{IosWindowState, WindowReference};
 use gpui::{
-    Autocapitalize, PlatformInputHandler, TextInputAction, TextInputConfiguration,
+    Autocapitalize, PlatformInputHandler, TextInputAction, TextInputConfiguration, TextInputMode,
     TextInputStateChange, px,
 };
 use objc2::rc::{Retained, Weak};
@@ -320,7 +320,18 @@ define_class!(
 
     unsafe impl UITextInputTraits for TextInputView {
         #[unsafe(method(keyboardType))]
-        fn keyboard_type(&self) -> UIKeyboardType { UIKeyboardType::Default }
+        fn keyboard_type(&self) -> UIKeyboardType {
+            match self.ivars().configuration.borrow().input_mode {
+                TextInputMode::Unspecified | TextInputMode::Text => UIKeyboardType::Default,
+                TextInputMode::Decimal => UIKeyboardType::DecimalPad,
+                TextInputMode::Numeric => UIKeyboardType::NumberPad,
+                TextInputMode::Tel => UIKeyboardType::PhonePad,
+                TextInputMode::Search => UIKeyboardType::WebSearch,
+                TextInputMode::Email => UIKeyboardType::EmailAddress,
+                TextInputMode::Url => UIKeyboardType::URL,
+                TextInputMode::SignedDecimal => UIKeyboardType::NumbersAndPunctuation,
+            }
+        }
         #[unsafe(method(autocorrectionType))]
         fn autocorrection_type(&self) -> UITextAutocorrectionType {
             if self.ivars().configuration.borrow().autocorrect { UITextAutocorrectionType::Yes } else { UITextAutocorrectionType::No }
@@ -1126,6 +1137,7 @@ pub(super) mod tests {
             autocapitalize: Autocapitalize::Sentences,
             suggestions: true,
             input_action: TextInputAction::Search,
+            input_mode: TextInputMode::SignedDecimal,
         });
         assert_eq!(view.autocorrectionType(), UITextAutocorrectionType::Yes);
         assert_eq!(
@@ -1134,6 +1146,7 @@ pub(super) mod tests {
         );
         assert_eq!(view.spellCheckingType(), UITextSpellCheckingType::Yes);
         assert_eq!(view.returnKeyType(), UIReturnKeyType::Search);
+        assert_eq!(view.keyboardType(), UIKeyboardType::NumbersAndPunctuation);
         view.set_keyboard_visible(false);
         view.reconcile_text_input(sel!(reconcileTextInput));
         assert!(!view.canBecomeFirstResponder());

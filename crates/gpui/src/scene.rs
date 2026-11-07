@@ -460,6 +460,47 @@ impl Scene {
         self.shader_layers = self.plan_shader_layers().map(Box::new);
     }
 
+    /// Where this scene's primitives can draw: the union of each one's
+    /// bounds, a shadow's with its blur's reach, within its content mask.
+    /// `None` for a scene that draws nothing. A renderer composing the scene
+    /// as a layer need touch no pixel outside it.
+    pub fn painted_bounds(&self) -> Option<Bounds<ScaledPixels>> {
+        let mut painted: Option<Bounds<ScaledPixels>> = None;
+        let mut add =
+            |bounds: Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>, reach: f32| {
+                let drawn = bounds.dilate(ScaledPixels(reach)).intersect(&mask.bounds);
+                if drawn.is_empty() {
+                    return;
+                }
+                painted = Some(painted.map_or(drawn, |p| p.union(&drawn)));
+            };
+        // A pixel either way for antialiased edges.
+        for s in &self.shadows {
+            add(s.bounds, &s.content_mask, s.blur_radius.0 * 3.0 + 1.0);
+        }
+        macro_rules! each {
+            ($($list:ident),*) => {$(
+                for p in &self.$list {
+                    add(p.bounds, &p.content_mask, 1.0);
+                }
+            )*};
+        }
+        each!(
+            quads,
+            paths,
+            underlines,
+            monochrome_sprites,
+            subpixel_sprites,
+            polychrome_sprites,
+            surfaces,
+            shaders
+        );
+        for b in &self.backdrop_blurs {
+            add(b.bounds, &b.content_mask, 1.0);
+        }
+        painted
+    }
+
     /// Whether this scene holds no primitives.
     pub fn is_blank(&self) -> bool {
         self.shadows.is_empty()

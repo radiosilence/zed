@@ -23,8 +23,8 @@ use objc2_metal::{
     MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable,
     MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
-    MTLRenderPipelineState, MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTexture,
-    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport,
+    MTLRenderPipelineState, MTLResourceOptions, MTLScissorRect, MTLStorageMode, MTLStoreAction,
+    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLResource, MTLSize};
@@ -1492,6 +1492,10 @@ impl MetalRenderer {
                 runs,
                 blur,
                 over: self.shader_layers.layers.get(k + 1).cloned().flatten(),
+                over_scissor: plan
+                    .layers
+                    .get(k + 1)
+                    .and_then(|layer| scissor_for(layer.painted_bounds(), viewport_size)),
             });
         }
         let mut drawn_colors = gpui::DynamicColorSet::default();
@@ -2443,6 +2447,9 @@ struct PlanGroup {
     blur: Option<BlurGeometry>,
     /// The layer drawn over the group's shaders.
     over: Option<Texture>,
+    /// Where the layer over the group draws, so composing it touches only
+    /// those pixels; `None` for the whole target.
+    over_scissor: Option<MTLScissorRect>,
 }
 
 struct ShaderRun {
@@ -2676,7 +2683,20 @@ impl PresentPlan {
                 }
             }
             if let Some(over) = &group.over {
+                // A layer holding a bar's text, say, is blended where that
+                // is, not over every pixel of the target.
+                if let Some(scissor) = group.over_scissor {
+                    encoder.setScissorRect(scissor);
+                }
                 layer(&encoder, &self.pipelines.over, over);
+                if group.over_scissor.is_some() {
+                    encoder.setScissorRect(MTLScissorRect {
+                        x: 0,
+                        y: 0,
+                        width: width as usize,
+                        height: height as usize,
+                    });
+                }
             }
         }
         encoder.endEncoding();
@@ -2998,6 +3018,50 @@ struct BlurGeometry {
 /// The largest reduction. Past it the box filter's reads stride so far
 /// apart that reducing costs more than the wider Gaussian it saves.
 const MAX_BLUR_FACTOR: usize = 8;
+
+/// A scissor holding `painted` in a target of `viewport`, in whole pixels;
+/// `None` where it would hold the whole target anyway or nothing is painted
+/// (an empty one, which Metal does not allow, as the smallest it does).
+fn scissor_for(
+    painted: Option<Bounds<ScaledPixels>>,
+    viewport: Size<DevicePixels>,
+) -> Option<MTLScissorRect> {
+    let width = i32::from(viewport.width).max(0) as f32;
+    let height = i32::from(viewport.height).max(0) as f32;
+    let Some(painted) = painted else {
+        return Some(MTLScissorRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        });
+    };
+    let x0 = painted.origin.x.0.floor().clamp(0., width);
+    let y0 = painted.origin.y.0.floor().clamp(0., height);
+    let x1 = (painted.origin.x.0 + painted.size.width.0)
+        .ceil()
+        .clamp(0., width);
+    let y1 = (painted.origin.y.0 + painted.size.height.0)
+        .ceil()
+        .clamp(0., height);
+    if x1 <= x0 || y1 <= y0 {
+        return Some(MTLScissorRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        });
+    }
+    if x0 == 0. && y0 == 0. && x1 == width && y1 == height {
+        return None;
+    }
+    Some(MTLScissorRect {
+        x: x0 as usize,
+        y: y0 as usize,
+        width: (x1 - x0) as usize,
+        height: (y1 - y0) as usize,
+    })
+}
 
 /// The most backdrop blurs one batch takes, and so the scratch pairs kept.
 const MAX_BLUR_BATCH: usize = 8;
@@ -4609,6 +4673,62 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         );
         let whole = renderer.render_scene_to_image(&scene, viewport).unwrap();
         assert!(close(&whole, &moved));
+    }
+
+    // A small layer over a shader covering the target is composed where it
+    // draws alone, and the frame matches a whole render.
+    #[test]
+    fn a_small_layer_is_composed_where_it_draws() {
+        static FILL: gpui::ShaderProgram = gpui::ShaderProgram {
+            name: "test-scissor-fill",
+            msl: r#"
+float4 shade(float2 position, float2 size, float time, constant float *u, texture2d<float> image, float4 tile) {
+    return float4(0.0, 0.0, 1.0, 1.0);
+}
+"#,
+            wgsl: "",
+            prepare: None,
+        };
+        let mut scene = Scene::default();
+        let whole = blur_rect(0., 0., 64., 32.);
+        scene.insert_primitive(solid(whole, gpui::black()));
+        scene.insert_primitive(gpui::PaintShader {
+            order: 0,
+            bounds: whole,
+            content_mask: ContentMask { bounds: whole },
+            program: &FILL,
+            uniforms: Arc::new(gpui::ShaderUniforms::new()),
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        });
+        let mark = blur_rect(40., 10., 8., 8.);
+        scene.insert_primitive(solid(mark, gpui::hsla(0., 1., 0.5, 0.5)));
+        scene.finish();
+        let plan = scene.shader_layers.as_deref().expect("a plan");
+        let painted = plan.layers[1].painted_bounds().expect("the mark");
+        let viewport = size(DevicePixels(64), DevicePixels(32));
+        let scissor = scissor_for(Some(painted), viewport).expect("not the whole target");
+        assert_eq!((scissor.x, scissor.y), (40, 10));
+        assert_eq!((scissor.width, scissor.height), (8, 8));
+
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        let drawn = renderer.render_scene_to_image(&scene, viewport).unwrap();
+        let composed = renderer
+            .compose_scene_to_image(&scene, viewport, 1)
+            .unwrap();
+        for (a, b) in drawn.pixels().zip(composed.pixels()) {
+            assert!(
+                a.0.iter().zip(b.0).all(|(x, y)| x.abs_diff(y) <= 2),
+                "{a:?} {b:?}"
+            );
+        }
+        assert!(
+            composed.get_pixel(44, 14).0[0] > 100,
+            "the mark, over the shader"
+        );
+        assert_eq!(composed.get_pixel(4, 4).0[..3], [0, 0, 255], "the shader");
     }
 
     // Blurs side by side share a batch; one drawing where another of the

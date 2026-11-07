@@ -3441,6 +3441,19 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
         self.renderer.render_scene_to_image(scene, size)
     }
 
+    fn compose_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        presents: usize,
+    ) -> anyhow::Result<image::RgbaImage> {
+        if scene.shader_layers.is_some() {
+            self.renderer.compose_scene_to_image(scene, size, presents)
+        } else {
+            self.renderer.render_scene_to_image(scene, size)
+        }
+    }
+
     fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
         self.renderer.render_scene(scene, size)
     }

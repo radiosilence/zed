@@ -1486,6 +1486,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
+
+    /// Renders the given scene as a window presents it, `presents` times,
+    /// and returns the last as an RGBA image: with shaders, the layers they
+    /// are drawn between first and the shaders composed over them. Where
+    /// the renderer does not compose, as `render_to_image`.
+    #[cfg(any(test, feature = "test-support"))]
+    fn compose_to_image(&self, scene: &Scene, _presents: usize) -> Result<RgbaImage> {
+        self.render_to_image(scene)
+    }
 }
 
 /// A renderer for headless windows that can produce real rendered output.
@@ -1497,6 +1506,19 @@ pub trait PlatformHeadlessRenderer {
         scene: &Scene,
         size: Size<DevicePixels>,
     ) -> Result<RgbaImage>;
+
+    /// Render a scene as a window presents it, `presents` times, and return
+    /// the last as an RGBA image: with shaders, the layers they are drawn
+    /// between are drawn once and each present composes them with the
+    /// shaders. Renderers that do not compose render the scene whole.
+    fn compose_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        _presents: usize,
+    ) -> Result<RgbaImage> {
+        self.render_scene_to_image(scene, size)
+    }
 
     /// Render a scene to an offscreen target without reading the result back.
     ///

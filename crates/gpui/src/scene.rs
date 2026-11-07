@@ -461,7 +461,8 @@ impl Scene {
     }
 
     /// Where this scene's primitives can draw: the union of each one's
-    /// bounds, a shadow's with its blur's reach, within its content mask.
+    /// bounds, a shadow's with its blur's reach and a transformed sprite's
+    /// as transformed, within its content mask.
     /// `None` for a scene that draws nothing. A renderer composing the scene
     /// as a layer need touch no pixel outside it.
     pub fn painted_bounds(&self) -> Option<Bounds<ScaledPixels>> {
@@ -485,11 +486,19 @@ impl Scene {
                 }
             )*};
         }
+        // Drawn where its transformation takes its corners, and clipped
+        // there, as the sprite program does.
+        for sprite in &self.monochrome_sprites {
+            add(
+                sprite.transformation.bounds_of(sprite.bounds),
+                &sprite.content_mask,
+                1.0,
+            );
+        }
         each!(
             quads,
             paths,
             underlines,
-            monochrome_sprites,
             subpixel_sprites,
             polychrome_sprites,
             surfaces,
@@ -1329,6 +1338,39 @@ impl TransformationMatrix {
         })
     }
 
+    /// The bounds of `bounds` with its corners transformed.
+    pub fn bounds_of(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        let [[a, b], [c, d]] = self.rotation_scale;
+        let [tx, ty] = self.translation;
+        let corners = [
+            (bounds.origin.x.0, bounds.origin.y.0),
+            (bounds.origin.x.0 + bounds.size.width.0, bounds.origin.y.0),
+            (bounds.origin.x.0, bounds.origin.y.0 + bounds.size.height.0),
+            (
+                bounds.origin.x.0 + bounds.size.width.0,
+                bounds.origin.y.0 + bounds.size.height.0,
+            ),
+        ]
+        .map(|(x, y)| (a * x + b * y + tx, c * x + d * y + ty));
+        let min_x = corners.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+        let max_x = corners
+            .iter()
+            .map(|p| p.0)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = corners.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+        let max_y = corners
+            .iter()
+            .map(|p| p.1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        Bounds {
+            origin: Point::new(ScaledPixels(min_x), ScaledPixels(min_y)),
+            size: Size {
+                width: ScaledPixels(max_x - min_x),
+                height: ScaledPixels(max_y - min_y),
+            },
+        }
+    }
+
     /// Perform matrix multiplication with another transformation
     /// to produce a new transformation that is the result of
     /// applying both transformations: first, `other`, then `self`.
@@ -1879,5 +1921,62 @@ mod layer_group_tests {
             again.layer_group_frames[0],
             Some(bounds(100.0, 50.0, 200.0, 100.0))
         );
+    }
+}
+
+#[cfg(test)]
+mod painted_bounds_tests {
+    use crate::{
+        AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, ContentMask, MonochromeSprite, Point,
+        Radians, ScaledPixels, Scene, Size, TileId, TransformationMatrix,
+    };
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point::new(ScaledPixels(x), ScaledPixels(y)),
+            size: Size {
+                width: ScaledPixels(w),
+                height: ScaledPixels(h),
+            },
+        }
+    }
+
+    // A sprite turned a quarter about a point draws where its corners turn
+    // to, and its layer's painted bounds hold that, within its mask.
+    #[test]
+    fn a_transformed_sprite_is_painted_where_it_is_turned() {
+        let turn = TransformationMatrix::unit()
+            .translate(Point::new(ScaledPixels(50.), ScaledPixels(50.)))
+            .rotate(Radians(std::f32::consts::FRAC_PI_2))
+            .translate(Point::new(ScaledPixels(-50.), ScaledPixels(-50.)));
+        let drawn = turn.bounds_of(bounds(40., 0., 20., 10.));
+        assert!((drawn.origin.x.0 - 90.).abs() < 1e-3, "{drawn:?}");
+        assert!((drawn.origin.y.0 - 40.).abs() < 1e-3, "{drawn:?}");
+        assert!((drawn.size.width.0 - 10.).abs() < 1e-3, "{drawn:?}");
+        assert!((drawn.size.height.0 - 20.).abs() < 1e-3, "{drawn:?}");
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(MonochromeSprite {
+            bounds: bounds(40., 0., 20., 10.),
+            content_mask: ContentMask {
+                bounds: bounds(0., 0., 200., 200.),
+            },
+            transformation: turn,
+            order: 0,
+            pad: 0,
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Monochrome,
+                },
+                tile_id: TileId(0),
+                padding: 0,
+                bounds: Bounds::default(),
+            },
+            color: crate::black(),
+        });
+        let painted = scene.painted_bounds().expect("the sprite");
+        assert!(painted.origin.x.0 <= 89. && painted.origin.x.0 + painted.size.width.0 >= 100.);
+        assert!(painted.origin.y.0 <= 40. && painted.origin.y.0 + painted.size.height.0 >= 60.);
     }
 }

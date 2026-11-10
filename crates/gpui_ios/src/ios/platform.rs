@@ -330,16 +330,9 @@ impl Platform for IosPlatform {
 
     fn prompt_for_paths(
         &self,
-        _options: PathPromptOptions,
+        options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
-        let (tx, rx) = oneshot::channel();
-        if tx
-            .send(Err(anyhow!("File picker not yet implemented for iOS")))
-            .is_err()
-        {
-            log::debug!("GPUI iOS: File picker receiver was dropped");
-        }
-        rx
+        super::document_picker::prompt(options, self.presented_view_controller())
     }
 
     fn prompt_for_new_path(

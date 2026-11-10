@@ -17,7 +17,9 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration, TextInputMode};
+use gpui::{
+    Autocapitalize, TextContentType, TextInputAction, TextInputConfiguration, TextInputMode,
+};
 use wasm_bindgen::JsCast;
 
 use crate::window::WebWindowInner;
@@ -146,7 +148,15 @@ impl ImeMirror {
         self.element.set_spellcheck(configuration.suggestions);
         let on_off = |enabled: bool| if enabled { "on" } else { "off" };
         element
-            .set_attribute("autocomplete", on_off(configuration.suggestions))
+            .set_attribute(
+                "autocomplete",
+                match configuration.content_type {
+                    TextContentType::Unspecified => on_off(configuration.suggestions),
+                    TextContentType::Username => "username",
+                    TextContentType::CurrentPassword => "current-password",
+                    TextContentType::NewPassword => "new-password",
+                },
+            )
             .ok();
         element
             .set_attribute("autocorrect", on_off(configuration.autocorrect))

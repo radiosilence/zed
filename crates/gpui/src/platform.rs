@@ -2603,6 +2603,11 @@ pub struct TextInputConfiguration {
     pub input_action: TextInputAction,
     /// The kind of text expected, which software keyboards lay out for.
     pub input_mode: TextInputMode,
+    /// Whether the text is a secret: software keyboards learn nothing from it
+    /// and platforms keep it out of their text services.
+    pub secure: bool,
+    /// What the text is, for platforms to offer saved values for it.
+    pub content_type: TextContentType,
 }
 
 /// Automatic capitalization applied by software keyboards.
@@ -2680,6 +2685,25 @@ pub enum TextInputMode {
     /// no minus sign, so iOS shows numbers and punctuation; HTML has no
     /// such mode, so the web asks for `decimal`.
     SignedDecimal,
+}
+
+/// What a focused region's text is, for platforms that offer saved values:
+/// password managers, and iOS's Password AutoFill.
+///
+/// The variants are the credential tokens of the HTML `autocomplete` attribute
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#autofill>);
+/// [`TextContentType::Unspecified`] means "emit no hint".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextContentType {
+    /// Nothing the platform could offer a saved value for.
+    #[default]
+    Unspecified,
+    /// An account's name.
+    Username,
+    /// An account's existing password.
+    CurrentPassword,
+    /// A password being chosen.
+    NewPassword,
 }
 
 /// The variables that can be configured when creating a new window

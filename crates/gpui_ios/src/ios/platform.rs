@@ -18,7 +18,7 @@ use futures::{
 };
 use gpui::{
     Action, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem, CursorStyle,
-    DummyKeyboardMapper, ForegroundExecutor, GestureTuning, Keymap, Menu, MenuItem,
+    DummyKeyboardMapper, FlingVelocityFit, ForegroundExecutor, GestureTuning, Keymap, Menu, MenuItem,
     PathPromptOptions, Platform, PlatformDisplay, PlatformGestures, PlatformKeyboardLayout,
     PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, PowerMode, Result, Task,
     ThermalState, WindowAppearance, WindowParams,
@@ -62,6 +62,7 @@ impl PlatformGestures for IosGestures {
             .unwrap_or(Duration::from_micros(16_667));
         GestureTuning {
             touch_resampling: Some(refresh_interval + Duration::from_millis(5)),
+            fling_velocity_fit: FlingVelocityFit::Linear,
             ..GestureTuning::default()
         }
     }

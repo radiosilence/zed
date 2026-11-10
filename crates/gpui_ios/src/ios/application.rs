@@ -14,8 +14,8 @@ use objc2_foundation::{
 };
 use objc2_quartz_core::CADisplayLink;
 use objc2_ui_kit::{
-    UIApplication, UIApplicationDelegate, UIApplicationLaunchOptionsKey, UIOpenURLContext, UIScene,
-    UISceneConfiguration, UISceneConnectionOptions, UISceneDelegate, UISceneSession, UIWindowScene,
+    UIApplication, UIApplicationDelegate, UIApplicationLaunchOptionsKey, UIApplicationState,
+    UIOpenURLContext, UIScene, UISceneConfiguration, UISceneConnectionOptions, UISceneDelegate, UISceneSession, UIWindowScene,
     UIWindowSceneDelegate,
 };
 use std::{
@@ -246,6 +246,14 @@ define_class!(
                 forwarding::forwarded_for(sel!(application:didFinishLaunchingWithOptions:))
             {
                 unsafe { delegate.application_didFinishLaunchingWithOptions(application, options) };
+            }
+            // A launch into the background, for a remote notification say, may
+            // connect no scene at all, so it cannot wait for one. A window
+            // opened before a scene connects is attached to it when one does.
+            if application.applicationState() == UIApplicationState::Background
+                && let Some(platform) = self.ivars().upgrade()
+            {
+                platform.application.finish_launching();
             }
             true
         }

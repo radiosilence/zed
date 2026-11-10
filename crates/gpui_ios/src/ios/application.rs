@@ -15,8 +15,8 @@ use objc2_foundation::{
 use objc2_quartz_core::CADisplayLink;
 use objc2_ui_kit::{
     UIApplication, UIApplicationDelegate, UIApplicationLaunchOptionsKey, UIApplicationState,
-    UIOpenURLContext, UIScene, UISceneConfiguration, UISceneConnectionOptions, UISceneDelegate, UISceneSession, UIWindowScene,
-    UIWindowSceneDelegate,
+    UIOpenURLContext, UIScene, UISceneConfiguration, UISceneConnectionOptions, UISceneDelegate,
+    UISceneSession, UIWindowScene, UIWindowSceneDelegate,
 };
 use std::{
     cell::{Cell, RefCell},

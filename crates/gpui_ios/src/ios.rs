@@ -2,9 +2,9 @@
 
 mod application;
 mod display;
+mod document_picker;
 mod events;
 mod forwarding;
-mod document_picker;
 mod platform;
 mod text_input;
 mod window;

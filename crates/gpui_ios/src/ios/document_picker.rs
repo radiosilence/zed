@@ -19,9 +19,13 @@ use std::{cell::RefCell, path::PathBuf};
 type Answer = oneshot::Sender<Result<Option<Vec<PathBuf>>>>;
 
 thread_local! {
-    /// The picker's delegate while it is up: UIKit holds delegates weakly.
-    /// A later prompt replaces it, which cancels the earlier one's answer.
-    static SHOWN: RefCell<Option<Retained<PickerDelegate>>> = const { RefCell::new(None) };
+    /// The picker up and its delegate, which UIKit holds weakly.
+    static SHOWN: RefCell<Option<Shown>> = const { RefCell::new(None) };
+}
+
+struct Shown {
+    picker: Retained<UIDocumentPickerViewController>,
+    _delegate: Retained<PickerDelegate>,
 }
 
 struct PickerIvars {
@@ -72,6 +76,9 @@ pub(super) fn prompt(
 ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
     let (answer, answered) = oneshot::channel();
     match presenter {
+        Some(_) if picker_up() => {
+            answer.send(Err(anyhow!("a file picker is already open"))).ok();
+        }
         Some(presenter) if options.files => show(options.multiple, presenter, answer),
         _ => {
             let why = if options.files {
@@ -83,6 +90,17 @@ pub(super) fn prompt(
         }
     }
     answered
+}
+
+/// Whether a picker is still on screen. One dismissed without telling its
+/// delegate leaves its entry behind, and does not count.
+fn picker_up() -> bool {
+    SHOWN.with(|shown| {
+        shown
+            .borrow()
+            .as_ref()
+            .is_some_and(|shown| shown.picker.presentingViewController().is_some())
+    })
 }
 
 fn show(multiple: bool, presenter: Retained<UIViewController>, answer: Answer) {
@@ -99,6 +117,11 @@ fn show(multiple: bool, presenter: Retained<UIViewController>, answer: Answer) {
     );
     picker.setAllowsMultipleSelection(multiple);
     picker.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*delegate)));
-    SHOWN.with(|shown| shown.replace(Some(delegate)));
     presenter.presentViewController_animated_completion(&picker, true, None);
+    SHOWN.with(|shown| {
+        shown.replace(Some(Shown {
+            picker,
+            _delegate: delegate,
+        }))
+    });
 }

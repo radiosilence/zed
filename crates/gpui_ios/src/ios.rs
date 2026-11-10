@@ -4,6 +4,7 @@ mod application;
 mod display;
 mod events;
 mod forwarding;
+mod document_picker;
 mod platform;
 mod text_input;
 mod window;

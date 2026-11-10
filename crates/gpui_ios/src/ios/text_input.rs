@@ -1,7 +1,7 @@
 use super::window::{IosWindowState, WindowReference};
 use gpui::{
-    Autocapitalize, PlatformInputHandler, TextInputAction, TextInputConfiguration, TextInputMode,
-    TextInputStateChange, px,
+    Autocapitalize, PlatformInputHandler, TextContentType, TextInputAction,
+    TextInputConfiguration, TextInputMode, TextInputStateChange, px,
 };
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
@@ -331,6 +331,22 @@ define_class!(
                 TextInputMode::Url => UIKeyboardType::URL,
                 TextInputMode::SignedDecimal => UIKeyboardType::NumbersAndPunctuation,
             }
+        }
+        #[unsafe(method(isSecureTextEntry))]
+        fn is_secure_text_entry(&self) -> bool {
+            self.ivars().configuration.borrow().secure
+        }
+        #[unsafe(method_id(textContentType))]
+        fn text_content_type(&self) -> Option<Retained<UITextContentType>> {
+            let content_type = unsafe {
+                match self.ivars().configuration.borrow().content_type {
+                    TextContentType::Unspecified => return None,
+                    TextContentType::Username => UITextContentTypeUsername,
+                    TextContentType::CurrentPassword => UITextContentTypePassword,
+                    TextContentType::NewPassword => UITextContentTypeNewPassword,
+                }
+            };
+            Some(content_type.retain())
         }
         #[unsafe(method(autocorrectionType))]
         fn autocorrection_type(&self) -> UITextAutocorrectionType {
@@ -1138,6 +1154,8 @@ pub(super) mod tests {
             suggestions: true,
             input_action: TextInputAction::Search,
             input_mode: TextInputMode::SignedDecimal,
+            secure: true,
+            content_type: TextContentType::CurrentPassword,
         });
         assert_eq!(view.autocorrectionType(), UITextAutocorrectionType::Yes);
         assert_eq!(
@@ -1147,6 +1165,11 @@ pub(super) mod tests {
         assert_eq!(view.spellCheckingType(), UITextSpellCheckingType::Yes);
         assert_eq!(view.returnKeyType(), UIReturnKeyType::Search);
         assert_eq!(view.keyboardType(), UIKeyboardType::NumbersAndPunctuation);
+        assert!(view.isSecureTextEntry());
+        assert!(
+            view.textContentType()
+                .isEqualToString(unsafe { UITextContentTypePassword })
+        );
         view.set_keyboard_visible(false);
         view.reconcile_text_input(sel!(reconcileTextInput));
         assert!(!view.canBecomeFirstResponder());

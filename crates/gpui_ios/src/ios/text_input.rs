@@ -338,15 +338,13 @@ define_class!(
         }
         #[unsafe(method_id(textContentType))]
         fn text_content_type(&self) -> Option<Retained<UITextContentType>> {
-            let content_type = unsafe {
-                match self.ivars().configuration.borrow().content_type {
-                    TextContentType::Unspecified => return None,
-                    TextContentType::Username => UITextContentTypeUsername,
-                    TextContentType::CurrentPassword => UITextContentTypePassword,
-                    TextContentType::NewPassword => UITextContentTypeNewPassword,
-                }
+            let content_type = match self.ivars().configuration.borrow().content_type {
+                TextContentType::Unspecified => None,
+                TextContentType::Username => Some(unsafe { UITextContentTypeUsername }),
+                TextContentType::CurrentPassword => Some(unsafe { UITextContentTypePassword }),
+                TextContentType::NewPassword => Some(unsafe { UITextContentTypeNewPassword }),
             };
-            Some(content_type.retain())
+            content_type.map(|content_type| content_type.retain())
         }
         #[unsafe(method(autocorrectionType))]
         fn autocorrection_type(&self) -> UITextAutocorrectionType {

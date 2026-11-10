@@ -28,7 +28,7 @@ use gpui_apple::{
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{
-    ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+    ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, class, define_class, msg_send, sel,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
@@ -867,7 +867,24 @@ impl IosWindowState {
     /// These represent the areas occupied by system UI (status bar,
     /// home indicator, camera notch) that content should avoid.
     fn safe_area_insets(&self) -> (f32, f32, f32, f32) {
-        let insets = self.view.safeAreaInsets();
+        // A window on iPadOS 26 carries its controls in the leading top
+        // corner, which the plain safe area leaves out; asked with vertical
+        // corner adaptation, the top edge stands clear of them.
+        let insets = if self
+            .view
+            .respondsToSelector(sel!(edgeInsetsForLayoutRegion:))
+        {
+            const VERTICAL: usize = 2;
+            unsafe {
+                let region: Retained<AnyObject> = msg_send![
+                    class!(UIViewLayoutRegion),
+                    safeAreaLayoutRegionWithCornerAdaptation: VERTICAL
+                ];
+                msg_send![&*self.view, edgeInsetsForLayoutRegion: &*region]
+            }
+        } else {
+            self.view.safeAreaInsets()
+        };
         (
             insets.top as f32,
             insets.bottom as f32,

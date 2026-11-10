@@ -123,6 +123,8 @@ pub struct GestureTuning {
     /// Minimum release velocity, in pixels per second, required to start
     /// scroll momentum.
     pub min_fling_velocity: f32,
+    /// How a touch's speed at release is estimated from its trailing samples.
+    pub fling_velocity_fit: FlingVelocityFit,
     /// When set, a pan moves once per frame, to where the touch was this long
     /// before the frame is expected to reach the screen, interpolated between
     /// the touch's samples by their timestamps. Without it each sample scrolls
@@ -147,9 +149,25 @@ impl Default for GestureTuning {
             long_press_duration: Duration::from_millis(500),
             scroll_physics: ScrollPhysics::ios(),
             min_fling_velocity: 50.,
+            fling_velocity_fit: FlingVelocityFit::Quadratic,
             touch_resampling: None,
         }
     }
+}
+
+/// How a touch's speed at release is read from its trailing samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlingVelocityFit {
+    /// A second-degree least-squares fit, differentiated at the newest
+    /// sample, like Flutter's `VelocityTracker` and Android's `lsq2`. It
+    /// reports the speed at the instant of lift-off, so it reads low for a
+    /// finger that eases off before lifting.
+    Quadratic,
+    /// A least-squares line through the trailing window: the window's overall
+    /// speed. On traced touches this agrees with the velocity
+    /// `UIScrollView` reports to within 8%, where the quadratic read 40-84%
+    /// of it, so a fling coasts as far as a native list's does.
+    Linear,
 }
 
 /// How free scrolling decelerates after a fling.
@@ -951,7 +969,7 @@ impl TouchGestureRecognizer {
                     let mut velocity = if finger_stopped {
                         Point::default()
                     } else {
-                        touch.velocity_tracker.velocity()
+                        touch.velocity_tracker.velocity(self.tuning.fling_velocity_fit)
                     };
                     let lock = |velocity: &mut Point<f32>| match axis {
                         Axis::Vertical => velocity.x = 0.,
@@ -1401,7 +1419,7 @@ impl VelocityTracker {
     /// endpoint difference over the same window would report the window's
     /// *average* speed, which for a flick — still accelerating at lift-off —
     /// is roughly half the speed the finger actually had at release.
-    fn velocity(&self) -> Point<f32> {
+    fn velocity(&self, fit: FlingVelocityFit) -> Point<f32> {
         let Some((newest_time, _)) = self.samples.back() else {
             return Point::default();
         };
@@ -1433,15 +1451,33 @@ impl VelocityTracker {
         if times_seconds.len() < 3 {
             return point(endpoint_estimate(&horizontal), endpoint_estimate(&vertical));
         }
+        let fitted = |values: &[f64]| match fit {
+            FlingVelocityFit::Quadratic => quadratic_velocity_at_newest(&times_seconds, values),
+            FlingVelocityFit::Linear => linear_velocity(&times_seconds, values),
+        };
         point(
-            quadratic_velocity_at_newest(&times_seconds, &horizontal).map_or_else(
+            fitted(&horizontal).map_or_else(
                 || endpoint_estimate(&horizontal),
                 |velocity| velocity as f32,
             ),
-            quadratic_velocity_at_newest(&times_seconds, &vertical)
+            fitted(&vertical)
                 .map_or_else(|| endpoint_estimate(&vertical), |velocity| velocity as f32),
         )
     }
+}
+
+/// The slope of the least-squares line through `values` at `times`.
+fn linear_velocity(times: &[f64], values: &[f64]) -> Option<f64> {
+    let count = times.len() as f64;
+    let sum_t: f64 = times.iter().sum();
+    let sum_v: f64 = values.iter().sum();
+    let sum_tt: f64 = times.iter().map(|t| t * t).sum();
+    let sum_tv: f64 = times.iter().zip(values).map(|(t, v)| t * v).sum();
+    let denominator = count * sum_tt - sum_t * sum_t;
+    if denominator.abs() < 1e-12 {
+        return None;
+    }
+    Some((count * sum_tv - sum_t * sum_v) / denominator)
 }
 
 /// Least-squares fit of `value = a0 + a1·t + a2·t²` returning `a1`: the
@@ -1479,6 +1515,22 @@ fn quadratic_velocity_at_newest(times: &[f64], values: &[f64]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A UIKit-delivered drag that eases off before it lifts, as traced on an
+    /// iOS simulator against a `UIScrollView`, which reported 2,338 points a
+    /// second for it. The linear fit reads what UIKit read.
+    #[test]
+    fn linear_fit_reads_a_drag_easing_off_as_uikit_does() {
+        let base = Instant::now();
+        let mut tracker = VelocityTracker::default();
+        for (ms, y) in [(0, 505.), (17, 472.), (33, 439.), (50, 392.), (67, 347.), (83, 306.), (100, 273.), (117, 262.)] {
+            tracker.push(base + Duration::from_millis(ms), point(px(0.), px(y)));
+        }
+        let linear = -tracker.velocity(FlingVelocityFit::Linear).y;
+        let quadratic = -tracker.velocity(FlingVelocityFit::Quadratic).y;
+        assert!((linear / 2338. - 1.).abs() < 0.2, "linear read {linear}");
+        assert!(quadratic < linear * 0.7, "quadratic read {quadratic}");
+    }
+
     use crate::point;
 
     #[test]
@@ -2451,7 +2503,7 @@ mod tests {
                 point(px(0.), px(1000. * t * t)),
             );
         }
-        let velocity = velocity_tracker.velocity();
+        let velocity = velocity_tracker.velocity(FlingVelocityFit::Quadratic);
         let release_speed = 2. * 1000. * 0.096;
         assert!(
             (velocity.y - release_speed).abs() < 1.,
@@ -2472,7 +2524,7 @@ mod tests {
         velocity_tracker.push(start + Duration::from_millis(16), point(px(0.), px(50.)));
         velocity_tracker.push(start + Duration::from_millis(80), point(px(0.), px(52.)));
         velocity_tracker.push(start + Duration::from_millis(96), point(px(0.), px(54.)));
-        let velocity = velocity_tracker.velocity();
+        let velocity = velocity_tracker.velocity(FlingVelocityFit::Quadratic);
         assert!(
             velocity.y < 200.,
             "pre-pause motion leaked into the estimate: {} px/s",

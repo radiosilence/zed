@@ -18,10 +18,10 @@ use futures::{
 };
 use gpui::{
     Action, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem, CursorStyle,
-    DummyKeyboardMapper, FlingVelocityFit, ForegroundExecutor, GestureTuning, Keymap, Menu, MenuItem,
-    PathPromptOptions, Platform, PlatformDisplay, PlatformGestures, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, PowerMode, Result, Task,
-    ThermalState, WindowAppearance, WindowParams,
+    DummyKeyboardMapper, FlingVelocityFit, ForegroundExecutor, GestureTuning, Keymap, Menu,
+    MenuItem, PathPromptOptions, Platform, PlatformDisplay, PlatformGestures,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, PowerMode,
+    Result, Task, ThermalState, WindowAppearance, WindowParams,
 };
 use gpui_apple::{
     AppleDispatcher, keychain, main_thread_marker,

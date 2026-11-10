@@ -1,7 +1,7 @@
 use super::window::{IosWindowState, WindowReference};
 use gpui::{
-    Autocapitalize, PlatformInputHandler, TextContentType, TextInputAction,
-    TextInputConfiguration, TextInputMode, TextInputStateChange, px,
+    Autocapitalize, PlatformInputHandler, TextContentType, TextInputAction, TextInputConfiguration,
+    TextInputMode, TextInputStateChange, px,
 };
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};

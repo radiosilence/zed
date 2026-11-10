@@ -77,7 +77,9 @@ pub(super) fn prompt(
     let (answer, answered) = oneshot::channel();
     match presenter {
         Some(_) if picker_up() => {
-            answer.send(Err(anyhow!("a file picker is already open"))).ok();
+            answer
+                .send(Err(anyhow!("a file picker is already open")))
+                .ok();
         }
         Some(presenter) if options.files => show(options.multiple, presenter, answer),
         _ => {

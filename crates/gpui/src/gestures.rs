@@ -623,6 +623,10 @@ enum TouchGestureState {
     Caught(ActiveTouch),
     LongPressing(ActiveTouch),
     TouchDragging(ActiveTouch),
+    /// A pan whose scroll was ended while its touch is still down
+    /// ([`TouchGestureRecognizer::end_scroll`]): the touch's events are
+    /// dropped until it lifts.
+    Spent(TouchId),
 }
 
 struct ActiveTouch {
@@ -944,6 +948,7 @@ impl TouchGestureRecognizer {
                         },
                     });
                 }
+                TouchGestureState::Spent(id) if id == event.id => {}
                 TouchGestureState::Caught(touch) if touch.id == event.id => {
                     // Never moved: the content it stopped stays where it is.
                     recognized.push(RecognizedTouchGesture::Scroll(scroll_event(
@@ -1071,6 +1076,7 @@ impl TouchGestureRecognizer {
             },
             TouchPhase::Cancelled => match mem::replace(&mut self.state, TouchGestureState::Idle) {
                 TouchGestureState::Pending { touch, .. } if touch.id == event.id => {}
+                TouchGestureState::Spent(id) if id == event.id => {}
                 TouchGestureState::Panning { touch, .. } | TouchGestureState::Caught(touch)
                     if touch.id == event.id =>
                 {
@@ -1196,6 +1202,21 @@ impl TouchGestureRecognizer {
                 touch_drag_offered: true,
                 ..
             } => TouchGestureState::TouchDragging(touch),
+            other => other,
+        };
+    }
+
+    /// Ends the scroll under way: a fling stops, a resampled release is not
+    /// shown further, and a pan still held delivers nothing more until its
+    /// touch lifts. No closing scroll event is emitted.
+    pub(crate) fn end_scroll(&mut self) {
+        self.momentum = None;
+        self.released = None;
+        self.carried = None;
+        self.state = match mem::replace(&mut self.state, TouchGestureState::Idle) {
+            TouchGestureState::Panning { touch, .. } | TouchGestureState::Caught(touch) => {
+                TouchGestureState::Spent(touch.id)
+            }
             other => other,
         };
     }
@@ -2119,6 +2140,79 @@ mod tests {
         assert!(closing.delta.pixel_delta(px(16.)).is_zero());
         assert_eq!(opening.touch_phase, TouchPhase::Started);
         assert!(opening.delta.pixel_delta(px(16.)).is_zero());
+    }
+
+    #[test]
+    fn an_ended_scroll_delivers_neither_its_fling_nor_the_rest_of_its_pan() {
+        let now = Instant::now();
+        let flick = |recognizer: &mut TouchGestureRecognizer| {
+            recognizer.handle_event_at(
+                &touch_event(TouchId(1), TouchPhase::Started, 100., 100.),
+                now,
+            );
+            for step in 1..=5 {
+                recognizer.handle_event_at(
+                    &touch_event(
+                        TouchId(1),
+                        TouchPhase::Moved,
+                        100.,
+                        100. + step as f32 * 30.,
+                    ),
+                    now + Duration::from_millis(step * 16),
+                );
+            }
+        };
+
+        // Released: the fling it started stops.
+        let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
+        flick(&mut recognizer);
+        recognizer.handle_event_at(
+            &touch_event(TouchId(1), TouchPhase::Ended, 100., 250.),
+            now + Duration::from_millis(96),
+        );
+        assert!(recognizer.has_momentum());
+        recognizer.end_scroll();
+        assert!(!recognizer.wants_frames());
+        assert!(
+            recognizer
+                .tick_frame(now + Duration::from_millis(112))
+                .is_empty()
+        );
+
+        // Held: the rest of the pan and its release are dropped, and the
+        // next touch is a tap again.
+        let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
+        flick(&mut recognizer);
+        recognizer.end_scroll();
+        assert!(
+            recognizer
+                .handle_event_at(
+                    &touch_event(TouchId(1), TouchPhase::Moved, 100., 300.),
+                    now + Duration::from_millis(96),
+                )
+                .is_empty()
+        );
+        assert!(
+            recognizer
+                .handle_event_at(
+                    &touch_event(TouchId(1), TouchPhase::Ended, 100., 300.),
+                    now + Duration::from_millis(112),
+                )
+                .is_empty()
+        );
+        assert!(!recognizer.has_momentum());
+        recognizer.handle_event_at(
+            &touch_event(TouchId(2), TouchPhase::Started, 50., 50.),
+            now + Duration::from_millis(400),
+        );
+        let recognized = recognizer.handle_event_at(
+            &touch_event(TouchId(2), TouchPhase::Ended, 50., 50.),
+            now + Duration::from_millis(450),
+        );
+        assert!(
+            matches!(recognized.as_slice(), [RecognizedTouchGesture::Tap { .. }]),
+            "expected a tap, got {recognized:?}"
+        );
     }
 
     #[test]

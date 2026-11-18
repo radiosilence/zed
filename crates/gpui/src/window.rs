@@ -6463,6 +6463,15 @@ impl Window {
         self.touch_prediction_enabled
     }
 
+    /// Ends the touch scroll under way: its fling stops, and the rest of its
+    /// pan, until the finger lifts, is not delivered. For a listener that
+    /// takes the whole gesture, such as a sheet dismissed by a swipe, whose
+    /// leftover motion must not scroll what the sheet uncovers. No closing
+    /// scroll event follows.
+    pub fn end_touch_scroll(&mut self) {
+        self.touch_gestures.end_scroll();
+    }
+
     /// Sets whether recognized touch pans may use the platform's predicted
     /// touch positions. Disabling drops [`TouchEvent::predicted_position`]
     /// before gesture recognition, so pans track only raw touch positions.

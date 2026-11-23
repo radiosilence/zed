@@ -881,6 +881,16 @@ impl MetalRenderer {
             keep_depth,
         )?;
         let depth_scale = quad_depth_scale(scene.quads.len());
+        // The opaque pass draws the quads painted before the first backdrop
+        // blur, which must not read those painted after it; the quad pass
+        // draws the rest, opaque or not.
+        let opaque_count = scene
+            .backdrop_blurs
+            .first()
+            .map_or(scene.quads.len(), |blur| {
+                scene.quads.partition_point(|quad| quad.order < blur.order)
+            });
+        let opaque_count_value = opaque_count as u32;
         let depth_test_state = self.depth_test_state.clone();
         // What every pass of this frame starts with: the values each vertex
         // shader reads, and the depth test.
@@ -898,12 +908,17 @@ impl MetalRenderer {
                     mem::size_of_val(&depth_scale),
                     GlobalInputIndex::DepthScale as usize,
                 );
+                command_encoder.setVertexBytes_length_atIndex(
+                    ptr::NonNull::from(&opaque_count_value).cast(),
+                    mem::size_of_val(&opaque_count_value),
+                    QuadInputIndex::QuadCount as usize,
+                );
             }
             command_encoder.setDepthStencilState(Some(&depth_test_state));
         };
         set_globals(&command_encoder);
 
-        self.draw_opaque_quads(scene.quads.len(), instance_bindings, &command_encoder);
+        self.draw_opaque_quads(opaque_count, instance_bindings, &command_encoder);
         command_encoder.setDepthStencilState(Some(&self.depth_test_state));
 
         let mut quad_cursor: u32 = 0;
@@ -1019,6 +1034,18 @@ impl MetalRenderer {
                             None,
                             true,
                         )?;
+                        // Composed where the blur stands in the depth order,
+                        // under the opaque quads painted after it.
+                        set_globals(&command_encoder);
+                        let depth = quad_depth(quad_cursor, depth_scale) as f64;
+                        command_encoder.setViewport(MTLViewport {
+                            originX: 0.0,
+                            originY: 0.0,
+                            width: i32::from(viewport_size.width) as f64,
+                            height: i32::from(viewport_size.height) as f64,
+                            znear: depth,
+                            zfar: depth,
+                        });
                         for (geometry, scratch) in batch.iter().zip(&self.blur_scratch) {
                             compose_backdrop(&command_encoder, pipelines, scratch, geometry);
                         }

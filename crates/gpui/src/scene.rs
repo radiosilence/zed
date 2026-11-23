@@ -2406,14 +2406,26 @@ mod layer_group_tests {
         let mut scene = Scene::default();
         scene.push_group();
         scene.push_group();
-        let mut path: Path<Pixels> = Path::new(point(px(110.0), px(60.0)));
-        path.line_to(point(px(150.0), px(60.0)));
-        path.line_to(point(px(150.0), px(90.0)));
-        let mut path = path.scale(1.0);
-        path.content_mask = ContentMask {
-            bounds: bounds(0.0, 0.0, 1000.0, 1000.0),
-        };
-        scene.insert_primitive(path);
+        let mut builder = crate::PathBuilder::fill();
+        builder.add_polygon(
+            &[
+                point(px(110.0), px(60.0)),
+                point(px(150.0), px(60.0)),
+                point(px(150.0), px(90.0)),
+            ],
+            true,
+        );
+        scene.insert_primitive(crate::PaintedPath::new(
+            builder.build().unwrap(),
+            1.0,
+            ContentMask {
+                bounds: crate::Bounds::new(
+                    point(px(0.0), px(0.0)),
+                    crate::size(px(1000.0), px(1000.0)),
+                ),
+            },
+            crate::Hsla::default().into(),
+        ));
         scene.pop_group(shader(bounds(105.0, 55.0, 60.0, 40.0)));
         scene.pop_group(shader(bounds(100.0, 50.0, 200.0, 100.0)));
         scene.finish();
@@ -2428,19 +2440,31 @@ mod layer_group_tests {
     }
 
     /// One holding a path stays the window's size, its content where it was
-    /// painted: paths are drawn through a texture the window's size.
+    /// painted: a path's tiles are binned in window coordinates.
     #[test]
     fn a_group_with_a_path_is_drawn_at_the_windows_size() {
         let mut scene = Scene::default();
         scene.push_group();
-        let mut path: Path<Pixels> = Path::new(point(px(110.0), px(60.0)));
-        path.line_to(point(px(150.0), px(60.0)));
-        path.line_to(point(px(150.0), px(90.0)));
-        let mut path = path.scale(1.0);
-        path.content_mask = ContentMask {
-            bounds: bounds(0.0, 0.0, 1000.0, 1000.0),
-        };
-        scene.insert_primitive(path);
+        let mut builder = crate::PathBuilder::fill();
+        builder.add_polygon(
+            &[
+                point(px(110.0), px(60.0)),
+                point(px(150.0), px(60.0)),
+                point(px(150.0), px(90.0)),
+            ],
+            true,
+        );
+        scene.insert_primitive(crate::PaintedPath::new(
+            builder.build().unwrap(),
+            1.0,
+            ContentMask {
+                bounds: crate::Bounds::new(
+                    point(px(0.0), px(0.0)),
+                    crate::size(px(1000.0), px(1000.0)),
+                ),
+            },
+            crate::Hsla::default().into(),
+        ));
         scene.pop_group(shader(bounds(100.0, 50.0, 200.0, 100.0)));
         scene.finish();
         assert_eq!(scene.layer_group_frames[0], None);
@@ -2528,7 +2552,7 @@ mod painted_bounds_tests {
             },
             transformation: turn,
             order: 0,
-            pad: 0,
+            animation: crate::SpriteAnimationId::NONE,
             tile: AtlasTile {
                 texture_id: AtlasTextureId {
                     index: 0,

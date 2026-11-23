@@ -71,7 +71,8 @@ float quad_depth(uint quad_id, float depth_scale) {
   return saturate(float(quad_id + 1u) * depth_scale);
 }
 
-// Opaque rectangles are drawn by the opaque pass instead of the quad pass.
+// Opaque rectangles are drawn by the opaque pass instead of the quad pass,
+// those of the first `opaque_count` quads it draws.
 bool is_opaque_rectangle(Quad quad) {
   return quad.background.tag == 0u && quad.background.solid.a >= 1.0 &&
          quad.background.solid.h < 2.0 &&
@@ -85,9 +86,10 @@ vertex QuadFragmentInput quad_vertex(
     constant Size_DevicePixels *viewport_size
     [[buffer(GlobalInputIndex_ViewportSize)]],
     constant float *depth_scale [[buffer(GlobalInputIndex_DepthScale)]],
+    constant uint *opaque_count [[buffer(QuadInputIndex_QuadCount)]],
     constant float4 *dynamic_colors [[buffer(20)]]) {
   Quad quad = quads[quad_id];
-  if (is_opaque_rectangle(quad)) {
+  if (quad_id < *opaque_count && is_opaque_rectangle(quad)) {
     QuadFragmentInput culled = {};
     culled.position = CULLED_POSITION;
     return culled;

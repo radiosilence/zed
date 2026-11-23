@@ -1,10 +1,10 @@
 use crate::{
-    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs, HeadlessAtlas,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size,
-    TestDisplay, TestPlatform, TextInputConfiguration, TextInputStateChange, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
-    WindowVisibility,
+    AnyWindowHandle, Bounds, Decorations, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs,
+    HeadlessAtlas, KeyDownEvent, NativeViewId, Pixels, Platform, PlatformAtlas, PlatformDisplay,
+    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, RequestFrameOptions, Scene, Size, TestDisplay, TestPlatform,
+    TextInputConfiguration, TextInputStateChange, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowInsets, WindowParams, WindowVisibility,
 };
 use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "test-support"))]
@@ -32,6 +32,11 @@ pub(crate) struct TestWindowState {
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
     close_callback: Option<Box<dyn FnOnce()>>,
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
+    attached_native_views: Rc<Cell<usize>>,
+    focused_native_view: Option<NativeViewId>,
+    hit_test_native_view_callback: Option<Box<dyn FnMut(Point<Pixels>) -> Option<NativeViewId>>>,
+    native_view_focused_callback: Option<Box<dyn FnMut(NativeViewId)>>,
+    key_down_before_native_view_callback: Option<Box<dyn FnMut(KeyDownEvent) -> bool>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     active_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     visibility: WindowVisibility,
@@ -58,6 +63,7 @@ pub(crate) struct TestWindowState {
     is_fullscreen: bool,
     scale_factor: f32,
     appearance: WindowAppearance,
+    decorations: Decorations,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
 }
@@ -123,6 +129,11 @@ impl TestWindow {
             moved_callback: None,
             display_changed_callback: None,
             appearance_change_callback: None,
+            attached_native_views: Rc::new(Cell::new(0)),
+            focused_native_view: None,
+            hit_test_native_view_callback: None,
+            native_view_focused_callback: None,
+            key_down_before_native_view_callback: None,
             request_frame_callback: None,
             frame_wake_count: Rc::new(Cell::new(0)),
             frame_scheduled: false,
@@ -135,6 +146,7 @@ impl TestWindow {
             // Preserve the test platform's historical 2x default.
             scale_factor: 2.0,
             appearance: WindowAppearance::Light,
+            decorations: Decorations::default(),
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
         })))
@@ -258,6 +270,47 @@ impl TestWindow {
         self.simulate_resize(size);
     }
 
+    /// How many native views are attached to the window.
+    pub fn attached_native_view_count(&self) -> usize {
+        self.0.lock().attached_native_views.get()
+    }
+
+    /// The native view the window last gave keyboard input to.
+    pub fn focused_native_view(&self) -> Option<NativeViewId> {
+        self.0.lock().focused_native_view
+    }
+
+    /// Asks the window which native view a mouse event at `position` reaches.
+    pub fn hit_test_native_view(&self, position: Point<Pixels>) -> Option<NativeViewId> {
+        let mut callback = self.0.lock().hit_test_native_view_callback.take()?;
+        let id = callback(position);
+        self.0.lock().hit_test_native_view_callback = Some(callback);
+        id
+    }
+
+    /// Acts as if the user pressed a key while a native view had keyboard input,
+    /// and returns whether the window used the key before the view saw it.
+    pub fn simulate_key_down_before_native_view(&self, event: KeyDownEvent) -> bool {
+        let Some(mut callback) = self.0.lock().key_down_before_native_view_callback.take() else {
+            return false;
+        };
+        let handled = callback(event);
+        self.0.lock().key_down_before_native_view_callback = Some(callback);
+        handled
+    }
+
+    /// Acts as if the user moved keyboard input to a native view through the platform.
+    pub fn simulate_native_view_focused(&self, id: NativeViewId) {
+        let mut lock = self.0.lock();
+        lock.focused_native_view = Some(id);
+        let Some(mut callback) = lock.native_view_focused_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback(id);
+        self.0.lock().native_view_focused_callback = Some(callback);
+    }
+
     pub(crate) fn simulate_active_status_change(&self, active: bool) {
         let mut lock = self.0.lock();
         let Some(mut callback) = lock.active_status_change_callback.take() else {
@@ -283,6 +336,17 @@ impl TestWindow {
     /// `presents`, as a platform presenting moving shaders itself would.
     pub fn set_presents_shaders(&self, presents: bool) {
         self.0.lock().presents_shaders = presents;
+    }
+
+    pub fn simulate_decorations_change(&self, decorations: Decorations) {
+        let mut lock = self.0.lock();
+        lock.decorations = decorations;
+        let Some(mut callback) = lock.appearance_change_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback();
+        self.0.lock().appearance_change_callback = Some(callback);
     }
 
     /// Returns how many times this window's frame waker has been invoked.
@@ -486,8 +550,21 @@ impl PlatformWindow for TestWindow {
     }
 
     fn toggle_fullscreen(&self) {
-        let mut lock = self.0.lock();
-        lock.is_fullscreen = !lock.is_fullscreen;
+        let platform = {
+            let mut lock = self.0.lock();
+            lock.is_fullscreen = !lock.is_fullscreen;
+            lock.platform.upgrade()
+        };
+        if let Some(platform) = platform {
+            let mut window = self.clone();
+            platform
+                .foreground_executor()
+                .spawn(async move {
+                    let size = window.0.lock().bounds.size;
+                    window.simulate_resize(size);
+                })
+                .detach();
+        }
     }
 
     fn is_fullscreen(&self) -> bool {
@@ -561,6 +638,45 @@ impl PlatformWindow for TestWindow {
 
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
         self.0.lock().hit_test_window_control_callback = Some(callback);
+    }
+
+    /// Counts the view as attached without ever reading `_view`, so tests may
+    /// pass a dangling pointer.
+    unsafe fn attach_native_view(
+        &self,
+        _id: NativeViewId,
+        _view: std::ptr::NonNull<std::ffi::c_void>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        struct Attachment(Rc<Cell<usize>>);
+
+        impl Drop for Attachment {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+
+        let attached_native_views = self.0.lock().attached_native_views.clone();
+        attached_native_views.set(attached_native_views.get() + 1);
+        Some(Box::new(Attachment(attached_native_views)))
+    }
+
+    fn set_focused_native_view(&self, id: Option<NativeViewId>) {
+        self.0.lock().focused_native_view = id;
+    }
+
+    fn on_key_down_before_native_view(&self, callback: Box<dyn FnMut(KeyDownEvent) -> bool>) {
+        self.0.lock().key_down_before_native_view_callback = Some(callback);
+    }
+
+    fn on_hit_test_native_view(
+        &self,
+        callback: Box<dyn FnMut(Point<Pixels>) -> Option<NativeViewId>>,
+    ) {
+        self.0.lock().hit_test_native_view_callback = Some(callback);
+    }
+
+    fn on_native_view_focused(&self, callback: Box<dyn FnMut(NativeViewId)>) {
+        self.0.lock().native_view_focused_callback = Some(callback);
     }
 
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
@@ -643,5 +759,9 @@ impl PlatformWindow for TestWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         None
+    }
+
+    fn window_decorations(&self) -> Decorations {
+        self.0.lock().decorations
     }
 }

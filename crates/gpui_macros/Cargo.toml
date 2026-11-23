@@ -1,6 +1,6 @@
 [package]
 name = "gpui-koan-macros"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 publish = false
 license = "Apache-2.0"

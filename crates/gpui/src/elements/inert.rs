@@ -68,14 +68,6 @@ impl Element for Inert {
     }
 }
 
-impl IntoElement for Inert {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;

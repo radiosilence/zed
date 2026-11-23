@@ -386,11 +386,8 @@ struct WgpuRendererCore {
     /// Depth buffers by size, the most recently used last: the window's and
     /// its layer groups'.
     depth_textures: Vec<DepthTexture>,
-    /// Read by the headless renderer to create its render target.
-    #[cfg(all(
-        not(target_family = "wasm"),
-        any(test, feature = "bench-support", feature = "test-support")
-    ))]
+    /// The format drawn to: the headless renderer's render target, and the
+    /// shader layers and layer groups composed into the frame.
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
 }
@@ -1540,10 +1537,6 @@ impl WgpuRendererCore {
             transient_attachments: context.supports_transient_attachments(),
             adapter_info: context.adapter.get_info(),
             depth_textures: Vec::new(),
-            #[cfg(all(
-                not(target_family = "wasm"),
-                any(test, feature = "bench-support", feature = "test-support")
-            ))]
             target_format,
             max_texture_size,
         }
@@ -1558,6 +1551,7 @@ impl WgpuRendererCore {
         surface_format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
     ) {
+        self.target_format = surface_format;
         self.resources.pipelines = Self::create_pipelines(
             &self.resources.device,
             &self.resources.bind_group_layouts,

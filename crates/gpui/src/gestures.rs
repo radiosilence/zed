@@ -974,7 +974,9 @@ impl TouchGestureRecognizer {
                     let mut velocity = if finger_stopped {
                         Point::default()
                     } else {
-                        touch.velocity_tracker.velocity(self.tuning.fling_velocity_fit)
+                        touch
+                            .velocity_tracker
+                            .velocity(self.tuning.fling_velocity_fit)
                     };
                     let lock = |velocity: &mut Point<f32>| match axis {
                         Axis::Vertical => velocity.x = 0.,
@@ -1543,7 +1545,16 @@ mod tests {
     fn linear_fit_reads_a_drag_easing_off_as_uikit_does() {
         let base = Instant::now();
         let mut tracker = VelocityTracker::default();
-        for (ms, y) in [(0, 505.), (17, 472.), (33, 439.), (50, 392.), (67, 347.), (83, 306.), (100, 273.), (117, 262.)] {
+        for (ms, y) in [
+            (0, 505.),
+            (17, 472.),
+            (33, 439.),
+            (50, 392.),
+            (67, 347.),
+            (83, 306.),
+            (100, 273.),
+            (117, 262.),
+        ] {
             tracker.push(base + Duration::from_millis(ms), point(px(0.), px(y)));
         }
         let linear = -tracker.velocity(FlingVelocityFit::Linear).y;

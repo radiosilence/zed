@@ -383,6 +383,9 @@ jobs:
       - name: Open the koan pull request
         run: |
           set -euo pipefail
+          # `gh repo clone` authenticates the clone only; the push needs git
+          # itself to use the token.
+          gh auth setup-git
           gh repo clone "$KOAN" "$RUNNER_TEMP/koan"
           cd "$RUNNER_TEMP/koan"
           if ! grep -rqs 'gpui-koan' Cargo.toml crates/*/Cargo.toml; then

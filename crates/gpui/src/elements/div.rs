@@ -4647,7 +4647,7 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, GestureTuning, InputEvent, IntoElement,
-        Keystroke, MouseMoveEvent, TestAppContext, TouchEvent, TouchId, canvas,
+        Keystroke, MouseMoveEvent, ScrollDelta, TestAppContext, TouchEvent, TouchId, canvas,
         util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
@@ -6009,9 +6009,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_a_wheel_past_either_end_leaves_the_offset_within_the_content(
-        cx: &mut TestAppContext,
-    ) {
+    fn test_a_wheel_past_either_end_leaves_the_offset_within_the_content(cx: &mut TestAppContext) {
         struct Column {
             scroll_handle: ScrollHandle,
             content: Pixels,

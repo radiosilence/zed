@@ -281,7 +281,7 @@ jobs:
   publish-crate:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     needs: [changes, check-version]
     if: ${{ !cancelled() && needs.check-version.result == 'success' }}
     env:
@@ -304,29 +304,46 @@ jobs:
         # this staged workspace already.
         #
         # Publishing is not idempotent: it errors on a version that already
-        # exists. A release retried after a partial publish (crates.io limits
-        # how many new crates arrive at once, so the first release may need a
-        # retry), or after a downstream failure, would fail here, so each
-        # crate already in the index at this version is excluded and only the
-        # rest go out.
+        # exists. Each pass excludes the crates already in the index at this
+        # version and publishes the rest, so a retried release, or a pass cut
+        # short, picks up where the last one stopped.
+        #
+        # crates.io limits how many new crates arrive at once: after a burst it
+        # answers 429 with the time the next one is allowed. A pass that ends
+        # that way sleeps until then and runs again; any other failure fails
+        # the step.
         run: |
-          EXCLUDE=()
-          PENDING=0
-          for crate in $(cargo metadata --no-deps --format-version 1 \
-                         | jq -r '.packages[] | select(.publish != []) | .name'); do
-            if curl -sf "https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}" \
-               | grep -q "\"vers\":\"${VERSION}+"; then
-              echo "${crate} ${VERSION} is already on crates.io"
-              EXCLUDE+=(--exclude "$crate")
-            else
-              PENDING=$((PENDING + 1))
+          set -o pipefail
+          while :; do
+            EXCLUDE=()
+            PENDING=0
+            for crate in $(cargo metadata --no-deps --format-version 1 \
+                           | jq -r '.packages[] | select(.publish != []) | .name'); do
+              if curl -sf "https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}" \
+                 | grep -q "\"vers\":\"${VERSION}+"; then
+                EXCLUDE+=(--exclude "$crate")
+              else
+                PENDING=$((PENDING + 1))
+              fi
+            done
+            if [ "$PENDING" -eq 0 ]; then
+              echo "every crate is on crates.io at ${VERSION}"
+              exit 0
+            fi
+            echo "publishing ${PENDING} crates"
+            if cargo publish --workspace --no-verify --allow-dirty "${EXCLUDE[@]}" 2>&1 | tee publish.log; then
+              exit 0
+            fi
+            AFTER=$(grep -o 'try again after [^.]* GMT' publish.log | head -1 | sed 's/try again after //')
+            if [ -z "$AFTER" ]; then
+              exit 1
+            fi
+            WAIT=$(( $(date -d "$AFTER" +%s) - $(date +%s) + 5 ))
+            if [ "$WAIT" -gt 0 ]; then
+              echo "rate limited until ${AFTER}; waiting ${WAIT}s"
+              sleep "$WAIT"
             fi
           done
-          if [ "$PENDING" -eq 0 ]; then
-            echo "nothing to publish"
-            exit 0
-          fi
-          cargo publish --workspace --no-verify --allow-dirty "${EXCLUDE[@]}"
 
   release:
     name: Release

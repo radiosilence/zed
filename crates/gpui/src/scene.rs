@@ -592,14 +592,10 @@ impl Scene {
         });
         self.surfaces.sort_by_key(|surface| surface.order);
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
-        // Kept together by program and image within an order.
-        self.shaders.sort_by_key(|shader| {
-            (
-                shader.order,
-                shader.program as *const crate::ShaderProgram as usize,
-                shader.image.as_ref().map(|tile| tile.texture_id.index),
-            )
-        });
+        // A shader is drawn over what it was painted over, even within one
+        // order: a layer gives everything in it the layer's order. The sort
+        // is stable, so shaders keep the order they were painted in.
+        self.shaders.sort_by_key(|shader| shader.order);
         self.native_views
             .sort_by_key(|native_view| native_view.order);
         self.keep_first_painted_native_views();
@@ -2149,6 +2145,28 @@ mod tests {
                 [
                     format!("shaders (1) of {}", first.name),
                     format!("shaders (1) of {}", second.name),
+                ]
+            );
+        }
+    }
+
+    /// Shaders in one layer share its order, and are still drawn in the
+    /// order they were painted, whatever their programs.
+    #[test]
+    fn shaders_in_a_layer_are_drawn_in_paint_order() {
+        for (first, second) in [(&UNDER, &OVER), (&OVER, &UNDER)] {
+            let mut scene = Scene::default();
+            scene.push_layer();
+            scene.insert_primitive(shader(first, 0.));
+            scene.insert_primitive(shader(second, 5.));
+            scene.insert_primitive(shader(first, 20.));
+            scene.pop_layer();
+            assert_eq!(
+                batch_labels(&mut scene),
+                [
+                    format!("shaders (1) of {}", first.name),
+                    format!("shaders (1) of {}", second.name),
+                    format!("shaders (1) of {}", first.name),
                 ]
             );
         }

@@ -3562,17 +3562,19 @@ impl Interactivity {
                     }
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
+                    // Held within the content at once, rather than when the
+                    // element is next laid out: whatever reads the offset
+                    // before then, as a view rendering, sees where the
+                    // content will stand.
+                    let max = scroll_max.get();
+                    scroll_offset.x = scroll_offset.x.clamp(-max.x, px(0.));
+                    scroll_offset.y = scroll_offset.y.clamp(-max.y, px(0.));
                     // A finger's pan moves the innermost container under it
                     // that can still move that way, and only that one; one
                     // already at its end leaves the pan to the container
                     // around it.
-                    if touch {
-                        let max = scroll_max.get();
-                        scroll_offset.x = scroll_offset.x.clamp(-max.x, px(0.));
-                        scroll_offset.y = scroll_offset.y.clamp(-max.y, px(0.));
-                        if *scroll_offset != old_scroll_offset {
-                            cx.stop_propagation();
-                        }
+                    if touch && *scroll_offset != old_scroll_offset {
+                        cx.stop_propagation();
                     }
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
@@ -6004,6 +6006,67 @@ mod tests {
 
         // Five 40px items in a 100px strip: the last one ends at 200px.
         assert_eq!(scroll_handle.offset().x, px(-100.));
+    }
+
+    #[gpui::test]
+    fn test_a_wheel_past_either_end_leaves_the_offset_within_the_content(
+        cx: &mut TestAppContext,
+    ) {
+        struct Column {
+            scroll_handle: ScrollHandle,
+            content: Pixels,
+            /// The offset each render saw.
+            seen: Rc<RefCell<Vec<Pixels>>>,
+        }
+
+        impl Render for Column {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                self.seen.borrow_mut().push(self.scroll_handle.offset().y);
+                div().size_full().child(
+                    div()
+                        .id("column")
+                        .h(px(100.))
+                        .w(px(100.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_handle)
+                        .child(div().w_full().flex_none().h(self.content)),
+                )
+            }
+        }
+
+        for (content, max) in [(px(300.), px(200.)), (px(50.), px(0.))] {
+            let scroll_handle = ScrollHandle::new();
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let (_, cx) = cx.add_window_view({
+                let scroll_handle = scroll_handle.clone();
+                let seen = seen.clone();
+                move |_, _| Column {
+                    scroll_handle,
+                    content,
+                    seen,
+                }
+            });
+            cx.run_until_parked();
+            for lines in [-3., -40., 3., 40.] {
+                cx.simulate_event(ScrollEvent {
+                    position: point(px(50.), px(50.)),
+                    delta: ScrollDelta::Lines(point(0., lines)),
+                    ..Default::default()
+                });
+                cx.run_until_parked();
+            }
+            for offset in seen.borrow().iter() {
+                assert!(
+                    *offset <= px(0.) && *offset >= -max,
+                    "{content:?} of content rendered at {offset:?}"
+                );
+            }
+            assert_eq!(scroll_handle.offset().y, px(0.), "{content:?} of content");
+        }
     }
 
     struct ContentSizedGrid;

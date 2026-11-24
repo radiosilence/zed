@@ -1053,6 +1053,8 @@ impl PrimitiveKind {
             Self::MonochromeSprite => Self::Underline,
             Self::SubpixelSprite => Self::MonochromeSprite,
             Self::PolychromeSprite => Self::SubpixelSprite,
+            // Shaders sharing an order are sorted by program and image.
+            Self::Shader => Self::Surface,
             kind => kind,
         }
     }
@@ -2102,9 +2104,65 @@ mod tests {
         }
     }
 
+    static UNDER: crate::ShaderProgram = crate::ShaderProgram {
+        name: "under",
+        msl: "",
+        wgsl: "",
+        prepare: None,
+    };
+
+    static OVER: crate::ShaderProgram = crate::ShaderProgram {
+        name: "over",
+        msl: "",
+        wgsl: "",
+        prepare: None,
+    };
+
+    fn shader(program: &'static crate::ShaderProgram, x: f32) -> crate::PaintShader {
+        crate::PaintShader {
+            order: 0,
+            bounds: square(x),
+            content_mask: ContentMask { bounds: square(x) },
+            program,
+            uniforms: std::sync::Arc::new(crate::ShaderUniforms::default()),
+            image: None,
+            group: None,
+            group_inset: Default::default(),
+        }
+    }
+
     fn batch_labels(scene: &mut Scene) -> Vec<String> {
         scene.finish();
         scene.batches().map(|batch| batch.label()).collect()
+    }
+
+    /// Shaders overlapping are drawn in the order they were painted, whatever
+    /// their programs: one sharing another's order would be sorted by program.
+    #[test]
+    fn overlapping_shaders_are_drawn_in_paint_order() {
+        for (first, second) in [(&UNDER, &OVER), (&OVER, &UNDER)] {
+            let mut scene = Scene::default();
+            scene.insert_primitive(shader(first, 0.));
+            scene.insert_primitive(shader(second, 5.));
+            assert_eq!(
+                batch_labels(&mut scene),
+                [
+                    format!("shaders (1) of {}", first.name),
+                    format!("shaders (1) of {}", second.name),
+                ]
+            );
+        }
+    }
+
+    /// A shader still shares the order of the quad it overlaps: shaders are
+    /// drawn after quads within an order.
+    #[test]
+    fn a_shader_over_a_quad_shares_its_order() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0.));
+        scene.insert_primitive(shader(&OVER, 5.));
+        scene.finish();
+        assert_eq!(scene.quads[0].order, scene.shaders[0].order);
     }
 
     #[test]

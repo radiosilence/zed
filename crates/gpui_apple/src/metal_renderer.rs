@@ -947,7 +947,12 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::Quads(range) => {
                     quad_cursor += range.len() as u32;
-                    self.draw_quads(range, instance_bindings, &command_encoder)
+                    self.draw_quads(
+                        range,
+                        opaque_count_value,
+                        instance_bindings,
+                        &command_encoder,
+                    )
                 }
                 PrimitiveBatch::Paths(range) => {
                     let tiles_start = path_tile_cursor;
@@ -1811,6 +1816,7 @@ impl MetalRenderer {
     fn draw_quads(
         &self,
         quads: Range<usize>,
+        opaque_count: u32,
         instance_bindings: &InstanceBindings,
         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     ) {
@@ -1819,6 +1825,17 @@ impl MetalRenderer {
         }
 
         command_encoder.setRenderPipelineState(&self.quads_pipeline_state);
+        // How many quads the opaque pass drew, which this pass skips: bound
+        // with every batch, since sprites, paths and surfaces bind the slot.
+        // SAFETY: Metal copies the value, which matches the quad vertex
+        // shader's `QuadInputIndex_QuadCount` argument.
+        unsafe {
+            command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(&opaque_count).cast(),
+                mem::size_of_val(&opaque_count),
+                QuadInputIndex::QuadCount as usize,
+            );
+        }
         // SAFETY: the table was written with the frame's instances and lives as long.
         unsafe {
             command_encoder.setVertexBuffer_offset_atIndex(
@@ -4449,6 +4466,50 @@ float4 shade(float2 position, float2 size, float time, constant float *u, textur
         for (x, y) in [(4, 4), (10, 16), (60, 30), (30, 4)] {
             assert_eq!(blurred.get_pixel(x, y), sharp.get_pixel(x, y), "({x}, {y})");
         }
+    }
+
+    // An opaque quad painted after a blur is left to the quad pass, which
+    // reads how many quads the opaque pass drew from a slot sprites also
+    // bind: after a sprite, the quad is still drawn.
+    #[test]
+    fn an_opaque_quad_after_a_blur_and_a_sprite_is_drawn() {
+        use gpui::PlatformAtlas as _;
+        let viewport = size(DevicePixels(64), DevicePixels(32));
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default()))).unwrap();
+        let key = gpui::AtlasKey::Image(gpui::RenderImageParams {
+            image_id: gpui::ImageId(1),
+            frame_index: 0,
+        });
+        let tile = renderer
+            .sprite_atlas()
+            .get_or_insert_with(key, &mut || {
+                Ok(Some((
+                    size(DevicePixels(2), DevicePixels(2)),
+                    std::borrow::Cow::Owned(vec![255; 16]),
+                )))
+            })
+            .unwrap()
+            .unwrap();
+        let red = gpui::hsla(0., 1., 0.5, 1.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid(blur_rect(0., 0., 64., 32.), gpui::black()));
+        scene.insert_primitive(backdrop_blur(blur_rect(0., 0., 12., 12.), 2., 0.));
+        let over_blur = blur_rect(4., 4., 8., 8.);
+        scene.insert_primitive(gpui::PolychromeSprite {
+            order: 0,
+            pad: 0,
+            tile,
+            grayscale: false.into(),
+            opacity: 1.,
+            bounds: over_blur,
+            content_mask: ContentMask { bounds: over_blur },
+            corner_radii: Default::default(),
+        });
+        scene.insert_primitive(solid(blur_rect(8., 8., 48., 20.), red));
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, viewport).unwrap();
+        assert_eq!(image.get_pixel(40, 16).0, [255, 0, 0, 255]);
     }
 
     // What is painted after a blur is drawn over it, sharp; what was painted
